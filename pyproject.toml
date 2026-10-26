@@ -1,0 +1,8 @@
+[project]
+name = "sisi"
+version = "0.1.0"
+description = "Sisi — WhatsApp-first SI assistant for South African spaza shops"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
