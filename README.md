@@ -58,6 +58,10 @@ Run the API: `.venv/bin/python -m uvicorn app.main:app --port 8000`.
   sends a local recording through the full voice pipeline (ffmpeg → Muse Voice Transcribe →
   Sisi's reply with the transcript shown first). Needs `ffmpeg` installed and `MODEL_API_KEY` set.
   More samples in [samples/](samples/): cash sale, restock, restock list, cash-up.
+- Expiry photo without WhatsApp: `python scripts/simulate.py --photo <shelf.jpg>`
+  reads best-before stamps via vision + strict structured output and proposes an
+  expiry note. Set `SISI_TODAY=YYYY-MM-DD` on the server to freeze "today" for
+  dated props.
 - Live WhatsApp: message the test number (see hackathon submission) — try "Sipho took two bread and a 2L Coke on the book", tap Yes, then Undo.
 - Screenshots: [screenshots/](screenshots/).
 

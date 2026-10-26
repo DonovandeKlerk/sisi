@@ -29,6 +29,11 @@ TOKEN_LOG = Path("token_usage.log")
 _client = None
 
 
+def get_client():
+    """Shared OpenAI-compatible client for the Meta Model API."""
+    return _get_client()
+
+
 def _get_client():
     global _client
     if _client is None:
@@ -62,7 +67,7 @@ def save_turn(conn: sqlite3.Connection, shop_id: str, role: str, content: str) -
     conn.commit()
 
 
-def _log_usage(shop_id: str, model: str, usage, round_no: int) -> None:
+def log_usage(shop_id: str, model: str, usage, round_no: int = 1) -> None:
     try:
         entry = {
             "ts": now_iso(),
@@ -81,7 +86,7 @@ def _log_usage(shop_id: str, model: str, usage, round_no: int) -> None:
 
 def _complete(messages: list) -> object:
     """Thin seam over the API call so tests can stub it."""
-    return _get_client().chat.completions.create(
+    return get_client().chat.completions.create(
         model=config.model_name(), messages=messages, tools=TOOL_DEFS, tool_choice="auto"
     )
 
@@ -107,7 +112,7 @@ def _run_tool(conn: sqlite3.Connection, shop_id: str, name: str, raw_args: str |
         return f"{name} failed: {e}."
 
 
-def _print_api_error(e: Exception) -> None:
+def print_api_error(e: Exception) -> None:
     print("Sisi API error (full body):", file=sys.stderr)
     body = getattr(e, "body", None)
     if body is not None:
@@ -132,11 +137,11 @@ def chat(conn: sqlite3.Connection, shop_id: str, text: str) -> str:
         try:
             resp = _complete(messages)
         except Exception as e:  # noqa: BLE001 - API outage must not crash the chat
-            _print_api_error(e)
+            print_api_error(e)
             reply = "My signal dropped just now. Please say that again."
             save_turn(conn, shop_id, "assistant", reply)
             return reply
-        _log_usage(shop_id, model, getattr(resp, "usage", None), round_no)
+        log_usage(shop_id, model, getattr(resp, "usage", None), round_no)
         msg = resp.choices[0].message
         calls = list(getattr(msg, "tool_calls", None) or [])
         if not calls:

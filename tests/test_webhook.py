@@ -247,8 +247,8 @@ def test_webhook_dedupes_message_id(sim_env, monkeypatch):
 def test_unsupported_type_gets_graceful_reply(sim_env):
     client = TestClient(app)
     payload = {"object": "whatsapp_business_account", "entry": [{"changes": [{
-        "value": {"messages": [{"id": "wamid.7", "from": SHOP, "type": "image",
-                                "image": {"id": "media-1"}}]}}]}]}
+        "value": {"messages": [{"id": "wamid.7", "from": SHOP, "type": "video",
+                                "video": {"id": "media-1"}}]}}]}]}
     raw = json.dumps(payload).encode()
     assert client.post("/webhook", content=raw, headers=_signed(raw)).status_code == 200
     out = client.get("/_sim/outbox", params={"shop": SHOP}).json()["messages"]

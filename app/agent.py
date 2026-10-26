@@ -6,9 +6,11 @@ import sqlite3
 
 from app.llm import chat as llm_chat
 from app.llm import save_turn
+from app.vision import VisionError, read_expiry_photo
 from app.voice import VoiceError, transcribe_audio
 from app.tools import (
     cancel_pending,
+    check_expiry_photo,
     confirm_pending,
     demo_reset,
     ensure_shop,
@@ -75,6 +77,26 @@ def handle_voice(conn: sqlite3.Connection, shop_id: str, audio: bytes,
         return None, "I couldn't hear anything in that voice note. Send it again?", None
     reply, buttons = handle_text(conn, shop_id, transcript)
     return transcript, f"Heard: “{transcript}”\n{reply}", buttons
+
+
+def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes):
+    """Read expiry dates from a photo and propose saving the findings.
+
+    Returns (findings_or_None, reply, buttons). Nothing is saved until Yes.
+    """
+    ensure_shop(conn, shop_id)
+    before = get_pending(conn, shop_id)
+    before_id = before["id"] if before else None
+    try:
+        findings = read_expiry_photo(image, shop_id)
+    except VisionError as e:
+        return None, str(e), None
+    save_turn(conn, shop_id, "user", "[photo]")
+    reply = check_expiry_photo(conn, shop_id, findings)
+    save_turn(conn, shop_id, "assistant", reply)
+    after = get_pending(conn, shop_id)
+    buttons = ["Yes", "No"] if after is not None and after["id"] != before_id else None
+    return findings, reply, buttons
 
 
 def handle_text(conn: sqlite3.Connection, shop_id: str, text: str):

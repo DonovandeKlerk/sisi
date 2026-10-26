@@ -82,14 +82,14 @@ def parse_webhook(payload: dict) -> list[IncomingMessage]:
     return out
 
 
-def download_media(media_id: str) -> bytes:
+def download_media(media_id: str, label: str = "voice note") -> bytes:
     """Fetch WhatsApp media bytes via the media-id endpoint. Raises VoiceError."""
     from app.voice import CANT_HEAR, VoiceError
 
     token = os.environ.get("WHATSAPP_TOKEN", "")
     version = os.environ.get("GRAPH_API_VERSION", "v26.0")
     if not token:
-        raise VoiceError("I couldn't fetch that voice note. Please send it again?")
+        raise VoiceError(f"I couldn't fetch that {label}. Please send it again?")
     headers = {"Authorization": f"Bearer {token}"}
     try:
         meta = httpx.get(f"{GRAPH_BASE}/{version}/{media_id}", headers=headers, timeout=15)
@@ -100,7 +100,9 @@ def download_media(media_id: str) -> bytes:
         return data.content
     except httpx.HTTPError as e:
         log.warning("media download failed: %r", e)
-        raise VoiceError(CANT_HEAR) from e
+        if label == "voice note":
+            raise VoiceError(CANT_HEAR) from e
+        raise VoiceError(f"I couldn't fetch that {label}. Please send it again?") from e
 
 
 class WhatsAppSender:
