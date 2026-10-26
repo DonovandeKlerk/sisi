@@ -407,7 +407,7 @@ def _apply_add_stock(conn: sqlite3.Connection, shop_id: str, payload: dict, acti
         product_id, created = payload["product_id"], False
         old_wholesaler = conn.execute("SELECT wholesaler FROM products WHERE id = ?",
                                       (product_id,)).fetchone()["wholesaler"]
-        if payload.get("wholesaler"):
+        if payload.get("wholesaler") and not old_wholesaler:
             conn.execute("UPDATE products SET wholesaler = ? WHERE id = ?",
                          (payload["wholesaler"], product_id))
     conn.execute("UPDATE products SET stock_qty = stock_qty + ? WHERE id = ?",
@@ -706,19 +706,19 @@ def restock_list(conn: sqlite3.Connection, shop_id: str) -> str:
 def cash_up(conn: sqlite3.Connection, shop_id: str, day: str | None = None) -> str:
     ensure_shop(conn, shop_id)
     day = day or today_str()
+    # created_at is UTC; the shop day is SAST (UTC+2), so shift before comparing.
+    day_expr = "substr(datetime(created_at, '+2 hours'), 1, 10)"
     cash = conn.execute(
         "SELECT COALESCE(SUM(total_cents), 0) s, COUNT(*) n FROM sales"
-        " WHERE shop_id = ? AND customer_id IS NULL AND reversed = 0"
-        " AND substr(created_at, 1, 10) = ?",
+        f" WHERE shop_id = ? AND customer_id IS NULL AND reversed = 0 AND {day_expr} = ?",
         (shop_id, day)).fetchone()
     book = conn.execute(
         "SELECT COALESCE(SUM(total_cents), 0) s FROM sales"
-        " WHERE shop_id = ? AND customer_id IS NOT NULL AND reversed = 0"
-        " AND substr(created_at, 1, 10) = ?",
+        f" WHERE shop_id = ? AND customer_id IS NOT NULL AND reversed = 0 AND {day_expr} = ?",
         (shop_id, day)).fetchone()["s"]
     pay = conn.execute(
         "SELECT COALESCE(SUM(amount_cents), 0) s FROM payments"
-        " WHERE shop_id = ? AND reversed = 0 AND substr(created_at, 1, 10) = ?",
+        f" WHERE shop_id = ? AND reversed = 0 AND {day_expr} = ?",
         (shop_id, day)).fetchone()["s"]
     if not cash["s"] and not book and not pay:
         return f"Cash-up {day}: nothing recorded yet."
@@ -934,7 +934,8 @@ def _tool(name: str, desc: str, props: dict, required: list[str]) -> dict:
 
 
 TOOL_DEFS = [
-    _tool("add_credit", "Put items on a customer's credit book (asks for Yes first).",
+    _tool("add_credit", "Put items someone TOOK on their credit book (asks for Yes first)."
+          " Use for 'took ... on the book'. No sale is recorded and stock is unchanged.",
           {"customer": {"type": "string"},
            "items": {"type": "array", "items": {"type": "object",
                      "properties": {"product": {"type": "string"}, "qty": {"type": "number"}},
@@ -947,10 +948,13 @@ TOOL_DEFS = [
     _tool("list_debtors", "Everyone who owes, with the total.", {}, []),
     _tool("draft_reminder", "Draft a polite payment reminder the owner forwards herself.",
           {"customer": {"type": "string"}}, ["customer"]),
-    _tool("record_sale", "Record a sale. Omit buyer for cash, or name the buyer for a credit sale.",
+    _tool("record_sale", "Record something SOLD: reduces stock and counts toward cash-up."
+          " Use whenever the owner says they sold something."
+          " Omit buyer for cash, or name the buyer for a credit sale.",
           {"product": {"type": "string"}, "qty": {"type": "number"},
            "buyer": {"type": "string"}}, ["product"]),
-    _tool("add_stock", "Add stock, optionally with the wholesaler name.",
+    _tool("add_stock", "Add stock. Pass wholesaler only when the owner names a specific"
+          " wholesaler; never guess one.",
           {"product": {"type": "string"}, "qty": {"type": "number"},
            "wholesaler": {"type": "string"}}, ["product", "qty"]),
     _tool("set_price", "Set a product's selling price in cents.",

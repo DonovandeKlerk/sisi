@@ -212,6 +212,20 @@ def test_add_stock_and_set_price(conn):
     assert row["price_cents"] is None
 
 
+def test_add_stock_keeps_known_wholesaler(conn):
+    _seeded(conn)
+    add_stock(conn, SHOP, "Coke 2L", 5, wholesaler="depot")
+    confirm_pending(conn, SHOP)
+    row = conn.execute("SELECT wholesaler, stock_qty FROM products WHERE shop_id = ? AND name = ?",
+                       (SHOP, "Coke 2L")).fetchone()
+    assert (row["wholesaler"], row["stock_qty"]) == ("Coke Depot", 10)
+    add_stock(conn, SHOP, "New Beans", 3, wholesaler="Jumbo")
+    confirm_pending(conn, SHOP)
+    row = conn.execute("SELECT wholesaler FROM products WHERE shop_id = ? AND name = ?",
+                       (SHOP, "New Beans")).fetchone()
+    assert row["wholesaler"] == "Jumbo"
+
+
 def test_low_stock_and_restock(conn):
     _seeded(conn)
     low = low_stock(conn, SHOP)
@@ -232,12 +246,25 @@ def test_cash_up(conn):
     confirm_pending(conn, SHOP)
     record_payment(conn, SHOP, "Thandi", 4550)
     confirm_pending(conn, SHOP)
-    day = conn.execute("SELECT substr(created_at, 1, 10) d FROM sales LIMIT 1").fetchone()["d"]
+    day = conn.execute(
+        "SELECT substr(datetime(created_at, '+2 hours'), 1, 10) d FROM sales LIMIT 1"
+    ).fetchone()["d"]
     out = cash_up(conn, SHOP, day)
     assert "Cash sales: R72.00 (1 sales)" in out
     assert "Book sales: R33.00" in out
     assert "Payments in: R45.50" in out
     assert "In the drawer: R117.50." in out
+
+
+def test_cash_up_uses_sast_day(conn):
+    _seeded(conn)
+    record_sale(conn, SHOP, "Coke 2L", 1)
+    confirm_pending(conn, SHOP)
+    conn.execute("UPDATE sales SET created_at = '2026-10-26T23:30:00.000Z' WHERE shop_id = ?",
+                 (SHOP,))
+    conn.commit()
+    assert "R36.00" in cash_up(conn, SHOP, "2026-10-27")  # 01:30 SAST next day
+    assert cash_up(conn, SHOP, "2026-10-26").endswith("nothing recorded yet.")
 
 
 # --- photo findings --------------------------------------------------------
