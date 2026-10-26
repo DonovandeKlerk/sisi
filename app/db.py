@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS products (
   shop_id       TEXT NOT NULL REFERENCES shops(shop_id),
   name          TEXT NOT NULL COLLATE NOCASE,
   price_cents   INTEGER,
+  cost_cents    INTEGER,
   stock_qty     REAL NOT NULL DEFAULT 0,
   reorder_level REAL NOT NULL DEFAULT 0,
   wholesaler    TEXT NOT NULL DEFAULT '',
@@ -157,6 +158,11 @@ def connect(path: str | Path | None = None) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    for sql in ("ALTER TABLE products ADD COLUMN cost_cents INTEGER",):
+        try:
+            conn.execute(sql)
+        except sqlite3.OperationalError:
+            pass  # column already exists on fresh DBs
     conn.commit()
 
 
