@@ -40,13 +40,33 @@ python -m seed.seed_demo
 pytest
 ```
 
-Run the API: `uvicorn app.main:app --reload`. Local chat (Step 3+): `python cli.py`.
+Run the API: `.venv/bin/python -m uvicorn app.main:app --port 8000`.
 
 ## Try it (judges)
 
-- CLI + seed data: `python -m seed.seed_demo && python cli.py`, shop `27710000001` (MaZulu's Spaza, fictional).
-- WhatsApp: message the test number (see hackathon submission) — try "Sipho took two bread and a 2L Coke on the book", tap Yes, then Undo.
+- Terminal chat (real model, no WhatsApp): `python -m seed.seed_demo && python -m sisi.chat`, shop `27710000001` (MaZulu's Spaza, fictional).
+- Simulated WhatsApp (no Meta account, same webhook + buttons path as production):
+
+  ```bash
+  SISI_DB=/tmp/sisi_sim.db .venv/bin/python -m uvicorn app.main:app --port 8000 &
+  python scripts/simulate.py "Sipho took 2 Sasko white bread and a 2L Coke on the book"
+  python scripts/simulate.py "Yes"
+  ```
+
+  Add `APP_SECRET=dev-secret` in front of both commands to also exercise signature verification.
+- Live WhatsApp: message the test number (see hackathon submission) — try "Sipho took two bread and a 2L Coke on the book", tap Yes, then Undo.
 - Screenshots: [screenshots/](screenshots/).
+
+## Go live (no code changes)
+
+Sisi auto-selects the fake sender until both of these are set; add exactly 2 env vars to send via the Cloud API:
+
+```bash
+WHATSAPP_TOKEN=...
+WHATSAPP_PHONE_NUMBER_ID=...
+```
+
+Also set `APP_SECRET` (webhook signature check) and `VERIFY_TOKEN` (webhook verification) before pointing Meta at `/webhook`.
 
 ## Honest notes
 
