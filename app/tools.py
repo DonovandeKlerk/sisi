@@ -80,13 +80,17 @@ def _get_or_create_customer(conn: sqlite3.Connection, shop_id: str, name: str) -
 
 
 def _find_products(conn: sqlite3.Connection, shop_id: str, query: str):
-    """Returns (unique_row_or_None, ambiguous_rows). Exact match wins, else one substring hit."""
+    """Returns (unique_row_or_None, ambiguous_rows). Exact match wins, else every
+    query word must appear in the product name ("Sasko bread" finds Sasko White Bread)."""
     q = query.strip().lower()
     rows = conn.execute("SELECT * FROM products WHERE shop_id = ?", (shop_id,)).fetchall()
     for r in rows:
         if r["name"].lower() == q:
             return r, []
-    hits = [r for r in rows if q in r["name"].lower() or r["name"].lower() in q]
+    toks = [t for t in q.replace(",", " ").split() if len(t) > 1]
+    hits = [r for r in rows if toks and all(t in r["name"].lower() for t in toks)]
+    if not hits:  # fallback: a full product name inside a longer phrase
+        hits = [r for r in rows if r["name"].lower() in q]
     if len(hits) == 1:
         return hits[0], []
     return None, hits

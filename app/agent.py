@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import sqlite3
 
+from app.llm import chat as llm_chat
+from app.llm import save_turn
 from app.tools import (
     cancel_pending,
     confirm_pending,
     demo_reset,
     ensure_shop,
+    get_pending,
     undo_last,
 )
 
@@ -47,12 +50,21 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
     return None
 
 
-def route_to_llm(conn: sqlite3.Connection, shop_id: str, text: str) -> str:  # Step 3
-    raise NotImplementedError("Step 3 wires the model")
+def route_to_llm(conn: sqlite3.Connection, shop_id: str, text: str) -> str:
+    return llm_chat(conn, shop_id, text)
 
 
 def handle_text(conn: sqlite3.Connection, shop_id: str, text: str):
+    ensure_shop(conn, shop_id)
+    before = get_pending(conn, shop_id)
+    before_id = before["id"] if before else None
     direct = try_deterministic(conn, shop_id, text)
     if direct is not None:
-        return direct
-    return route_to_llm(conn, shop_id, text), None
+        message, _ = direct
+        save_turn(conn, shop_id, "user", text)
+        save_turn(conn, shop_id, "assistant", message)
+    else:
+        message = route_to_llm(conn, shop_id, text)  # saves turns itself
+    after = get_pending(conn, shop_id)
+    buttons = ["Yes", "No"] if after is not None and after["id"] != before_id else None
+    return message, buttons

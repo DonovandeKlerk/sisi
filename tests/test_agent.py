@@ -1,7 +1,6 @@
 """Deterministic Yes/No/Undo routing (offline)."""
 
-import pytest
-
+from app import agent
 from app.agent import handle_text, try_deterministic
 from app.tools import add_credit, get_balance
 from seed.seed_demo import DEMO_SHOP_ID, seed_demo
@@ -44,12 +43,27 @@ def test_multilingual_yes_no(conn):
         assert msg == "OK, I did not save it.", word
 
 
-def test_other_text_goes_to_llm(conn):
+def test_other_text_goes_to_llm(conn, monkeypatch):
     seed_demo(SHOP, conn)
     assert try_deterministic(conn, SHOP, "Sipho took two bread") is None
     assert try_deterministic(conn, SHOP, "yes but change it") is None
-    with pytest.raises(NotImplementedError):
-        handle_text(conn, SHOP, "Sipho took two bread")
+    monkeypatch.setattr(agent, "llm_chat", lambda c, s, t: "roger")
+    msg, buttons = handle_text(conn, SHOP, "Sipho took two bread")
+    assert (msg, buttons) == ("roger", None)
+
+
+def test_new_preview_gets_yes_no_buttons(conn, monkeypatch):
+    seed_demo(SHOP, conn)
+
+    def fake_llm(c, shop_id, text):
+        add_credit(c, shop_id, "Sipho", [{"product": "Coke 2L", "qty": 1}])
+        return "Save?"
+
+    monkeypatch.setattr(agent, "llm_chat", fake_llm)
+    msg, buttons = handle_text(conn, SHOP, "Sipho took a Coke")
+    assert buttons == ["Yes", "No"]
+    msg, buttons = handle_text(conn, SHOP, "yes")
+    assert buttons is None and "Saved" in msg
 
 
 def test_demo_reset_command(conn):

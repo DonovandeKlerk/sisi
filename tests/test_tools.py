@@ -325,3 +325,16 @@ def test_tool_registry_complete():
 def test_confirm_cancel_without_pending(conn):
     assert confirm_pending(conn, SHOP) == "There is nothing waiting for Yes."
     assert cancel_pending(conn, SHOP) == "There is nothing waiting."
+
+
+def test_fuzzy_product_matching(conn):
+    from app.tools import _find_products
+
+    _seeded(conn)
+    prod, _ = _find_products(conn, SHOP, "Sasko bread")
+    assert prod["name"] == "Sasko White Bread 700g"
+    prod, _ = _find_products(conn, SHOP, "2l coke")
+    assert prod["name"] == "Coke 2L"
+    prod, _ = _find_products(conn, SHOP, "a bottle of coke 2l please")
+    assert prod["name"] == "Coke 2L"
+    assert _find_products(conn, SHOP, "Unicorn Flakes")[0] is None

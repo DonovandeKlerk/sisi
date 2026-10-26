@@ -16,6 +16,11 @@ def env(name: str, default: str = "") -> str:
     return os.environ.get(name, default)
 
 
+def model_name() -> str:
+    """Live read so SISI_MODEL can switch standard/contributor per run."""
+    return os.environ.get("SISI_MODEL") or "muse-spark-1.3"
+
+
 MODEL_API_KEY = env("MODEL_API_KEY")
 SISI_MODEL = env("SISI_MODEL", "muse-spark-1.3")
 SISI_LANGUAGE_BIAS = env("SISI_LANGUAGE_BIAS", "English")
