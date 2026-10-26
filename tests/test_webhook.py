@@ -235,6 +235,22 @@ def test_simulated_credit_conversation(sim_env, monkeypatch):
     assert "R146.00" in out3[0]["body"]
 
 
+def test_compliance_routing_keeps_official_link(sim_env, monkeypatch):
+    def fake(messages):
+        if any(isinstance(m, dict) and m.get("role") == "tool" for m in messages):
+            tool = next(m["content"] for m in reversed(messages)
+                        if isinstance(m, dict) and m.get("role") == "tool")
+            return _resp(f"Fund info: {tool}")
+        return _resp(calls=[_call("c9", "compliance_guide", {"topic": "fund"})])
+
+    monkeypatch.setattr(llm, "_complete", fake)
+    client = TestClient(app)
+    assert _post_text(client, "Can I get the spaza fund?", "wamid.c1").status_code == 200
+    out = client.get("/_sim/outbox", params={"shop": SHOP}).json()["messages"]
+    assert len(out) == 1
+    assert "spazashopfund.co.za" in out[0]["body"] and "FREE" in out[0]["body"]
+
+
 def test_webhook_dedupes_message_id(sim_env, monkeypatch):
     _scripted_model(monkeypatch)
     client = TestClient(app)

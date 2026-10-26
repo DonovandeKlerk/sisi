@@ -62,6 +62,8 @@ Run the API: `.venv/bin/python -m uvicorn app.main:app --port 8000`.
   reads best-before stamps via vision + strict structured output and proposes an
   expiry note. Set `SISI_TODAY=YYYY-MM-DD` on the server to freeze "today" for
   dated props.
+- Compliance: `python scripts/simulate.py "Can I get the spaza fund?"` answers
+  with the checklist, the official link, and the applications-are-free warning.
 - Live WhatsApp: message the test number (see hackathon submission) — try "Sipho took two bread and a 2L Coke on the book", tap Yes, then Undo.
 - Screenshots: [screenshots/](screenshots/).
 
