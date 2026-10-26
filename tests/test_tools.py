@@ -337,4 +337,8 @@ def test_fuzzy_product_matching(conn):
     assert prod["name"] == "Coke 2L"
     prod, _ = _find_products(conn, SHOP, "a bottle of coke 2l please")
     assert prod["name"] == "Coke 2L"
+    prod, _ = _find_products(conn, SHOP, "two litre Coke")
+    assert prod["name"] == "Coke 2L"
+    prod, _ = _find_products(conn, SHOP, "2 liter stoney")
+    assert prod["name"] == "Stoney 2L"
     assert _find_products(conn, SHOP, "Unicorn Flakes")[0] is None

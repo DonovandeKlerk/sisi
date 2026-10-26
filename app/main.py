@@ -16,11 +16,13 @@ import traceback
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 
-from app.agent import handle_text
+from app.agent import handle_text, handle_voice
 from app.db import connect, init_db
+from app.voice import VoiceError
 from app.whatsapp import (
     FakeSender,
     IncomingMessage,
+    download_media,
     get_sender,
     parse_webhook,
     verify_signature,
@@ -87,13 +89,24 @@ def process_message(msg: IncomingMessage) -> None:
             log.info("duplicate %s ignored", msg.message_id)
             return
         sender = get_sender()
-        if msg.text is None:
-            sender.send_text(msg.shop_id, UNSUPPORTED_REPLY)
-            return
         conn = connect()
         try:
             init_db(conn)
-            reply, buttons = handle_text(conn, msg.shop_id, msg.text)
+            if msg.kind == "media:audio":
+                if not msg.media_id:
+                    sender.send_text(msg.shop_id, "That voice note came out empty. Send it again?")
+                    return
+                try:
+                    audio = download_media(msg.media_id)
+                    _, reply, buttons = handle_voice(conn, msg.shop_id, audio, ".ogg")
+                except VoiceError as e:
+                    sender.send_text(msg.shop_id, str(e))
+                    return
+            elif msg.text is None:
+                sender.send_text(msg.shop_id, UNSUPPORTED_REPLY)
+                return
+            else:
+                reply, buttons = handle_text(conn, msg.shop_id, msg.text)
         finally:
             conn.close()
         if buttons:
@@ -113,3 +126,24 @@ def sim_outbox(shop: str):
     if not isinstance(sender, FakeSender):
         raise HTTPException(status_code=404, detail="live sender active")
     return {"messages": sender.pop_shop(shop)}
+
+
+@app.post("/_sim/voice")
+async def sim_voice(request: Request, shop: str):
+    """Dev-only: run raw audio bytes through the voice pipeline. 404 when live.
+
+    POST raw audio (ogg/opus or wav) with ?shop=<id>; answers synchronously
+    with the transcript, reply, and buttons. No signature needed (dev only).
+    """
+    if not isinstance(get_sender(), FakeSender):
+        raise HTTPException(status_code=404, detail="live sender active")
+    raw = await request.body()
+    ctype = (request.headers.get("Content-Type") or "").lower()
+    suffix = ".wav" if "wav" in ctype else ".ogg"
+    conn = connect()
+    try:
+        init_db(conn)
+        transcript, reply, buttons = handle_voice(conn, shop, raw, suffix)
+    finally:
+        conn.close()
+    return {"transcript": transcript, "reply": reply, "buttons": buttons or []}

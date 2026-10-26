@@ -54,6 +54,9 @@ Run the API: `.venv/bin/python -m uvicorn app.main:app --port 8000`.
   ```
 
   Add `APP_SECRET=dev-secret` in front of both commands to also exercise signature verification.
+- Voice notes without WhatsApp: `python scripts/simulate.py --audio samples/voice_sipho_credit.ogg`
+  sends a local recording through the full voice pipeline (ffmpeg → Muse Voice Transcribe →
+  Sisi's reply with the transcript shown first). Needs `ffmpeg` installed and `MODEL_API_KEY` set.
 - Live WhatsApp: message the test number (see hackathon submission) — try "Sipho took two bread and a 2L Coke on the book", tap Yes, then Undo.
 - Screenshots: [screenshots/](screenshots/).
 

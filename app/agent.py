@@ -6,6 +6,7 @@ import sqlite3
 
 from app.llm import chat as llm_chat
 from app.llm import save_turn
+from app.voice import VoiceError, transcribe_audio
 from app.tools import (
     cancel_pending,
     confirm_pending,
@@ -52,6 +53,28 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
 
 def route_to_llm(conn: sqlite3.Connection, shop_id: str, text: str) -> str:
     return llm_chat(conn, shop_id, text)
+
+
+def handle_voice(conn: sqlite3.Connection, shop_id: str, audio: bytes,
+               suffix: str = ".ogg"):
+    """Transcribe a voice note and handle it like text.
+
+    Returns (transcript_or_None, reply, buttons). The owner always sees what
+    Sisi heard before anything is proposed or saved.
+    """
+    ensure_shop(conn, shop_id)
+    extra = [r["name"] for r in conn.execute(
+        "SELECT name FROM customers WHERE shop_id = ?", (shop_id,)).fetchall()]
+    extra += [r["name"] for r in conn.execute(
+        "SELECT name FROM products WHERE shop_id = ?", (shop_id,)).fetchall()]
+    try:
+        transcript = transcribe_audio(audio, suffix, shop_id, extra).strip()
+    except VoiceError as e:
+        return None, str(e), None
+    if not transcript:
+        return None, "I couldn't hear anything in that voice note. Send it again?", None
+    reply, buttons = handle_text(conn, shop_id, transcript)
+    return transcript, f"Heard: “{transcript}”\n{reply}", buttons
 
 
 def handle_text(conn: sqlite3.Connection, shop_id: str, text: str):

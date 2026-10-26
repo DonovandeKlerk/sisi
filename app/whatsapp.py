@@ -34,6 +34,7 @@ class IncomingMessage:
     kind: str  # "text" | "button" | "media:<type>"
     text: str | None  # text body, button title, or None when unsupported
     timestamp: str = ""
+    media_id: str | None = None  # WhatsApp media id for audio/image/video
 
 
 def verify_signature(raw_body: bytes, signature_header: str | None, app_secret: str) -> bool:
@@ -75,8 +76,31 @@ def parse_webhook(payload: dict) -> list[IncomingMessage]:
                     out.append(IncomingMessage(mid, frm, "button",
                                                br.get("title") or br.get("id") or "", ts))
                 else:
-                    out.append(IncomingMessage(mid, frm, f"media:{mtype}", None, ts))
+                    inner = m.get(mtype) or {}
+                    media_id = inner.get("id") if isinstance(inner, dict) else None
+                    out.append(IncomingMessage(mid, frm, f"media:{mtype}", None, ts, media_id))
     return out
+
+
+def download_media(media_id: str) -> bytes:
+    """Fetch WhatsApp media bytes via the media-id endpoint. Raises VoiceError."""
+    from app.voice import CANT_HEAR, VoiceError
+
+    token = os.environ.get("WHATSAPP_TOKEN", "")
+    version = os.environ.get("GRAPH_API_VERSION", "v26.0")
+    if not token:
+        raise VoiceError("I couldn't fetch that voice note. Please send it again?")
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        meta = httpx.get(f"{GRAPH_BASE}/{version}/{media_id}", headers=headers, timeout=15)
+        meta.raise_for_status()
+        url = meta.json().get("url", "")
+        data = httpx.get(url, headers=headers, timeout=30)
+        data.raise_for_status()
+        return data.content
+    except httpx.HTTPError as e:
+        log.warning("media download failed: %r", e)
+        raise VoiceError(CANT_HEAR) from e
 
 
 class WhatsAppSender:

@@ -79,15 +79,30 @@ def _get_or_create_customer(conn: sqlite3.Connection, shop_id: str, name: str) -
     return conn.execute("SELECT * FROM customers WHERE id = ?", (cur.lastrowid,)).fetchone(), True
 
 
+_NUMBER_WORDS = {"one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+                "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10"}
+
+
+def _normalize_query(query: str) -> str:
+    """Lowercase, number words to digits, litre/liter to l ("two litre Coke" -> "2 l coke")."""
+    out = []
+    for word in query.strip().lower().replace(",", " ").split():
+        word = _NUMBER_WORDS.get(word, word)
+        if word in ("litre", "litres", "liter", "liters"):
+            word = "l"
+        out.append(word)
+    return " ".join(out)
+
+
 def _find_products(conn: sqlite3.Connection, shop_id: str, query: str):
     """Returns (unique_row_or_None, ambiguous_rows). Exact match wins, else every
     query word must appear in the product name ("Sasko bread" finds Sasko White Bread)."""
-    q = query.strip().lower()
+    q = _normalize_query(query)
     rows = conn.execute("SELECT * FROM products WHERE shop_id = ?", (shop_id,)).fetchall()
     for r in rows:
         if r["name"].lower() == q:
             return r, []
-    toks = [t for t in q.replace(",", " ").split() if len(t) > 1]
+    toks = [t for t in q.split() if len(t) > 1]
     hits = [r for r in rows if toks and all(t in r["name"].lower() for t in toks)]
     if not hits:  # fallback: a full product name inside a longer phrase
         hits = [r for r in rows if r["name"].lower() in q]
