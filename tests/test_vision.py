@@ -1,6 +1,5 @@
 """Photo expiry pipeline: vision shape, agent + webhook wiring. Offline."""
 
-import base64
 import json
 import shutil
 import subprocess
@@ -44,21 +43,13 @@ def _vresp(content):
 
 
 def _tiny_jpg() -> bytes:
-    """A real 8x8 jpeg (ffmpeg-generated when available, else a minimal stub)."""
-    if ffmpeg_available:
-        proc = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-             "-f", "lavfi", "-i", "testsrc=size=8x8:rate=1:duration=1",
-             "-frames:v", "1", "-f", "mjpeg", "pipe:1"],
-            capture_output=True, timeout=30,
-        )
-        if proc.returncode == 0 and proc.stdout[:2] == b"\xff\xd8":
-            return proc.stdout
-    return base64.b64decode(
-        "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////"
-        "//////////////////////////////////////////2wBDAf////////////////////////////////"
-        "//////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAA"
-        "AAAAAP/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AK//Z")
+    """A real 8x8 jpeg, generated with Pillow (ffmpeg-independent)."""
+    import io
+
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (8, 8), (200, 30, 30)).save(buf, "JPEG")
+    return buf.getvalue()
 
 
 def _expiry_doc(items):
