@@ -71,8 +71,10 @@ def test_demo_reset_command(conn):
     add_credit(conn, SHOP, "Sipho", [{"product": "Coke 2L", "qty": 1}])
     try_deterministic(conn, SHOP, "yes")
     msg, _ = try_deterministic(conn, SHOP, "demo reset")
-    assert msg.startswith("🎉 Fresh start.")
-    assert get_balance(conn, SHOP, "Sipho") == "💳 *Sipho* owes R73.00."
+    assert msg.startswith("🏪 *Let's set up your shop.*")
+    assert "Step 1 of 6" in msg
+    assert conn.execute("SELECT COUNT(*) n FROM customers WHERE shop_id = ?",
+                        (SHOP,)).fetchone()["n"] == 0
 
 
 def test_delete_my_data_command(conn):

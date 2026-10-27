@@ -163,7 +163,7 @@ def test_questions_and_errors_format(conn):
     assert assert_format(set_price(conn, SHOP, "Unicorn", 100)).startswith("❓ *")
     assert assert_format(record_sale(conn, SHOP, "Milk 1L", 0)) == "How many?"
     assert "🔒" not in assert_format(delete_my_data(conn, SHOP))
-    assert assert_format(demo_reset(conn, SHOP)).startswith("🎉 Fresh start.")
+    assert assert_format(demo_reset(conn, SHOP)).startswith("🏪 *Let's set up")
     assert_format(CONSENT_LINE)
     assert_format(UNSUPPORTED_REPLY)
     assert_format(CANT_HEAR)

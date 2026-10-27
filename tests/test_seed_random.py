@@ -81,15 +81,21 @@ def test_reseed_is_random_but_repeatable(conn):
 
 def test_demo_reset_dispatches_per_number(conn):
     seed_demo(DEMO_SHOP_ID, conn)
-    assert demo_reset(conn, DEMO_NUMBER) == "🎉 Fresh start. Sisi Spaza is loaded again."
-    assert 25 <= len(_products(conn)) <= 30
-    assert demo_reset(conn, DEMO_SHOP_ID).startswith("🎉 Fresh start. MaZulu's Spaza")
-    assert len(_products(conn, DEMO_SHOP_ID)) == 10
+    msg = demo_reset(conn, DEMO_NUMBER)
+    assert msg.startswith("🏪 *Let's set up your shop.*")
+    row = conn.execute("SELECT value FROM flags WHERE shop_id = ? AND key = 'setup-reseed'",
+                       (DEMO_NUMBER,)).fetchone()
+    assert row is not None
+    msg = demo_reset(conn, DEMO_SHOP_ID)
+    assert msg.startswith("🏪 *Let's set up your shop.*")
+    row = conn.execute("SELECT value FROM flags WHERE shop_id = ? AND key = 'setup-reseed'",
+                       (DEMO_SHOP_ID,)).fetchone()
+    assert row is None
 
 
 def test_reset_demo_command_for_live_number(conn):
     msg, buttons = try_deterministic(conn, DEMO_NUMBER, "reset demo")
-    assert buttons is None and "Sisi Spaza" in msg
+    assert buttons is None and "Step 1 of 6" in msg
 
 
 def test_reset_clears_await_price_and_conversation(conn):

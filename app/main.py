@@ -296,12 +296,19 @@ def admin_seed(token: str, shop: str):
     expected = os.environ.get("VERIFY_TOKEN", "")
     if not expected or not hmac.compare_digest(token, expected):
         raise HTTPException(status_code=403, detail="forbidden")
-    from app.tools import demo_reset
+    from app.setup import skip_setup
+    from seed.seed_demo import seed_demo
+    from seed.seed_random import DEMO_NUMBER, seed_random_shop
 
     conn = connect()
     try:
         init_db(conn)
-        message = demo_reset(conn, shop)
+        if shop == DEMO_NUMBER:
+            seed_random_shop(shop, conn)
+        else:
+            seed_demo(shop, conn)
+        skip_setup(conn, shop)
+        message = "Demo shop reseeded."
     finally:
         conn.close()
     return {"status": "ok", "shop": shop, "message": message}

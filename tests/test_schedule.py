@@ -27,9 +27,11 @@ def _dirs(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def shop(conn):
+    from app.setup import skip_setup
     ensure_shop(conn, SHOP, "Nudge Spaza")
     conn.execute("UPDATE shops SET channel = 'vonage' WHERE shop_id = ?", (SHOP,))
     conn.commit()
+    skip_setup(conn, SHOP)
     return SHOP
 
 

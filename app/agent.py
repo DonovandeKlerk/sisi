@@ -12,6 +12,13 @@ from datetime import datetime, timedelta, timezone
 
 from app import reports
 from app.db import today_str
+from app.setup import (
+    answer as setup_answer,
+    mark_paused,
+    needs_setup,
+    setup_step,
+    start_setup,
+)
 from app.llm import chat as llm_chat
 from app.llm import save_turn
 from app.vision import VisionError, read_expiry_photo, read_shop_photo
@@ -45,9 +52,11 @@ from app.tools import (
     propose_book_page,
     propose_receipt,
     add_staff,
+    confirm_reset_shop,
     customer_statement,
     record_sale,
     resolve_sender,
+    reset_shop,
     confirm_logo,
     save_shop_logo,
     switch_logo,
@@ -131,6 +140,8 @@ DEMO_HELP = (
     "• *expiry* — 'bread expires Friday'\n"
     "• *nudge* — 'nudge at 20:00', 'nudge off'\n"
     "• *staff* — 'add staff 082… Thandi', 'who recorded today'\n"
+    "• *setup* — 'setup' re-runs the 6-step guide\n"
+    "• *reset* — 'reset demo' (fresh demo) or 'reset shop' (erase all)\n"
     "• *expiry photo* — send a photo of a date stamp\n"
     "• *compliance* — 'can I get the spaza fund?'\n"
     "• *scam check* — 'is this fund agent a scam?'\n"
@@ -186,27 +197,39 @@ def _parse_order_add(word: str):
     return product, qty, unit
 
 
+def _float_num(tok: str) -> int | None:
+    m = re.fullmatch(r"r?(\d+(?:\.\d{1,2})?)", tok.strip(" .!?"))
+    if not m:
+        return None
+    cents = int(round(float(m.group(1)) * 100))
+    return cents if cents > 0 else None
+
+
 def _parse_float(text: str) -> dict:
     """'float R1200 petty R300' -> {'cash': 120000, 'petty': 30000}."""
-    toks = (text or "").lower().replace(",", " ").split()
     out: dict[str, int] = {}
-    for i, tok in enumerate(toks):
-        m = re.fullmatch(r"r?(\d+(?:\.\d{1,2})?)", tok.strip(" .!?"))
-        if not m:
-            continue
-        cents = int(round(float(m.group(1)) * 100))
-        if cents <= 0:
-            continue
-        acct = "cash"
-        prev = toks[i - 1].strip(" .!?") if i else ""
-        nxt = toks[i + 1].strip(" .!?") if i + 1 < len(toks) else ""
-        after = toks[i + 2] if i + 2 < len(toks) else ""
-        if prev in _FLOAT_WORDS:
-            acct = _FLOAT_WORDS[prev]
-        elif nxt in _FLOAT_WORDS and not re.fullmatch(r"r?\d+(?:\.\d{1,2})?",
-                                                      after.strip(" .!?")):
-            acct = _FLOAT_WORDS[nxt]
-        out.setdefault(acct, cents)
+    for seg in re.split(r"[,;]|\band\b", (text or "").lower()):
+        toks = [t.strip(" .!?") for t in seg.split()]
+        pending_label: str | None = None
+        unbound: list[int] = []
+        for i, tok in enumerate(toks):
+            num = _float_num(tok)
+            if num is not None:
+                if pending_label is not None:
+                    out.setdefault(pending_label, num)
+                    pending_label = None
+                else:
+                    unbound.append(num)
+                continue
+            if tok in _FLOAT_WORDS:
+                nxt_is_num = (i + 1 < len(toks)
+                              and _float_num(toks[i + 1]) is not None)
+                if unbound and not nxt_is_num:
+                    out.setdefault(_FLOAT_WORDS[tok], unbound.pop())
+                else:
+                    pending_label = _FLOAT_WORDS[tok]
+        for num in unbound:
+            out.setdefault("cash", num)
     return out
 
 
@@ -219,7 +242,8 @@ _STAFF_BLOCKED_EXACT = {"undo", "demo reset", "reset demo", "delete my data",
                         "statements for everyone", "all statements",
                         "shop profile", "show shop profile",
                         "my shop profile", "show my shop profile",
-                        "logo", "use original logo", "remove logo background"}
+                        "logo", "use original logo", "remove logo background",
+                        "setup", "reset shop", "yes erase everything"}
 
 
 def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
@@ -444,9 +468,23 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
 
     Returns (doc_or_None, reply, buttons). Nothing is saved until Yes.
     """
-    shop_id, _ = _enter(conn, shop_id)
+    shop_id, staff = _enter(conn, shop_id)
     ensure_shop(conn, shop_id)
     LAST_PHOTO[shop_id] = (image or b"", datetime.now(timezone.utc))
+    if staff is None and setup_step(conn, shop_id):
+        from app.setup import handle_photo as setup_photo
+        from app.setup import step_prompt as setup_prompt
+        got = setup_photo(conn, shop_id, image or b"")
+        if got is not None:
+            save_turn(conn, shop_id, "user", "[photo]")
+            save_turn(conn, shop_id, "assistant", got)
+            return None, got, None
+        step = setup_step(conn, shop_id) or 1
+        reply = ("📷 Noted — but first, let's finish setting up.\n\n"
+                 + setup_prompt(conn, shop_id, step))
+        save_turn(conn, shop_id, "user", "[photo]")
+        save_turn(conn, shop_id, "assistant", reply)
+        return None, reply, None
     if (caption or "").strip().lower() == "logo":
         reply = save_shop_logo(conn, shop_id, image or b"")
         save_turn(conn, shop_id, "user", "[logo photo]")
@@ -485,8 +523,43 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
 
 
 def handle_text(conn: sqlite3.Connection, shop_id: str, text: str):
-    shop_id, _ = _enter(conn, shop_id)
+    shop_id, staff = _enter(conn, shop_id)
     ensure_shop(conn, shop_id)
+    if staff is None:
+        word0 = _normalize(text or "")
+        if word0 == "setup":
+            message = start_setup(conn, shop_id)
+            save_turn(conn, shop_id, "user", text)
+            save_turn(conn, shop_id, "assistant", message)
+            return message, None
+        if word0 == "reset shop":
+            message = reset_shop(conn, shop_id)
+            save_turn(conn, shop_id, "user", text)
+            save_turn(conn, shop_id, "assistant", message)
+            return message, None
+        if word0 == "yes erase everything":
+            message = confirm_reset_shop(conn, shop_id)
+            save_turn(conn, shop_id, "user", text)
+            save_turn(conn, shop_id, "assistant", message)
+            return message, None
+        if word0 in RESET_WORDS:
+            message = demo_reset(conn, shop_id)
+            save_turn(conn, shop_id, "user", text)
+            save_turn(conn, shop_id, "assistant", message)
+            return message, None
+        if word0 in HELP_WORDS:
+            mark_paused(conn, shop_id)
+            save_turn(conn, shop_id, "user", text)
+            save_turn(conn, shop_id, "assistant", DEMO_HELP)
+            return DEMO_HELP, None
+        if needs_setup(conn, shop_id):
+            if setup_step(conn, shop_id) is None:
+                message = start_setup(conn, shop_id)
+            else:
+                message = setup_answer(conn, shop_id, shop_id, text)
+            save_turn(conn, shop_id, "user", text)
+            save_turn(conn, shop_id, "assistant", message)
+            return message, None
     before = get_pending(conn, shop_id)
     before_id = before["id"] if before else None
     direct = try_deterministic(conn, shop_id, text)

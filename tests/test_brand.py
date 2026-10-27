@@ -25,6 +25,12 @@ def _logo_bytes(color=(20, 80, 40), size=(300, 200)):
 
 
 @pytest.fixture(autouse=True)
+def _no_setup(conn):
+    from app.setup import skip_setup
+    skip_setup(conn, SHOP)
+
+
+@pytest.fixture(autouse=True)
 def _dirs(tmp_path, monkeypatch):
     monkeypatch.setattr(reports, "REPORTS_DIR", tmp_path / "reports")
     monkeypatch.setattr(reports, "LOGOS_DIR", tmp_path / "logos")

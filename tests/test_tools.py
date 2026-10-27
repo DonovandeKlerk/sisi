@@ -334,9 +334,8 @@ def test_demo_reset(conn):
     _seeded(conn)
     add_credit(conn, SHOP, "Stranger", [{"product": "Coke 2L", "qty": 1}])
     confirm_pending(conn, SHOP)
-    assert demo_reset(conn, SHOP).startswith("🎉 Fresh start.")
-    assert _count(conn, "customers") == 6
-    assert get_balance(conn, SHOP, "Sipho") == "💳 *Sipho* owes R73.00."
+    assert demo_reset(conn, SHOP).startswith("🏪 *Let's set up your shop.*")
+    assert _count(conn, "customers") == 0
 
 
 def test_delete_my_data_erases_shop(conn):

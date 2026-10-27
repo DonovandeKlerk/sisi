@@ -1628,18 +1628,38 @@ def compliance_guide(conn: sqlite3.Connection, shop_id: str, topic: str = "overv
 
 
 def demo_reset(conn: sqlite3.Connection, shop_id: str) -> str:
-    """Wipe one shop and reseed demo data. Demo command, not a model tool."""
+    """Wipe demo data, run setup, then reseed the 30-day books (demo number)."""
     blocked = _staff_blocked()
     if blocked:
         return blocked
-    from seed.seed_demo import DEMO_SHOP_NAME, seed_demo
-    from seed.seed_random import DEMO_NUMBER, SHOP_NAME, seed_random_shop
+    from seed.seed_demo import wipe_shop
+    from seed.seed_random import DEMO_NUMBER
+    from app.setup import start_setup
+    wipe_shop(conn, shop_id)
+    ensure_shop(conn, shop_id)
+    return start_setup(conn, shop_id, reseed=(shop_id == DEMO_NUMBER))
 
-    if shop_id == DEMO_NUMBER:
-        seed_random_shop(shop_id, conn)
-        return f"🎉 Fresh start. {SHOP_NAME} is loaded again."
-    seed_demo(shop_id, conn)
-    return f"🎉 Fresh start. {DEMO_SHOP_NAME} is loaded again."
+
+def reset_shop(conn: sqlite3.Connection, shop_id: str) -> str:
+    """Danger prompt before wiping a real shop. Confirm with 'yes erase everything'."""
+    blocked = _staff_blocked()
+    if blocked:
+        return blocked
+    ensure_shop(conn, shop_id)
+    return ("⚠️ *Reset shop?*\n• This erases ALL your stock, books and reports.\n"
+            "• Reply 'yes erase everything' to go ahead, or anything else to keep it.")
+
+
+def confirm_reset_shop(conn: sqlite3.Connection, shop_id: str) -> str:
+    """Wipe a real shop after confirmation, then run setup. No reseed."""
+    blocked = _staff_blocked()
+    if blocked:
+        return blocked
+    from seed.seed_demo import wipe_shop
+    from app.setup import start_setup
+    wipe_shop(conn, shop_id)
+    ensure_shop(conn, shop_id)
+    return start_setup(conn, shop_id)
 
 
 def _remove_shop_files(conn: sqlite3.Connection, shop_id: str, *logos: str) -> None:
