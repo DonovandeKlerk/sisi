@@ -1,6 +1,6 @@
 """DB schema, money formatting, and date-freeze helpers."""
 
-from app.db import cents_to_rand, today_str
+from app.db import cents_to_rand, init_db, today_str
 
 
 def test_schema_tables_exist(conn):
@@ -56,3 +56,16 @@ def test_today_freeze(monkeypatch):
     assert today_str() == "2026-11-01"
     monkeypatch.delenv("SISI_TODAY")
     assert len(today_str()) == 10  # real date, YYYY-MM-DD
+
+
+def test_init_db_idempotent_and_preserves_legacy_rows(conn):
+    conn.execute("INSERT INTO shops (shop_id, name) VALUES ('legacy-1', 'Old Shop')")
+    conn.execute("INSERT INTO customers (shop_id, name) VALUES ('legacy-1', 'Sipho')")
+    conn.commit()
+    init_db(conn)  # rerun: ALTERs must pass harmlessly
+    init_db(conn)
+    shop = conn.execute("SELECT * FROM shops WHERE shop_id = 'legacy-1'").fetchone()
+    assert shop["name"] == "Old Shop"
+    assert shop["address"] == "" and shop["logo_path"] == ""
+    cust = conn.execute("SELECT * FROM customers WHERE shop_id = 'legacy-1'").fetchone()
+    assert cust["name"] == "Sipho" and cust["credit_limit_cents"] is None

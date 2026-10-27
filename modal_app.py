@@ -48,3 +48,15 @@ def web():
     os.environ["SISI_DB"] = "/data/sisi.db"
     os.environ.setdefault("SISI_REPORTS", "/data/reports")
     return fastapi_app
+
+
+@app.function(schedule=modal.Period(minutes=15), timeout=300)
+def nudges():
+    """Quarter-hour tick: 19:00 SAST book nudge, Sunday snapshot, expiry warns."""
+    import logging
+
+    os.environ["SISI_DB"] = "/data/sisi.db"
+    os.environ.setdefault("SISI_REPORTS", "/data/reports")
+    from app.schedule import run_due
+    for job in run_due():
+        logging.getLogger("sisi").info("scheduled %s -> %s", job["key"], job["shop"])

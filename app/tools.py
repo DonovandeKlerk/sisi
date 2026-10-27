@@ -239,7 +239,42 @@ def confirm_pending(conn: sqlite3.Connection, shop_id: str) -> str:
         (now_iso(), row["id"]),
     )
     conn.commit()
+    if row["action_type"] in ("book_page", "record_count"):
+        from app.schedule import maybe_day_summary
+        message += maybe_day_summary(conn, shop_id)
+    if row["action_type"] == "receipt" and undo.get("cost_increases"):
+        message += _chain_price_alert(conn, shop_id, undo["cost_increases"],
+                                      undo.get("supplier") or "")
     return message
+
+
+def _chain_price_alert(conn: sqlite3.Connection, shop_id: str, increases: list,
+                       supplier: str) -> str:
+    """After a receipt with higher costs, propose a price update (Yes applies)."""
+    import math as _math
+    first = increases[0]
+    prod = conn.execute("SELECT price_cents FROM products WHERE id = ?",
+                        (first["product_id"],)).fetchone()
+    price = prod["price_cents"] if prod else None
+    up = first["new"] - first["old"]
+    margin = ""
+    if price:
+        margin = f" Your margin is now {round((price - first['new']) * 100 / price)}%."
+    suggest = (price + up) if price else None
+    if suggest is not None:
+        suggest = int(_math.ceil(suggest / 50) * 50)
+        payload = {"product_id": first["product_id"], "name": first["name"],
+                   "price_cents": suggest, "old_price": price,
+                   "for_pack": False, "pack_name": ""}
+        _propose(conn, shop_id, "set_price", payload,
+                 f"📝 *Set price?*\n• {first['name']} {cents_to_rand(price)}"
+                 f" → {cents_to_rand(suggest)}")
+        ask = f" Update the price to {cents_to_rand(suggest)}?"
+    else:
+        ask = " Set a sell price?"
+    extra = f" (+{len(increases) - 1} more)" if len(increases) > 1 else ""
+    return (f"\n\n⚠️ *{first['name']} cost went up {cents_to_rand(up)}"
+            f" at {supplier}.*{margin}{ask}{extra}")
 
 
 def cancel_pending(conn: sqlite3.Connection, shop_id: str) -> str:
@@ -356,9 +391,10 @@ def clear_await_price(conn: sqlite3.Connection, shop_id: str) -> None:
 def _apply_add_credit(conn: sqlite3.Connection, shop_id: str, payload: dict, action_id: str):
     cust, _ = _get_or_create_customer(conn, shop_id, payload["customer"])
     cur = conn.execute(
-        "INSERT INTO credit_entries (shop_id, customer_id, amount_cents, items_text, action_id)"
-        " VALUES (?, ?, ?, ?, ?)",
-        (shop_id, cust["id"], payload["total_cents"], _items_text(payload["lines"]), action_id),
+        "INSERT INTO credit_entries (shop_id, customer_id, amount_cents, items_text,"
+        " action_id, recorded_by) VALUES (?, ?, ?, ?, ?, ?)",
+        (shop_id, cust["id"], payload["total_cents"], _items_text(payload["lines"]),
+         action_id, _rec()),
     )
     bal = balance_cents(conn, shop_id, cust["id"])
     return (
@@ -414,6 +450,10 @@ def add_credit(conn: sqlite3.Connection, shop_id: str, customer: str, items: lis
         f"• {customer.strip()} +{cents_to_rand(total)} ({_items_text(lines)})\n"
         f"• New balance {cents_to_rand(new_bal)}"
     )
+    if not is_new:
+        cust = _get_customer(conn, shop_id, customer)
+        if cust is not None:
+            preview += _limit_warn(conn, shop_id, cust["id"], new_bal)
     if is_new:
         preview += "\n• New customer."
     return _propose(conn, shop_id, "add_credit", payload, preview)
@@ -421,8 +461,9 @@ def add_credit(conn: sqlite3.Connection, shop_id: str, customer: str, items: lis
 
 def _apply_record_payment(conn: sqlite3.Connection, shop_id: str, payload: dict, action_id: str):
     cur = conn.execute(
-        "INSERT INTO payments (shop_id, customer_id, amount_cents, action_id) VALUES (?, ?, ?, ?)",
-        (shop_id, payload["customer_id"], payload["amount_cents"], action_id),
+        "INSERT INTO payments (shop_id, customer_id, amount_cents, action_id, recorded_by)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (shop_id, payload["customer_id"], payload["amount_cents"], action_id, _rec()),
     )
     _post_cash(conn, shop_id, payload.get("account", "cash"), payload["amount_cents"],
                "credit_payment", action_id, ref_type="payment", ref_id=cur.lastrowid)
@@ -463,10 +504,10 @@ def record_payment(conn: sqlite3.Connection, shop_id: str, customer: str, amount
 
 def _apply_record_expense(conn: sqlite3.Connection, shop_id: str, payload: dict, action_id: str):
     cur = conn.execute(
-        "INSERT INTO expenses (shop_id, category, amount_cents, account, note, action_id)"
-        " VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO expenses (shop_id, category, amount_cents, account, note, action_id,"
+        " recorded_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
         (shop_id, payload["category"], payload["amount_cents"], payload["account"],
-         payload.get("note") or "", action_id),
+         payload.get("note") or "", action_id, _rec()),
     )
     _post_cash(conn, shop_id, payload["account"], -payload["amount_cents"], "expense",
                action_id, category=payload["category"], ref_type="expense",
@@ -626,18 +667,18 @@ def _apply_record_sale(conn: sqlite3.Connection, shop_id: str, payload: dict, ac
         cust, _ = _get_or_create_customer(conn, shop_id, payload["buyer"])
         customer_id = cust["id"]
         cur = conn.execute(
-            "INSERT INTO credit_entries (shop_id, customer_id, amount_cents, items_text, action_id)"
-            " VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO credit_entries (shop_id, customer_id, amount_cents, items_text,"
+            " action_id, recorded_by) VALUES (?, ?, ?, ?, ?, ?)",
             (shop_id, customer_id, payload["total_cents"],
              f"{payload.get('short') or _fmt_qty(payload['qty']) + 'x ' + payload['product']} (sale)",
-             action_id),
+             action_id, _rec()),
         )
         credit_id = cur.lastrowid
     cur = conn.execute(
-        "INSERT INTO sales (shop_id, product_id, product_name, qty, total_cents, customer_id, action_id)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO sales (shop_id, product_id, product_name, qty, total_cents, customer_id,"
+        " action_id, recorded_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (shop_id, payload["product_id"], payload["product"], payload["qty"],
-         payload["total_cents"], customer_id, action_id),
+         payload["total_cents"], customer_id, action_id, _rec()),
     )
     sale_id = cur.lastrowid
     conn.execute("UPDATE products SET stock_qty = stock_qty - ? WHERE id = ?",
@@ -725,6 +766,10 @@ def record_sale(conn: sqlite3.Connection, shop_id: str, product: str, qty: float
                    f"• Balance {cents_to_rand(buyer_bal)}\n{left}")
         if buyer_new:
             preview += "\n• New customer."
+        else:
+            cust = _get_customer(conn, shop_id, buyer_name)
+            if cust is not None:
+                preview += _limit_warn(conn, shop_id, cust["id"], buyer_bal)
     else:
         preview = f"📝 *Save sale?*\n{first} cash\n{left}"
     if line["warn"]:
@@ -1139,12 +1184,208 @@ def list_debtors(conn: sqlite3.Connection, shop_id: str) -> str:
     if not debtors:
         return "✅ Nobody owes anything. The book is clean."
     debtors.sort(key=lambda t: -t[1])
-    lines = ["💳 *On the book*"] + [f"• {n} — {cents_to_rand(b)}" for n, b in debtors]
+    today = today_str()
+    lines = ["💳 *On the book*"]
+    for n, b in debtors:
+        cust = _get_customer(conn, shop_id, n)
+        age = ""
+        if cust is not None:
+            first = conn.execute(
+                "SELECT MIN(substr(created_at, 1, 10)) m FROM credit_entries"
+                " WHERE shop_id = ? AND customer_id = ? AND reversed = 0",
+                (shop_id, cust["id"])).fetchone()["m"]
+            if first:
+                days = (date.fromisoformat(today) - date.fromisoformat(first)).days
+                if days > 7:
+                    age = f" ⚠️ {days}d old"
+        lines.append(f"• {n} — {cents_to_rand(b)}{age}")
     total = sum(b for _, b in debtors)
     return "\n".join(lines) + f"\n\nTotal: {cents_to_rand(total)}."
 
 
+_WEEKDAYS = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+             "friday": 4, "saturday": 5, "sunday": 6}
+
+
+def parse_expiry_date(text: str) -> str | None:
+    """'Friday', 'tomorrow', 'in 5 days', '2026-11-03' -> ISO date. None if lost."""
+    from datetime import timedelta as _td
+    word = (text or "").strip().lower()
+    today = date.fromisoformat(today_str())
+    if word in ("today",):
+        return today.isoformat()
+    if word in ("tomorrow", "tmr"):
+        return (today + _td(days=1)).isoformat()
+    m = re.fullmatch(r"in (\d{1,3}) days?", word)
+    if m:
+        return (today + _td(days=int(m.group(1)))).isoformat()
+    if word in _WEEKDAYS:
+        delta = (_WEEKDAYS[word] - today.weekday()) % 7 or 7
+        return (today + _td(days=delta)).isoformat()
+    m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", word)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3))).isoformat()
+        except ValueError:
+            return None
+    return None
+
+
+def add_staff(conn: sqlite3.Connection, shop_id: str, phone: str,
+              name: str) -> str:
+    blocked = _staff_blocked()
+    if blocked:
+        return blocked
+    ensure_shop(conn, shop_id)
+    digits = re.sub(r"\D", "", phone or "")
+    if len(digits) < 9:
+        return "Say it like 'add staff 0821234567 Thandi'."
+    if digits == re.sub(r"\D", "", shop_id):
+        return "That's your own number — you're already the owner."
+    conn.execute("INSERT INTO staff (shop_id, phone, name) VALUES (?, ?, ?)"
+                 " ON CONFLICT (shop_id, phone) DO UPDATE SET name = excluded.name",
+                 (shop_id, digits, (name or "").strip()[:40] or digits))
+    conn.commit()
+    return (f"✅ *Staff added*\n• {(name or '').strip() or digits} ({digits})"
+            " can record sales, credit and book photos.")
+
+
+def resolve_sender(conn: sqlite3.Connection,
+                   sender: str) -> tuple[str, str | None]:
+    """Map a sender number to (owner_shop, staff_name_or_None)."""
+    row = conn.execute("SELECT shop_id, name FROM staff WHERE phone = ?",
+                       (re.sub(r"\D", "", sender or ""),)).fetchone()
+    if row is None:
+        return sender, None
+    return row["shop_id"], row["name"] or row["shop_id"]
+
+
+def _staff_blocked() -> str | None:
+    from app.agent import _STAFF_NAME
+    if _STAFF_NAME.get():
+        return ("⛔ *Owners only*\nStaff can record sales, credit and book photos"
+                " — profit, reports and settings stay with the owner.")
+    return None
+
+
+def _rec() -> str:
+    """Display name to stamp on entries: staff name, or '' for the owner."""
+    from app.agent import _STAFF_NAME
+    return _STAFF_NAME.get() or ""
+
+
+def who_recorded_today(conn: sqlite3.Connection, shop_id: str) -> str:
+    ensure_shop(conn, shop_id)
+    day = today_str()
+    rng = "substr(datetime(created_at, '+2 hours'), 1, 10) = ?"
+    tallies: dict[str, dict] = {}
+    for table, col in (("sales", "total_cents"), ("credit_entries", "amount_cents"),
+                       ("payments", "amount_cents"), ("expenses", "amount_cents")):
+        for r in conn.execute(
+                f"SELECT recorded_by, COUNT(*) n, COALESCE(SUM({col}), 0) s"
+                f" FROM {table} WHERE shop_id = ? AND reversed = 0 AND {rng}"
+                " GROUP BY recorded_by", (shop_id, day)).fetchall():
+            who = r["recorded_by"] or "Owner"
+            t = tallies.setdefault(who, {"n": 0, "s": 0})
+            t["n"] += r["n"]
+            t["s"] += r["s"]
+    if not tallies:
+        return "📝 *Who recorded today*\n\nNothing recorded yet today."
+    lines = ["📝 *Who recorded today*"]
+    for who in sorted(tallies):
+        t = tallies[who]
+        lines.append(f"• {who}: {t['n']} entries, {cents_to_rand(t['s'])}")
+    return "\n".join(lines)
+
+
+def set_expiry(conn: sqlite3.Connection, shop_id: str, product: str,
+               when: str) -> str:
+    blocked = _staff_blocked()
+    if blocked:
+        return blocked
+    ensure_shop(conn, shop_id)
+    day = parse_expiry_date(when or "")
+    if day is None:
+        return "When does it expire? Say 'Friday', 'tomorrow' or a date."
+    prod, _ = _find_products(conn, shop_id, product or "")
+    qty = prod["stock_qty"] if prod else 0
+    name = prod["name"] if prod else (product or "").strip()
+    if not name:
+        return "Which item?"
+    conn.execute(
+        "INSERT INTO expiry_items (shop_id, product_name, qty, expiry_date, note)"
+        " VALUES (?, ?, ?, ?, 'owner')",
+        (shop_id, name, qty, day))
+    conn.commit()
+    return (f"⏰ *Expiry noted*\n• {name} {_fmt_date(day)}\n"
+            "• I'll warn you 2 days before.")
+
+
+def set_nudge(conn: sqlite3.Connection, shop_id: str, setting: str) -> str:
+    """Change the 19:00 books reminder: 'HH:MM', 'off' or 'on'."""
+    blocked = _staff_blocked()
+    if blocked:
+        return blocked
+    import re as _re
+    ensure_shop(conn, shop_id)
+    word = (setting or "").strip().lower()
+    if word == "off":
+        conn.execute("INSERT INTO flags (shop_id, key, value) VALUES (?, 'nudge_off', '1')"
+                     " ON CONFLICT (shop_id, key) DO UPDATE SET value = '1'",
+                     (shop_id,))
+        conn.commit()
+        return "🔕 *Books reminder off*\n• I'll stay quiet in the evenings."
+    if word == "on":
+        conn.execute("DELETE FROM flags WHERE shop_id = ? AND key = 'nudge_off'",
+                     (shop_id,))
+        conn.commit()
+        return "🔔 *Books reminder on*\n• I'll nudge you every evening."
+    if not _re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", word):
+        return "Say it like 'nudge at 20:00', 'nudge off' or 'nudge on'."
+    conn.execute("INSERT INTO flags (shop_id, key, value) VALUES (?, 'nudge_time', ?)"
+                 " ON CONFLICT (shop_id, key) DO UPDATE SET value = excluded.value",
+                 (shop_id, word))
+    conn.commit()
+    return f"🔔 *Books reminder at {word}*\n• I'll ask for the book photo then."
+
+
+def set_customer_limit(conn: sqlite3.Connection, shop_id: str, customer: str,
+                       amount_cents: int) -> str:
+    blocked = _staff_blocked()
+    if blocked:
+        return blocked
+    ensure_shop(conn, shop_id)
+    cust = _get_customer(conn, shop_id, customer or "")
+    if cust is None:
+        return f"No one named {(customer or '').strip()} is on the book."
+    try:
+        amount = int(amount_cents)
+    except (TypeError, ValueError):
+        return "What limit? Say it like 'set Sipho limit R300'."
+    if amount <= 0:
+        return "What limit? Say it like 'set Sipho limit R300'."
+    conn.execute("UPDATE customers SET credit_limit_cents = ? WHERE id = ?",
+                 (amount, cust["id"]))
+    conn.commit()
+    return (f"✅ *Limit saved*\n• {cust['name']} may owe up to {cents_to_rand(amount)}")
+
+
+def _limit_warn(conn: sqlite3.Connection, shop_id: str, cust_id: int,
+                new_bal: int) -> str:
+    row = conn.execute("SELECT name, credit_limit_cents FROM customers WHERE id = ?",
+                       (cust_id,)).fetchone()
+    if row is None or row["credit_limit_cents"] is None:
+        return ""
+    if new_bal > row["credit_limit_cents"]:
+        return (f"\n• ⚠️ Over {row['name']}'s {cents_to_rand(row['credit_limit_cents'])}"
+                " limit.")
+    return ""
+
+
 def draft_reminder(conn: sqlite3.Connection, shop_id: str, customer: str) -> str:
+    import os as _os
+
+    from app import reports as _reports
     ensure_shop(conn, shop_id)
     cust = _get_customer(conn, shop_id, customer or "")
     if cust is None:
@@ -1153,9 +1394,17 @@ def draft_reminder(conn: sqlite3.Connection, shop_id: str, customer: str) -> str
     if bal <= 0:
         return f"{cust['name']} owes nothing, no reminder needed."
     shop = ensure_shop(conn, shop_id)["name"]
-    return (f"✉️ *Reminder for {cust['name']}*\n\nForward this yourself:\n\n"
-            f"\"Hi {cust['name']}, a reminder of {cents_to_rand(bal)} on the book"
-            f" at {shop}. Please pay when you can. Thank you!\"")
+    out = (f"✉️ *Reminder for {cust['name']}*\n\nForward this yourself:\n\n"
+           f"\"Hi {cust['name']}, a reminder of {cents_to_rand(bal)} on the book"
+           f" at {shop}. Please pay when you can. Thank you!\"")
+    data = _reports.statement_data(conn, shop_id, cust["name"])
+    base = _os.environ.get("SISI_PUBLIC_URL", "").rstrip("/")
+    if data is not None and base:
+        _reports.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        _queue_statement(conn, shop_id, data, _reports.shop_brand(conn, shop_id),
+                         base)
+        out += "\n\n📎 Statement card below — forward it too."
+    return out
 
 
 _CATEGORY_ORDER = ["Bread", "Dairy", "Drinks", "Groceries", "Household", "Airtime"]
@@ -1380,6 +1629,9 @@ def compliance_guide(conn: sqlite3.Connection, shop_id: str, topic: str = "overv
 
 def demo_reset(conn: sqlite3.Connection, shop_id: str) -> str:
     """Wipe one shop and reseed demo data. Demo command, not a model tool."""
+    blocked = _staff_blocked()
+    if blocked:
+        return blocked
     from seed.seed_demo import DEMO_SHOP_NAME, seed_demo
     from seed.seed_random import DEMO_NUMBER, SHOP_NAME, seed_random_shop
 
@@ -1390,9 +1642,28 @@ def demo_reset(conn: sqlite3.Connection, shop_id: str) -> str:
     return f"🎉 Fresh start. {DEMO_SHOP_NAME} is loaded again."
 
 
+def _remove_shop_files(conn: sqlite3.Connection, shop_id: str, logo: str = "") -> None:
+    import os as _os
+    paths = [logo] if logo else []
+    for row in conn.execute("SELECT pdf_path, png_path FROM reports WHERE shop_id = ?",
+                            (shop_id,)).fetchall():
+        paths += [row["pdf_path"], row["png_path"]]
+    for p in paths:
+        try:
+            if p:
+                _os.remove(p)
+        except OSError:
+            pass
+
+
 def delete_my_data(conn: sqlite3.Connection, shop_id: str) -> str:
     """Erase everything stored for one shop (POPIA). Keeps only an empty shop row."""
+    blocked = _staff_blocked()
+    if blocked:
+        return blocked
     ensure_shop(conn, shop_id)
+    shop = ensure_shop(conn, shop_id)
+    _remove_shop_files(conn, shop_id, shop["logo_path"] if "logo_path" in shop.keys() else "")
     for table in (
         "conversation_turns",
         "messages_seen",
@@ -1400,6 +1671,7 @@ def delete_my_data(conn: sqlite3.Connection, shop_id: str) -> str:
         "await_price",
         "reports",
         "flags",
+        "staff",
         "receipts",
         "cash_moves",
         "expenses",
@@ -1417,7 +1689,8 @@ def delete_my_data(conn: sqlite3.Connection, shop_id: str) -> str:
     ):
         conn.execute(f"DELETE FROM {table} WHERE shop_id = ?", (shop_id,))
     conn.execute(
-        "UPDATE shops SET consent_given_at = NULL, language = 'en' WHERE shop_id = ?",
+        "UPDATE shops SET consent_given_at = NULL, language = 'en', address = '',"
+        " phone = '', logo_path = '' WHERE shop_id = ?",
         (shop_id,),
     )
     conn.commit()
@@ -1569,6 +1842,9 @@ def _month_cost_of_sales(conn: sqlite3.Connection, shop_id: str, month: str) -> 
 
 
 def profit_month(conn: sqlite3.Connection, shop_id: str, month: str | None = None) -> str:
+    blocked = _staff_blocked()
+    if blocked:
+        return blocked
     ensure_shop(conn, shop_id)
     m = (month or "").strip()
     if not re.fullmatch(r"\d{4}-\d{2}", m):
@@ -1774,9 +2050,10 @@ def _apply_book_page(conn: sqlite3.Connection, shop_id: str, payload: dict, acti
     def _sell(n, product_id, name, units, total, customer_id=None):
         cur = conn.execute(
             "INSERT INTO sales (shop_id, product_id, product_name, qty, total_cents,"
-            " customer_id, action_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            " customer_id, action_id, created_at, recorded_by)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (shop_id, product_id, name, units, total, customer_id, f"{action_id}-s{n}",
-             stamp))
+             stamp, _rec()))
         sale_ids.append(cur.lastrowid)
         conn.execute("UPDATE products SET stock_qty = stock_qty - ? WHERE id = ?",
                      (units, product_id))
@@ -1798,17 +2075,18 @@ def _apply_book_page(conn: sqlite3.Connection, shop_id: str, payload: dict, acti
         _sell(f"c{i}", e["product_id"], e["name"], e["units"], e["total"], cust_id)
         cur = conn.execute(
             "INSERT INTO credit_entries (shop_id, customer_id, amount_cents, items_text,"
-            " action_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (shop_id, cust_id, e["total"], e["short"], f"{action_id}-c{i}", stamp))
+            " action_id, created_at, recorded_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (shop_id, cust_id, e["total"], e["short"], f"{action_id}-c{i}", stamp,
+             _rec()))
         credit_ids.append(cur.lastrowid)
         if created:
             new_customers.append(cust_id)
     for i, e in enumerate(payload["payments"]):
         cust = _get_customer(conn, shop_id, e["customer"])
         cur = conn.execute(
-            "INSERT INTO payments (shop_id, customer_id, amount_cents, action_id, created_at)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (shop_id, cust["id"], e["amount"], f"{action_id}-p{i}", stamp))
+            "INSERT INTO payments (shop_id, customer_id, amount_cents, action_id, created_at,"
+            " recorded_by) VALUES (?, ?, ?, ?, ?, ?)",
+            (shop_id, cust["id"], e["amount"], f"{action_id}-p{i}", stamp, _rec()))
         payment_ids.append(cur.lastrowid)
     if cash_total:
         _post_cash(conn, shop_id, "cash", cash_total, "sale", action_id,
@@ -2138,7 +2416,7 @@ def propose_receipt(conn: sqlite3.Connection, shop_id: str, receipt: dict,
 
 
 def _apply_receipt(conn: sqlite3.Connection, shop_id: str, payload: dict, action_id: str):
-    moves, expense_ids = [], []
+    moves, expense_ids, increases = [], [], []
     for e in payload["stock"]:
         if e.get("unresolved"):
             continue
@@ -2163,12 +2441,15 @@ def _apply_receipt(conn: sqlite3.Connection, shop_id: str, payload: dict, action
                      (shop_id, pid, e["units"], action_id, now_iso()))
         moves.append({"product_id": pid, "qty": e["units"], "created": created,
                       "old_cost": old_cost})
+        if old_cost is not None and avg is not None and avg > old_cost:
+            increases.append({"product_id": pid, "name": e["name"],
+                              "old": old_cost, "new": avg})
     for e in payload["expenses"]:
         cur = conn.execute(
-            "INSERT INTO expenses (shop_id, category, amount_cents, account, note, action_id)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO expenses (shop_id, category, amount_cents, account, note, action_id,"
+            " recorded_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (shop_id, e["category"], e["total"], payload["account"],
-             f"receipt {payload['supplier']}", f"{action_id}-e{e['line_no']}"))
+             f"receipt {payload['supplier']}", f"{action_id}-e{e['line_no']}", _rec()))
         expense_ids.append(cur.lastrowid)
     total = sum(e["total"] for e in payload["stock"]
                 if not e.get("unresolved") and e["total"] is not None)
@@ -2199,7 +2480,7 @@ def _apply_receipt(conn: sqlite3.Connection, shop_id: str, payload: dict, action
            f" — {', '.join(bits)}\n{money_line}")
     return (msg, "receipt", f"receipt {payload['supplier']} {cents_to_rand(total)}",
             {"moves": moves, "expense_ids": expense_ids, "receipt_id": cur.lastrowid,
-             "supplier": payload["supplier"]})
+             "supplier": payload["supplier"], "cost_increases": increases})
 
 
 def _undo_receipt(conn: sqlite3.Connection, shop_id: str, undo: dict, action_id: str) -> str:
@@ -2309,6 +2590,9 @@ def list_receipts(conn: sqlite3.Connection, shop_id: str, month: str | None = No
 def month_end_report(conn: sqlite3.Connection, shop_id: str,
                     month: str | None = None) -> str:
     """Generate the month-end PDF + PNG card and queue them as WhatsApp media."""
+    blocked = _staff_blocked()
+    if blocked:
+        return blocked
     import os as _os
 
     from app import reports as _reports
@@ -2322,6 +2606,193 @@ def month_end_report(conn: sqlite3.Connection, shop_id: str,
         conn, shop_id, m or None, _os.environ.get("SISI_PUBLIC_URL", ""))
     _queue(shop_id, media)
     return text
+
+
+def set_shop_name(conn: sqlite3.Connection, shop_id: str, name: str) -> str:
+    blocked = _staff_blocked()
+    if blocked:
+        return blocked
+    ensure_shop(conn, shop_id)
+    name = (name or "").strip()
+    if not name:
+        return "What should I call your shop?"
+    conn.execute("UPDATE shops SET name = ? WHERE shop_id = ?", (name[:60], shop_id))
+    conn.commit()
+    return f"✅ *Shop name saved*\n• {name[:60]}"
+
+
+def set_shop_address(conn: sqlite3.Connection, shop_id: str, address: str) -> str:
+    blocked = _staff_blocked()
+    if blocked:
+        return blocked
+    ensure_shop(conn, shop_id)
+    conn.execute("UPDATE shops SET address = ? WHERE shop_id = ?",
+                 ((address or "").strip()[:120], shop_id))
+    conn.commit()
+    return "✅ *Address saved*"
+
+
+def set_shop_phone(conn: sqlite3.Connection, shop_id: str, phone: str) -> str:
+    blocked = _staff_blocked()
+    if blocked:
+        return blocked
+    ensure_shop(conn, shop_id)
+    conn.execute("UPDATE shops SET phone = ? WHERE shop_id = ?",
+                 ((phone or "").strip()[:30], shop_id))
+    conn.commit()
+    return "✅ *Shop phone saved*"
+
+
+def show_shop_profile(conn: sqlite3.Connection, shop_id: str) -> str:
+    blocked = _staff_blocked()
+    if blocked:
+        return blocked
+    import os as _os
+
+    from app import reports as _reports
+
+    from app.agent import queue_media as _queue
+    brand = _reports.shop_brand(conn, shop_id)
+    lines = ["🏪 *Shop profile*", f"• {brand['name']}"]
+    if brand["address"]:
+        lines.append(f"• {brand['address']}")
+    if brand["phone"]:
+        lines.append(f"• {brand['phone']}")
+    lines.append("• Logo: yes ✅" if brand["logo"] else "• Logo: not yet")
+    if not brand["logo"]:
+        lines.append("Send your logo as a photo with caption 'logo'.")
+    _reports.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
+    card = str(_reports.REPORTS_DIR / f"{safe}-profile.png")
+    _reports.render_shop_card(brand, card)
+    token = _reports.store_card(conn, shop_id, "profile", card)
+    base = _os.environ.get("SISI_PUBLIC_URL", "").rstrip("/")
+    if base:
+        _queue(shop_id, [{"kind": "image",
+                          "url": f"{base}/media/{token}?f=png",
+                          "caption": "Your shop header", "filename": ""}])
+        lines.append("\n📎 Header preview below.")
+    return "\n".join(lines)
+
+
+def save_shop_logo(conn: sqlite3.Connection, shop_id: str, image: bytes) -> str:
+    import io as _io
+    import os as _os
+
+    from PIL import Image, ImageOps
+
+    from app import reports as _reports
+
+    from app.agent import queue_media as _queue
+    ensure_shop(conn, shop_id)
+    try:
+        img = Image.open(_io.BytesIO(image or b"")).convert("RGB")
+    except Exception:
+        return "❌ That file is not a photo. Send your logo as a photo."
+    gray = ImageOps.grayscale(img)
+    bbox = ImageOps.invert(gray).getbbox()
+    if bbox:
+        img = img.crop(bbox)
+    side = min(img.size)
+    left = (img.width - side) // 2
+    img = img.crop((left, (img.height - side) // 2, left + side,
+                    (img.height - side) // 2 + side)).resize((512, 512))
+    _reports.LOGOS_DIR.mkdir(parents=True, exist_ok=True)
+    safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
+    logo_path = str(_reports.LOGOS_DIR / f"{safe}.png")
+    img.save(logo_path, "PNG")
+    conn.execute("UPDATE shops SET logo_path = ? WHERE shop_id = ?",
+                 (logo_path, shop_id))
+    conn.commit()
+    brand = _reports.shop_brand(conn, shop_id)
+    out = f"✅ *Logo saved*\n• It will head your {brand['name']} documents."
+    base = _os.environ.get("SISI_PUBLIC_URL", "").rstrip("/")
+    if base:
+        card = str(_reports.REPORTS_DIR / f"{safe}-profile.png")
+        _reports.render_shop_card(brand, card)
+        token = _reports.store_card(conn, shop_id, "profile", card)
+        _queue(shop_id, [{"kind": "image", "url": f"{base}/media/{token}?f=png",
+                          "caption": "Your new header", "filename": ""}])
+        out += "\n\n📎 Preview below."
+    return out
+
+
+def _queue_statement(conn: sqlite3.Connection, shop_id: str, data: dict,
+                     brand: dict, base: str) -> None:
+    from app.agent import queue_media as _queue
+    from app import reports as _reports
+    safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
+    slug = "".join(c.lower() if c.isalnum() else "-" for c in data["name"]).strip("-")
+    prefix = str(_reports.REPORTS_DIR / f"{safe}-statement-{slug}")
+    pages = _reports.render_statement_pngs(data, brand, prefix)
+    pdf = f"{prefix}.pdf"
+    _reports.render_statement_pdf(data, brand, pdf)
+    media = []
+    for n, page in enumerate(pages, 1):
+        token = _reports.store_card(conn, shop_id, f"stmt-{slug}-p{n}", page)
+        media.append({"kind": "image", "url": f"{base}/media/{token}?f=png",
+                      "caption": f"Statement · {data['name']}"
+                      + (f" ({n}/{len(pages)})" if len(pages) > 1 else ""),
+                      "filename": ""})
+    token = _reports.store_card(conn, shop_id, f"stmt-{slug}-pdf", pdf)
+    media.append({"kind": "file", "url": f"{base}/media/{token}?f=pdf",
+                  "caption": f"Statement PDF · {data['name']}",
+                  "filename": f"statement-{slug}.pdf"})
+    if base:
+        _queue(shop_id, media)
+    return len(media) if base else 0
+
+
+def customer_statement(conn: sqlite3.Connection, shop_id: str, customer: str) -> str:
+    blocked = _staff_blocked()
+    if blocked:
+        return blocked
+    import os as _os
+
+    from app import reports as _reports
+    ensure_shop(conn, shop_id)
+    data = _reports.statement_data(conn, shop_id, customer or "")
+    if data is None:
+        return f"No one named {(customer or '').strip()} is on the book."
+    if data["total"] <= 0 and not data["items"]:
+        return f"{data['name']} owes nothing — no statement needed."
+    brand = _reports.shop_brand(conn, shop_id)
+    _reports.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    sent = _queue_statement(conn, shop_id, data, brand,
+                            _os.environ.get("SISI_PUBLIC_URL", "").rstrip("/"))
+    tail = (f"Forward this to {data['name']} 👆" if sent
+            else "PNG + PDF saved on file.")
+    return (f"🧾 *Statement · {data['name']}*\n"
+            f"• Outstanding {cents_to_rand(data['total'])}\n\n{tail}")
+
+
+def statements_for_all(conn: sqlite3.Connection, shop_id: str) -> str:
+    blocked = _staff_blocked()
+    if blocked:
+        return blocked
+    import os as _os
+
+    from app import reports as _reports
+    ensure_shop(conn, shop_id)
+    rows = conn.execute(
+        "SELECT c.id, c.name, MIN(e.created_at) first FROM customers c"
+        " JOIN credit_entries e ON e.customer_id = c.id AND e.reversed = 0"
+        " WHERE c.shop_id = ? GROUP BY c.id ORDER BY first",
+        (shop_id,)).fetchall()
+    made = []
+    brand = _reports.shop_brand(conn, shop_id)
+    _reports.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    base = _os.environ.get("SISI_PUBLIC_URL", "").rstrip("/")
+    for r in rows:
+        data = _reports.statement_data(conn, shop_id, r["name"])
+        if data is None or data["total"] <= 0:
+            continue
+        _queue_statement(conn, shop_id, data, brand, base)
+        made.append(f"• {data['name']} — {cents_to_rand(data['total'])}")
+    if not made:
+        return "✅ Nobody owes anything. The book is clean."
+    tail = "Forward each card to its customer 👆" if base else "Cards saved on file."
+    return "🧾 *Statements for everyone who owes*\n" + "\n".join(made) + f"\n\n{tail}"
 
 
 def get_order_draft(conn: sqlite3.Connection, shop_id: str) -> dict | None:
@@ -2433,7 +2904,29 @@ def send_order(conn: sqlite3.Connection, shop_id: str, wholesaler: str | None = 
     known = [ln["est_cents"] for ln in items if ln["est_cents"] is not None]
     if known:
         out += f"\n\nTotal ± {cents_to_rand(sum(known))}"
-    return out + "\nThank you!"
+    out += "\nThank you!"
+    _queue_order_card(conn, shop_id, {"lines": items})
+    return out
+
+
+def _queue_order_card(conn: sqlite3.Connection, shop_id: str, payload: dict) -> None:
+    import os as _os
+
+    from app import reports as _reports
+
+    from app.agent import queue_media as _queue
+    base = _os.environ.get("SISI_PUBLIC_URL", "").rstrip("/")
+    if not base:
+        return
+    _reports.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
+    card = str(_reports.REPORTS_DIR / f"{safe}-order.png")
+    _reports.render_order_png(payload, _reports.shop_brand(conn, shop_id),
+                              card, today_str())
+    token = _reports.store_card(conn, shop_id, "order", card)
+    _queue(shop_id, [{"kind": "image", "url": f"{base}/media/{token}?f=png",
+                      "caption": "Order card — forward with the message",
+                      "filename": ""}])
 
 
 def edit_order_add(conn: sqlite3.Connection, shop_id: str, product: str,
@@ -2621,6 +3114,9 @@ def _undo_slip(conn: sqlite3.Connection, shop_id: str, undo: dict, action_id: st
 
 
 def undo_last(conn: sqlite3.Connection, shop_id: str) -> str:
+    blocked = _staff_blocked()
+    if blocked:
+        return blocked
     ensure_shop(conn, shop_id)
     row = conn.execute(
         "SELECT * FROM actions WHERE shop_id = ? AND undone = 0 AND kind != 'seed'"
@@ -2633,6 +3129,9 @@ def undo_last(conn: sqlite3.Connection, shop_id: str) -> str:
 
 def undo_last_kind(conn: sqlite3.Connection, shop_id: str, kind: str, nothing_msg: str) -> str:
     """Undo the most recent action of one kind, even when it is not the last."""
+    blocked = _staff_blocked()
+    if blocked:
+        return blocked
     ensure_shop(conn, shop_id)
     row = conn.execute(
         "SELECT * FROM actions WHERE shop_id = ? AND undone = 0 AND kind = ?"
@@ -2757,6 +3256,36 @@ TOOL_DEFS = [
           {"month": {"type": "string",
                      "description": "YYYY-MM or month name; omit for the books due"}},
           []),
+    _tool("set_shop_name", "Save the OWNER's own spaza shop name. Never invent one.",
+          {"name": {"type": "string"}}, ["name"]),
+    _tool("set_shop_address", "Save the shop's address (optional).",
+          {"address": {"type": "string"}}, ["address"]),
+    _tool("set_shop_phone", "Save the shop's phone number (optional).",
+          {"phone": {"type": "string"}}, ["phone"]),
+    _tool("show_shop_profile", "Show the shop profile header card.",
+          {}, []),
+    _tool("customer_statement", "Branded PNG + PDF statement for one customer,"
+          " queued for the OWNER to forward. Use for 'statement for Sipho'.",
+          {"customer": {"type": "string"}}, ["customer"]),
+    _tool("statements_for_all", "Branded statements for every debtor,"
+          " oldest debt first. Use for 'statements for everyone who owes'.",
+          {}, []),
+    _tool("set_customer_limit", "Cap what one customer may owe. Warns on later"
+          " credit sales over it. Use for 'set Sipho limit R300'.",
+          {"customer": {"type": "string"},
+           "amount_cents": {"type": "integer"}}, ["customer", "amount_cents"]),
+    _tool("set_nudge", "Change the evening books reminder: 'HH:MM', 'off', 'on'.",
+          {"setting": {"type": "string"}}, ["setting"]),
+    _tool("set_expiry", "Note when stock expires. Sisi warns 2 days before."
+          " Use for 'bread expires Friday'.",
+          {"product": {"type": "string"}, "when": {"type": "string"}},
+          ["product", "when"]),
+    _tool("add_staff", "Add a staff number (owner only). Staff can record sales,"
+          " credit and book photos. Use for 'add staff 0821234567 Thandi'.",
+          {"phone": {"type": "string"}, "name": {"type": "string"}},
+          ["phone", "name"]),
+    _tool("who_recorded_today", "Breakdown of who recorded entries today.",
+          {}, []),
     _tool("get_balance", "How much ONE named customer owes on the credit book. Needs a name.",
           {"customer": {"type": "string"}}, ["customer"]),
     _tool("list_debtors", "Everyone who owes on the credit book, with the total.", {}, []),
@@ -2824,6 +3353,17 @@ TOOL_FUNCS = {
     "profit_month": profit_month,
     "list_receipts": list_receipts,
     "month_end_report": month_end_report,
+    "set_shop_name": set_shop_name,
+    "set_shop_address": set_shop_address,
+    "set_shop_phone": set_shop_phone,
+    "show_shop_profile": show_shop_profile,
+    "customer_statement": customer_statement,
+    "statements_for_all": statements_for_all,
+    "set_customer_limit": set_customer_limit,
+    "set_nudge": set_nudge,
+    "set_expiry": set_expiry,
+    "add_staff": add_staff,
+    "who_recorded_today": who_recorded_today,
     "get_balance": get_balance,
     "list_debtors": list_debtors,
     "draft_reminder": draft_reminder,

@@ -70,6 +70,7 @@ class IncomingMessage:
     media_id: str | None = None  # WhatsApp media id for audio/image/video
     media_url: str | None = None  # Vonage-hosted media URL (vonage channel)
     channel: str = "meta"  # inbound channel: "meta" or "vonage"
+    caption: str = ""  # image caption, e.g. "logo"
 
 
 def verify_signature(raw_body: bytes, signature_header: str | None, app_secret: str) -> bool:
@@ -113,7 +114,10 @@ def parse_webhook(payload: dict) -> list[IncomingMessage]:
                 else:
                     inner = m.get(mtype) or {}
                     media_id = inner.get("id") if isinstance(inner, dict) else None
-                    out.append(IncomingMessage(mid, frm, f"media:{mtype}", None, ts, media_id))
+                    caption = inner.get("caption", "") if isinstance(inner, dict) else ""
+                    out.append(IncomingMessage(mid, frm, f"media:{mtype}", None, ts,
+                                               media_id, None, "meta",
+                                               caption if isinstance(caption, str) else ""))
     return out
 
 

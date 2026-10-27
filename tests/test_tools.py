@@ -364,7 +364,10 @@ def test_tool_registry_complete():
                      "compliance_guide", "undo_last", "record_expense", "record_drawing",
                      "record_count", "record_supplier_payment", "cash_balances",
                      "sales_summary", "profit_month", "list_receipts",
-                     "month_end_report"]:
+                     "month_end_report", "set_shop_name", "set_shop_address",
+                     "set_shop_phone", "show_shop_profile", "customer_statement",
+                     "statements_for_all", "set_customer_limit", "set_nudge",
+                     "set_expiry", "add_staff", "who_recorded_today"]:
         assert expected in names
 
 

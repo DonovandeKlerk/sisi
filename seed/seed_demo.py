@@ -60,6 +60,7 @@ def wipe_shop(conn: sqlite3.Connection, shop_id: str) -> None:
         "await_price",
         "reports",
         "flags",
+        "staff",
         "receipts",
         "cash_moves",
         "expenses",

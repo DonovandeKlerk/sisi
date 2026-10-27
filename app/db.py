@@ -12,6 +12,10 @@ CREATE TABLE IF NOT EXISTS shops (
   shop_id    TEXT PRIMARY KEY,
   name       TEXT NOT NULL,
   language   TEXT NOT NULL DEFAULT 'en',
+  address    TEXT NOT NULL DEFAULT '',
+  phone      TEXT NOT NULL DEFAULT '',
+  logo_path  TEXT NOT NULL DEFAULT '',
+  channel    TEXT NOT NULL DEFAULT '',
   consent_given_at TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
@@ -20,8 +24,17 @@ CREATE TABLE IF NOT EXISTS customers (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   shop_id    TEXT NOT NULL REFERENCES shops(shop_id),
   name       TEXT NOT NULL COLLATE NOCASE,
+  credit_limit_cents INTEGER,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   UNIQUE (shop_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS staff (
+  shop_id    TEXT NOT NULL REFERENCES shops(shop_id),
+  phone      TEXT NOT NULL,
+  name       TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  PRIMARY KEY (shop_id, phone)
 );
 
 CREATE TABLE IF NOT EXISTS products (
@@ -269,6 +282,15 @@ def init_db(conn: sqlite3.Connection) -> None:
         "ALTER TABLE products ADD COLUMN pack_name TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE products ADD COLUMN pack_size REAL",
         "ALTER TABLE products ADD COLUMN pack_price_cents INTEGER",
+        "ALTER TABLE shops ADD COLUMN address TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE shops ADD COLUMN phone TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE shops ADD COLUMN logo_path TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE shops ADD COLUMN channel TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE customers ADD COLUMN credit_limit_cents INTEGER",
+        "ALTER TABLE sales ADD COLUMN recorded_by TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE credit_entries ADD COLUMN recorded_by TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE payments ADD COLUMN recorded_by TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE expenses ADD COLUMN recorded_by TEXT NOT NULL DEFAULT ''",
     ):
         try:
             conn.execute(sql)

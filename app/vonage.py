@@ -166,8 +166,11 @@ def parse_vonage_webhook(payload: dict) -> list[IncomingMessage]:
         return [IncomingMessage(mid, shop_id, "media:audio", None, ts,
                                 channel="vonage", media_url=_media_url(msg.get("audio")))]
     if mtype == "image":
+        node = msg.get("image")
+        caption = node.get("caption", "") if isinstance(node, dict) else ""
         return [IncomingMessage(mid, shop_id, "media:image", None, ts,
-                                channel="vonage", media_url=_media_url(msg.get("image")))]
+                                channel="vonage", media_url=_media_url(node),
+                                caption=caption if isinstance(caption, str) else "")]
     if mtype == "reply":
         reply = msg.get("reply") or {}
         title = reply.get("title") or reply.get("id") or "" if isinstance(reply, dict) else ""

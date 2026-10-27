@@ -89,9 +89,15 @@ def seed_random_shop(shop_id: str = DEMO_NUMBER,
         ts = now_iso()
         today = date.fromisoformat(today_str())
         conn.execute(
-            "INSERT INTO shops (shop_id, name, language) VALUES (?, ?, 'zu')",
-            (shop_id, SHOP_NAME),
+            "INSERT INTO shops (shop_id, name, language, address, phone)"
+            " VALUES (?, ?, 'zu', 'Main Road, Amanzimtoti', ?)",
+            (shop_id, SHOP_NAME, shop_id),
         )
+        from app.reports import LOGOS_DIR, make_sample_logo
+        safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
+        logo = make_sample_logo(str(LOGOS_DIR / f"{safe}.png"))
+        conn.execute("UPDATE shops SET logo_path = ? WHERE shop_id = ?",
+                     (logo, shop_id))
         picked = rng.sample(CATALOG, rng.randint(25, 30))
         low_picks = set(rng.sample([p[0] for p in picked], 4))
         out_of_stock = rng.choice(sorted(low_picks))

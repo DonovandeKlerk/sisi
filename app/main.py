@@ -182,6 +182,11 @@ def process_message(msg: IncomingMessage) -> None:
         conn = connect()
         try:
             init_db(conn)
+            from app.tools import ensure_shop
+            ensure_shop(conn, msg.shop_id)
+            conn.execute("UPDATE shops SET channel = ? WHERE shop_id = ?",
+                         (msg.channel or "meta", msg.shop_id))
+            conn.commit()
             if msg.kind == "media:audio":
                 try:
                     audio = _download_msg_media(msg, "voice note")
@@ -199,7 +204,8 @@ def process_message(msg: IncomingMessage) -> None:
                     if image is None:
                         sender.send_text(msg.shop_id, "That photo came out empty. Send it again?")
                         return
-                    _, reply, buttons = handle_photo(conn, msg.shop_id, image)
+                    _, reply, buttons = handle_photo(conn, msg.shop_id, image,
+                                                     msg.caption or "")
                 except (VisionError, VoiceError) as e:
                     sender.send_text(msg.shop_id, str(e))
                     return

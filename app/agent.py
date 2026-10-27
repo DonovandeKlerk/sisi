@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sqlite3
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 
 from app import reports
@@ -43,8 +44,21 @@ from app.tools import (
     parse_month_name,
     propose_book_page,
     propose_receipt,
+    add_staff,
+    customer_statement,
     record_sale,
+    resolve_sender,
+    save_shop_logo,
+    set_customer_limit,
+    set_expiry,
+    set_nudge,
+    who_recorded_today,
+    statements_for_all,
     send_order,
+    set_shop_address,
+    set_shop_name,
+    set_shop_phone,
+    show_shop_profile,
     undo_last,
     undo_last_kind,
 )
@@ -60,6 +74,31 @@ def queue_media(shop_id: str, items: list[dict]) -> None:
 
 def take_media(shop_id: str) -> list[dict]:
     return MEDIA_OUTBOX.pop(shop_id, [])
+
+
+_STAFF_NAME: ContextVar[str | None] = ContextVar("sisi_staff", default=None)
+"""Staff display name for this turn (None when the sender is the owner)."""
+
+
+def _enter(conn: sqlite3.Connection, sender: str) -> tuple[str, str | None]:
+    shop_id, staff = resolve_sender(conn, sender)
+    _STAFF_NAME.set(staff)
+    return shop_id, staff
+
+
+LAST_PHOTO: dict[str, tuple[bytes, datetime]] = {}
+"""Last inbound photo bytes per shop, so a 'logo' reply can claim it."""
+
+
+def _fresh_photo(shop_id: str) -> bytes | None:
+    hit = LAST_PHOTO.get(shop_id)
+    if hit is None:
+        return None
+    image, at = hit
+    if datetime.now(timezone.utc) - at > timedelta(minutes=10):
+        LAST_PHOTO.pop(shop_id, None)
+        return None
+    return image
 
 
 YES_WORDS = {"yes", "y", "yebo", "yeah", "ja", "ewe", "ok", "okay", "sharp", "shap", "sure"}
@@ -84,6 +123,12 @@ DEMO_HELP = (
     "• *float* — 'float R500' sets the till float\n"
     "• *counted* — 'counted R1240' checks the till\n"
     "• *month-end* — 'month-end report' for the books\n"
+    "• *profile* — 'set shop name …', 'show my shop profile'\n"
+    "• *statement* — 'statement for Sipho'\n"
+    "• *limit* — 'set Sipho limit R300'\n"
+    "• *expiry* — 'bread expires Friday'\n"
+    "• *nudge* — 'nudge at 20:00', 'nudge off'\n"
+    "• *staff* — 'add staff 082… Thandi', 'who recorded today'\n"
     "• *expiry photo* — send a photo of a date stamp\n"
     "• *compliance* — 'can I get the spaza fund?'\n"
     "• *scam check* — 'is this fund agent a scam?'\n"
@@ -163,10 +208,31 @@ def _parse_float(text: str) -> dict:
     return out
 
 
+_STAFF_BLOCKED_PREFIX = ("month-end", "month end", "monthend", "report ",
+                               "statement", "set ", "add staff", "delete ",
+                               "reset ", "nudge", "undo")
+_STAFF_BLOCKED_EXACT = {"undo", "demo reset", "reset demo", "delete my data",
+                        "erase my data", "forget me",
+                        "statements for everyone who owes",
+                        "statements for everyone", "all statements",
+                        "shop profile", "show shop profile",
+                        "my shop profile", "show my shop profile"}
+
+
 def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
     """Returns (message, buttons_or_None), or None if the LLM should handle it."""
     ensure_shop(conn, shop_id)
     word = _normalize(text or "")
+    if _STAFF_NAME.get() and (word in _STAFF_BLOCKED_EXACT
+                              or word.startswith(_STAFF_BLOCKED_PREFIX)):
+        from app.tools import _staff_blocked
+        return _staff_blocked(), None
+    m = re.match(r"add staff ([\d\s+()\-]{9,}) (.+)$", (text or "").strip(),
+                   re.IGNORECASE)
+    if m and _STAFF_NAME.get() is None:
+        return add_staff(conn, shop_id, m.group(1), m.group(2).strip()), None
+    if word in ("who recorded today", "who recorded", "staff today"):
+        return who_recorded_today(conn, shop_id), None
     if word == "float" or word.startswith("float "):
         return set_float(conn, shop_id, _parse_float(word)), None
     if word in ORDER_WORDS:
@@ -219,6 +285,41 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
                 conn, shop_id, m, os.environ.get("SISI_PUBLIC_URL", ""))
             queue_media(shop_id, media)
             return text, None
+    if word.startswith("set shop name "):
+        return set_shop_name(conn, shop_id, text.strip()[len("set shop name "):]), None
+    if word.startswith("set address "):
+        return set_shop_address(conn, shop_id, text.strip()[len("set address "):]), None
+    if word.startswith("set phone "):
+        return set_shop_phone(conn, shop_id, text.strip()[len("set phone "):]), None
+    if word in ("nudge off", "nudge on") or word.startswith("nudge at "):
+        setting = word[9:].strip() if word.startswith("nudge at ") else word[6:]
+        return set_nudge(conn, shop_id, setting), None
+    m = re.match(r"(.+) expires? (.+)$", word)
+    if m and "expiry" not in word and not word.startswith(
+            ("what ", "when ", "which ", "list ", "show ", "check ")):
+        return set_expiry(conn, shop_id, m.group(1).strip(), m.group(2).strip()), None
+    m = re.match(r"set (.+) limit r?([\d.,]+)$", word)
+    if m:
+        try:
+            cents = int(round(float(m.group(2).replace(",", ".")) * 100))
+        except ValueError:
+            cents = 0
+        return set_customer_limit(conn, shop_id, m.group(1).strip(), cents), None
+    if word in ("show my shop profile", "shop profile", "show shop profile",
+                "my shop profile"):
+        return show_shop_profile(conn, shop_id), None
+    if word in ("statements for everyone who owes",
+                "statements for everyone", "all statements"):
+        return statements_for_all(conn, shop_id), None
+    if word.startswith("statement for "):
+        return customer_statement(conn, shop_id, word[len("statement for "):]), None
+    if word == "logo":
+        image = _fresh_photo(shop_id)
+        if image is None:
+            return ("Send your logo as a photo with the caption 'logo',"
+                    " then I'll head your documents with it."), None
+        LAST_PHOTO.pop(shop_id, None)
+        return save_shop_logo(conn, shop_id, image), None
     return None
 
 
@@ -307,6 +408,7 @@ def handle_voice(conn: sqlite3.Connection, shop_id: str, audio: bytes,
     Returns (transcript_or_None, reply, buttons). The owner always sees what
     Sisi heard before anything is proposed or saved.
     """
+    shop_id, _ = _enter(conn, shop_id)
     ensure_shop(conn, shop_id)
     extra = [r["name"] for r in conn.execute(
         "SELECT name FROM customers WHERE shop_id = ?", (shop_id,)).fetchall()]
@@ -326,12 +428,20 @@ def handle_voice(conn: sqlite3.Connection, shop_id: str, audio: bytes,
 _PHOTO_EMOJI = {"expiry": "📸", "book_page": "📒", "receipt": "🧾"}
 
 
-def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes):
-    """Classify a photo (expiry, book page, receipt) and propose saving it.
+def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
+                 caption: str = ""):
+    """Classify a photo (logo, expiry, book page, receipt) and propose saving it.
 
     Returns (doc_or_None, reply, buttons). Nothing is saved until Yes.
     """
+    shop_id, _ = _enter(conn, shop_id)
     ensure_shop(conn, shop_id)
+    LAST_PHOTO[shop_id] = (image or b"", datetime.now(timezone.utc))
+    if (caption or "").strip().lower() == "logo":
+        reply = save_shop_logo(conn, shop_id, image or b"")
+        save_turn(conn, shop_id, "user", "[logo photo]")
+        save_turn(conn, shop_id, "assistant", reply)
+        return None, reply, None
     digest = hashlib.sha256(image or b"").hexdigest()
     seen = photo_seen(conn, shop_id, digest)
     if seen is not None:
@@ -365,6 +475,7 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes):
 
 
 def handle_text(conn: sqlite3.Connection, shop_id: str, text: str):
+    shop_id, _ = _enter(conn, shop_id)
     ensure_shop(conn, shop_id)
     before = get_pending(conn, shop_id)
     before_id = before["id"] if before else None
