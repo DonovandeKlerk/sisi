@@ -28,15 +28,21 @@ SISI = {
 def _reports_dir() -> Path:
     override = globals().get("REPORTS_DIR")
     if override is not None:
+        Path(override).mkdir(parents=True, exist_ok=True)
         return override
-    return Path(os.environ.get("SISI_REPORTS", "data/reports"))
+    d = Path(os.environ.get("SISI_REPORTS", "data/reports"))
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def _logos_dir() -> Path:
     override = globals().get("LOGOS_DIR")
     if override is not None:
+        Path(override).mkdir(parents=True, exist_ok=True)
         return override
-    return Path(os.environ.get("SISI_LOGOS", "data/logos"))
+    d = Path(os.environ.get("SISI_LOGOS", "data/logos"))
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def __getattr__(name: str):
