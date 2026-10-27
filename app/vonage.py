@@ -72,9 +72,20 @@ class VonageSender(WhatsAppSender):
             resp = httpx.post(VONAGE_MESSAGES_URL, auth=(self.api_key, self.api_secret),
                               json=data, timeout=15)
             resp.raise_for_status()
+            log.info("vonage reply sent to=%s status=%s body=%.300s",
+                     data["to"], resp.status_code, resp.text)
             return resp.json()
 
-        call_with_retries(send)
+        try:
+            call_with_retries(send)
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code if e.response is not None else "?"
+            text = e.response.text[:300] if e.response is not None else ""
+            log.error("vonage reply failed to=%s status=%s body=%s", data["to"], status, text)
+            raise
+        except httpx.HTTPError as e:
+            log.error("vonage reply failed to=%s err=%r", data["to"], e)
+            raise
 
     def send_text(self, to: str, body: str) -> None:
         for chunk in _split_text(body):
@@ -119,13 +130,24 @@ def _message_id(payload: dict) -> str:
     return f"vonage-{digest}"
 
 
+def _media_url(node) -> str | None:
+    if isinstance(node, dict):
+        return node.get("url")
+    if isinstance(node, str):
+        return node or None
+    return None
+
+
 def parse_vonage_webhook(payload: dict) -> list[IncomingMessage]:
-    """Normalize a Vonage Messages inbound payload to internal messages."""
+    """Normalize a Vonage Messages inbound payload to internal messages.
+
+    Handles both the nested shape (fields under "message") and the flat
+    sandbox shape (message_type/text/audio/image at top level).
+    """
     if not isinstance(payload, dict):
         return []
-    msg = payload.get("message") or {}
-    if not isinstance(msg, dict):
-        return []
+    nested = payload.get("message")
+    msg = nested if isinstance(nested, dict) else payload
     shop_id = _digits(_sender_number(payload))
     mid = _message_id(payload)
     ts = str(payload.get("timestamp", ""))
@@ -133,18 +155,19 @@ def parse_vonage_webhook(payload: dict) -> list[IncomingMessage]:
         return []
     mtype = str(msg.get("message_type", "")).lower()
     if mtype == "text":
-        return [IncomingMessage(mid, shop_id, "text", str(msg.get("text", "")), ts,
-                                channel="vonage")]
+        text = msg.get("text", "")
+        text = text if isinstance(text, str) else ""
+        return [IncomingMessage(mid, shop_id, "text", text, ts, channel="vonage")]
     if mtype == "audio":
-        url = (msg.get("audio") or {}).get("url") if isinstance(msg.get("audio"), dict) else None
         return [IncomingMessage(mid, shop_id, "media:audio", None, ts,
-                                channel="vonage", media_url=url)]
+                                channel="vonage", media_url=_media_url(msg.get("audio")))]
     if mtype == "image":
-        url = (msg.get("image") or {}).get("url") if isinstance(msg.get("image"), dict) else None
         return [IncomingMessage(mid, shop_id, "media:image", None, ts,
-                                channel="vonage", media_url=url)]
+                                channel="vonage", media_url=_media_url(msg.get("image")))]
     if mtype == "reply":
         reply = msg.get("reply") or {}
         title = reply.get("title") or reply.get("id") or "" if isinstance(reply, dict) else ""
         return [IncomingMessage(mid, shop_id, "button", str(title), ts, channel="vonage")]
+    log.warning("vonage inbound dropped: unknown message_type=%r keys=%s",
+                msg.get("message_type"), sorted(payload.keys()))
     return []

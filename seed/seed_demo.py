@@ -98,10 +98,10 @@ def seed_demo(shop_id: str = DEMO_SHOP_ID, conn: sqlite3.Connection | None = Non
             conn.execute(
                 """INSERT INTO stock_moves (shop_id, product_id, delta_qty, reason,
                    action_id, created_at) VALUES (?, ?, ?, 'seed', ?, ?)""",
-                (shop_id, cur.lastrowid, qty, f"seed-stock-{i}", ts),
+                (shop_id, cur.lastrowid, qty, f"seed-{shop_id}-stock-{i}", ts),
             )
         for i, (cust, amount, items) in enumerate(CREDIT):
-            aid = f"seed-credit-{i}"
+            aid = f"seed-{shop_id}-credit-{i}"
             conn.execute(
                 """INSERT INTO credit_entries (shop_id, customer_id, amount_cents,
                    items_text, action_id, created_at) VALUES (?, ?, ?, ?, ?, ?)""",

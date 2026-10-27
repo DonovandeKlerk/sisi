@@ -89,7 +89,11 @@ async def webhook_receive(request: Request, background_tasks: BackgroundTasks):
         payload = json.loads(raw or b"{}")
     except ValueError:
         return {"status": "ignored"}
-    for msg in parse_webhook(payload):
+    msgs = parse_webhook(payload)
+    if not msgs:
+        log.warning("meta inbound dropped: no messages keys=%s",
+                    sorted(payload.keys()) if isinstance(payload, dict) else "?")
+    for msg in msgs:
         if _rate_limited(msg.shop_id):
             log.warning("rate-limited %s", msg.shop_id)
             continue
@@ -109,7 +113,13 @@ async def webhook_vonage_receive(request: Request, background_tasks: BackgroundT
         payload = json.loads(raw or b"{}")
     except ValueError:
         return {"status": "ignored"}
-    for msg in parse_vonage_webhook(payload):
+    msgs = parse_vonage_webhook(payload)
+    if not msgs:
+        log.warning("vonage inbound dropped: no messages keys=%s",
+                    sorted(payload.keys()) if isinstance(payload, dict) else "?")
+    for msg in msgs:
+        log.info("vonage inbound id=%s from=%s type=%s", msg.message_id,
+                 msg.shop_id, msg.kind)
         if _rate_limited(msg.shop_id):
             log.warning("rate-limited %s", msg.shop_id)
             continue
@@ -162,6 +172,8 @@ def _download_msg_media(msg: IncomingMessage, label: str) -> bytes | None:
 def process_message(msg: IncomingMessage) -> None:
     """Background worker: one message, own connection, never raises."""
     try:
+        log.info("handling id=%s channel=%s kind=%s shop=%s", msg.message_id,
+                 msg.channel, msg.kind, msg.shop_id)
         if _already_seen(msg.message_id, msg.shop_id):
             log.info("duplicate %s ignored", msg.message_id)
             return

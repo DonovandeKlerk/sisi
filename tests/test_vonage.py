@@ -86,6 +86,9 @@ class _FakePost:
         self.calls.append({"url": url, "auth": auth, "json": json})
 
         class Resp:
+            status_code = 202
+            text = '{"message_uuid":"out-1"}'
+
             def raise_for_status(self):
                 pass
 
@@ -126,6 +129,18 @@ def test_sender_buttons_as_text(vg_env, monkeypatch):
     assert len(fake.calls) == 1
     text = fake.calls[0]["json"]["text"]
     assert "Save?" in text and "Yes" in text and "No" in text
+
+
+def test_sender_logs_status_without_secrets(vg_env, monkeypatch, caplog):
+    import logging
+
+    fake = _FakePost()
+    monkeypatch.setattr(vonage.httpx, "post", fake)
+    with caplog.at_level(logging.INFO, logger="sisi.vonage"):
+        VonageSender().send_text("27710000002", "hi")
+    assert "vonage reply sent to=27710000002 status=202" in caplog.text
+    assert "out-1" in caplog.text
+    assert "vg-key" not in caplog.text and "vg-secret" not in caplog.text
 
 
 def test_sender_missing_creds_sends_nothing(vg_env, monkeypatch):
@@ -241,6 +256,54 @@ def test_vonage_image_end_to_end(vg_env, monkeypatch):
     body = fake.calls[0]["json"]["text"]
     assert "2 x Fresh Milk 1L 30 Oct has expired" in body
     assert "Reply: Yes / No" in body  # preview buttons rendered for vonage
+
+
+def _vg_flat_payload(message_type: str, mid: str = "vg-real-1", **extra) -> dict:
+    """Real sandbox inbound shape: flat fields, no nested 'message' object."""
+    payload = {
+        "channel": "whatsapp",
+        "message_uuid": mid,
+        "from": {"number": "27710000002", "type": "whatsapp"},
+        "to": {"number": "14157386102", "type": "whatsapp"},
+        "timestamp": "2026-10-27T05:00:00Z",
+        "message_type": message_type,
+        "profile": {"name": "Donovan"},
+    }
+    payload.update(extra)
+    return payload
+
+
+def test_parse_flat_sandbox_shape():
+    msgs = parse_vonage_webhook(_vg_flat_payload("text", text="hi"))
+    assert len(msgs) == 1
+    assert (msgs[0].shop_id, msgs[0].kind, msgs[0].text, msgs[0].channel) == (
+        "27710000002", "text", "hi", "vonage")
+    assert msgs[0].message_id == "vg-real-1"
+
+    msgs = parse_vonage_webhook(_vg_flat_payload("audio", audio={"url": "https://m.test/a"}))
+    assert len(msgs) == 1 and msgs[0].kind == "media:audio"
+    assert msgs[0].media_url == "https://m.test/a"
+
+    msgs = parse_vonage_webhook(_vg_flat_payload("image", image={"url": "https://m.test/i"}))
+    assert len(msgs) == 1 and msgs[0].kind == "media:image"
+    assert msgs[0].media_url == "https://m.test/i"
+
+
+def test_vonage_flat_text_end_to_end(vg_env, monkeypatch):
+    from seed.seed_demo import seed_demo
+
+    seed_demo("27710000002")  # the reporter's shop, like the demo shop
+    _scripted_llm(monkeypatch)
+    fake = _FakePost()
+    monkeypatch.setattr(vonage.httpx, "post", fake)
+    client = TestClient(app)
+    r = client.post("/webhook/vonage",
+                    json=_vg_flat_payload("text", text="How much does Sipho owe?"))
+    assert r.status_code == 200
+    assert len(fake.calls) == 1
+    sent = fake.calls[0]["json"]
+    assert sent["from"] == "14157386102" and sent["to"] == "27710000002"
+    assert "R73.00" in sent["text"]
 
 
 def test_vonage_status_and_bad_json(vg_env):
