@@ -12,6 +12,8 @@ from app.llm import save_turn
 from app.vision import VisionError, read_expiry_photo
 from app.voice import VoiceError, transcribe_audio
 from app.tools import (
+    _is_pack_unit,
+    _pack_echo,
     add_credit,
     cancel_pending,
     check_expiry_photo,
@@ -19,8 +21,10 @@ from app.tools import (
     confirm_pending,
     delete_my_data,
     demo_reset,
+    ensure_pack_price,
     ensure_product_price,
     ensure_shop,
+    find_product,
     get_await_price,
     get_pending,
     record_sale,
@@ -163,10 +167,18 @@ def try_price_reply(conn: sqlite3.Connection, shop_id: str, text: str) -> str | 
                     w in needle for w in words if len(w) > 2):
                 return None  # the price belongs to a different product
     spec = json.loads(waiting["spec_json"])
-    ensure_product_price(conn, shop_id, product, amounts[0])
+    prod = find_product(conn, shop_id, product)
+    if _is_pack_unit(text):
+        if prod is None or not prod["pack_size"]:
+            return (f"❓ *{product} has no {_pack_echo(text)} size yet.*\n"
+                    f"Reply with the single price, e.g. '{product.lower()} R2'.")
+        ensure_pack_price(conn, shop_id, product, amounts[0])
+    else:
+        ensure_product_price(conn, shop_id, product, amounts[0])
     clear_await_price(conn, shop_id)
     if spec["tool"] == "sale":
-        return record_sale(conn, shop_id, product, spec["qty"], buyer=spec.get("buyer"))
+        return record_sale(conn, shop_id, product, spec["qty"],
+                           buyer=spec.get("buyer"), unit=spec.get("unit"))
     return add_credit(conn, shop_id, spec["customer"], spec["items"])
 
 

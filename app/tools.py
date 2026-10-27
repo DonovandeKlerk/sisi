@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import sqlite3
 import uuid
 from datetime import date, datetime, timedelta, timezone
@@ -111,6 +112,37 @@ def _find_products(conn: sqlite3.Connection, shop_id: str, query: str):
     return None, hits
 
 
+_SINGLE_WORDS = {"single", "singles", "each", "loose", "unit", "units",
+                 "piece", "pieces"}
+_PACK_WORDS = {"box", "boxes", "tray", "trays", "pack", "packs", "packet", "packets",
+               "case", "cases", "carton", "cartons", "sleeve", "sleeves",
+               "bundle", "bundles", "crate", "crates",
+               "ibhokisi", "amabhokisi", "itreyi", "amatreyi",
+               "ipakethe", "amapakethe", "iphakethe", "amaphakethe",
+               "ikhathoni", "amakhathoni"}
+
+
+def _resolve_units(pack_name: str | None, pack_size: float | None,
+                   qty: float, unit: str | None) -> tuple[float, bool, bool]:
+    """Convert a quoted qty to base units. Returns (units, is_pack, no_pack_warn).
+
+    Bare numbers and single-words are singles. Pack words convert via the
+    product's pack size; an unknown word assumes singles (the preview shows
+    the reading so the owner can say No once).
+    """
+    u = (unit or "").strip().lower()
+    toks = {t.strip(" .!?,") for t in u.split()}
+    if not u or toks & _SINGLE_WORDS:
+        return qty, False, False
+    pack_hit = (bool(toks & _PACK_WORDS) or any(t.endswith("-pack") for t in toks)
+                or (pack_name and pack_name.lower() in u))
+    if not pack_hit:
+        return qty, False, False
+    if pack_size:
+        return qty * pack_size, True, False
+    return qty, False, True
+
+
 def balance_cents(conn: sqlite3.Connection, shop_id: str, customer_id: int) -> int:
     credit = conn.execute(
         "SELECT COALESCE(SUM(amount_cents), 0) s FROM credit_entries"
@@ -126,7 +158,22 @@ def balance_cents(conn: sqlite3.Connection, shop_id: str, customer_id: int) -> i
 
 
 def _items_text(lines: list[dict]) -> str:
-    return ", ".join(f"{_fmt_qty(ln['qty'])}x {ln['name']}" for ln in lines)
+    return ", ".join(ln.get("short") or f"{_fmt_qty(ln['qty'])}x {ln['name']}" for ln in lines)
+
+
+_PACK_SINGULAR = {"boxes": "box", "trays": "tray", "packs": "pack", "packets": "packet",
+                  "cases": "case", "cartons": "carton", "sleeves": "sleeve",
+                  "bundles": "bundle", "crates": "crate"}
+
+
+def _pack_echo(unit: str | None) -> str:
+    for tok in (unit or "").lower().split():
+        tok = tok.strip(" .!?,")
+        if tok in _PACK_WORDS:
+            return _PACK_SINGULAR.get(tok, tok)
+        if tok.endswith("-pack"):
+            return "pack"
+    return "pack"
 
 
 def _which_one(ambiguous) -> str:
@@ -207,25 +254,47 @@ def cancel_pending(conn: sqlite3.Connection, shop_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_priced_line(conn: sqlite3.Connection, shop_id: str, product: str, qty: float):
+def _resolve_priced_line(conn: sqlite3.Connection, shop_id: str, product: str,
+                         qty: float, unit: str | None = None):
     """Resolve one purchasable line (never guess a price).
 
     Returns (line_or_None, status, detail) with status one of ok, ambiguous,
     unknown, unpriced. Callers pause unknown/unpriced lines for the owner.
+    qty is quoted in singles unless unit names a pack; line["qty"] is always
+    base units for stock.
     """
     prod, ambiguous = _find_products(conn, shop_id, product)
     if prod is None:
         if ambiguous:
             return None, "ambiguous", _which_one(ambiguous)
         return None, "unknown", product
-    if prod["price_cents"] is None:
+    units, is_pack, no_pack = _resolve_units(prod["pack_name"], prod["pack_size"], qty, unit)
+    single, pack_price = prod["price_cents"], prod["pack_price_cents"]
+    if single is None and not (is_pack and pack_price is not None):
         return None, "unpriced", prod["name"]
+    if is_pack:
+        charged = pack_price if pack_price is not None else int(round(single * prod["pack_size"]))
+        total = int(round(charged * qty))
+        short = f"{_fmt_qty(qty)}x {prod['name']} {prod['pack_name']}"
+        label = (f"{_fmt_qty(qty)} × {prod['name']} {prod['pack_name']}"
+                 f" ({_fmt_qty(units)} units) @ {cents_to_rand(charged)}")
+    else:
+        total = int(round(single * units))
+        short = f"{_fmt_qty(units)}x {prod['name']}"
+        label = f"{_fmt_qty(units)} × {prod['name']} @ {cents_to_rand(single)}"
     return {
         "product_id": prod["id"],
         "name": prod["name"],
-        "qty": qty,
-        "price_cents": prod["price_cents"],
-        "line_total": int(round(prod["price_cents"] * qty)),
+        "qty": units,
+        "price_cents": single,
+        "line_total": total,
+        "is_pack": is_pack,
+        "short": short,
+        "label": label,
+        "warn": no_pack,
+        "unit_word": _pack_echo(unit) if no_pack else "",
+        "pack_name": prod["pack_name"] or "",
+        "pack_size": prod["pack_size"],
     }, "ok", ""
 
 
@@ -242,6 +311,23 @@ def ensure_product_price(conn: sqlite3.Connection, shop_id: str, name: str, pric
         conn.execute("UPDATE products SET price_cents = ? WHERE id = ?",
                      (price_cents, prod["id"]))
     conn.commit()
+
+
+def ensure_pack_price(conn: sqlite3.Connection, shop_id: str, name: str, pack_price: int) -> None:
+    """Set a known pack product's pack price and derive its single price."""
+    ensure_shop(conn, shop_id)
+    prod, _ = _find_products(conn, shop_id, name)
+    if prod is None or not prod["pack_size"]:
+        return
+    conn.execute("UPDATE products SET pack_price_cents = ?, price_cents = ? WHERE id = ?",
+                 (pack_price, int(round(pack_price / prod["pack_size"])), prod["id"]))
+    conn.commit()
+
+
+def find_product(conn: sqlite3.Connection, shop_id: str, name: str):
+    """Best-match product row or None (for the agent's price-reply path)."""
+    prod, _ = _find_products(conn, shop_id, name)
+    return prod
 
 
 def _store_await_price(conn: sqlite3.Connection, shop_id: str, product: str, spec: dict) -> None:
@@ -293,7 +379,8 @@ def add_credit(conn: sqlite3.Connection, shop_id: str, customer: str, items: lis
         name = str(item.get("product", "")).strip()
         if not name or qty <= 0:
             return "Tell me each item and how many."
-        line, status, detail = _resolve_priced_line(conn, shop_id, name, qty)
+        line, status, detail = _resolve_priced_line(conn, shop_id, name, qty,
+                                                         item.get("unit"))
         if status == "ambiguous":
             return detail
         if status in ("unknown", "unpriced"):
@@ -304,6 +391,9 @@ def add_credit(conn: sqlite3.Connection, shop_id: str, customer: str, items: lis
                 return (f"📝 *{cap} isn't on your list yet.*\nReply with the price, e.g."
                         f" '{detail.lower()} R18', and I'll add it and record"
                         f" {customer.strip()}'s credit.")
+            if _is_pack_unit(item.get("unit")):
+                return (f"{_ask_price(detail)}\nSay one price, e.g. 'R2 each'"
+                        f" — or the pack price, e.g. '{_pack_echo(item.get('unit'))} R60'.")
             return _ask_price(detail)
         lines.append(line)
     total = sum(ln["line_total"] for ln in lines)
@@ -375,7 +465,8 @@ def _apply_record_sale(conn: sqlite3.Connection, shop_id: str, payload: dict, ac
             "INSERT INTO credit_entries (shop_id, customer_id, amount_cents, items_text, action_id)"
             " VALUES (?, ?, ?, ?, ?)",
             (shop_id, customer_id, payload["total_cents"],
-             f"{_fmt_qty(payload['qty'])}x {payload['product']} (sale)", action_id),
+             f"{payload.get('short') or _fmt_qty(payload['qty']) + 'x ' + payload['product']} (sale)",
+             action_id),
         )
         credit_id = cur.lastrowid
     cur = conn.execute(
@@ -394,19 +485,24 @@ def _apply_record_sale(conn: sqlite3.Connection, shop_id: str, payload: dict, ac
     )
     stock = conn.execute("SELECT stock_qty FROM products WHERE id = ?",
                          (payload["product_id"],)).fetchone()["stock_qty"]
+    label = payload.get("label") or f"{_fmt_qty(payload['qty'])} × {payload['product']}"
+    first = f"• {label} = {cents_to_rand(payload['total_cents'])}"
+    prow = conn.execute("SELECT pack_name, pack_size FROM products WHERE id = ?",
+                        (payload["product_id"],)).fetchone()
+    left = f"• Stock left {_fmt_on_hand(stock, prow['pack_name'], prow['pack_size'])}"
     if payload.get("buyer"):
         bal = balance_cents(conn, shop_id, customer_id)
         return (
-            f"✅ *Sale saved*\n• {payload['buyer']} owes"
-            f" {cents_to_rand(payload['total_cents'])} more\n• Balance {cents_to_rand(bal)}",
+            f"✅ *Sale saved*\n{first}\n• {payload['buyer']} owes"
+            f" {cents_to_rand(payload['total_cents'])} more\n• Balance {cents_to_rand(bal)}"
+            f"\n{left}",
             "sale_credit",
             f"sale {payload['product']} to {payload['buyer']}",
             {"sale_id": sale_id, "credit_id": credit_id,
              "product_id": payload["product_id"], "qty": payload["qty"]},
         )
     return (
-        f"✅ *Sale saved*\n• {_fmt_qty(payload['qty'])} × {payload['product']}"
-        f" = {cents_to_rand(payload['total_cents'])}\n• Stock left {_fmt_qty(stock)}",
+        f"✅ *Sale saved*\n{first}\n{left}",
         "sale_cash",
         f"sale {payload['product']} cash",
         {"sale_id": sale_id, "product_id": payload["product_id"], "qty": payload["qty"]},
@@ -414,8 +510,11 @@ def _apply_record_sale(conn: sqlite3.Connection, shop_id: str, payload: dict, ac
 
 
 def record_sale(conn: sqlite3.Connection, shop_id: str, product: str, qty: float = 1,
-                buyer: str | None = None) -> str:
-    """Propose a sale. buyer=None means cash; a name means credit sale."""
+                buyer: str | None = None, unit: str | None = None) -> str:
+    """Propose a sale. buyer=None means cash; a name means credit sale.
+
+    qty is single units unless unit names a pack ("box", "tray", "ibhokisi").
+    """
     ensure_shop(conn, shop_id)
     try:
         qty = float(qty)
@@ -424,21 +523,25 @@ def record_sale(conn: sqlite3.Connection, shop_id: str, product: str, qty: float
     if qty <= 0:
         return "How many?"
     buyer_name = buyer.strip() if buyer and buyer.strip() else None
-    line, status, detail = _resolve_priced_line(conn, shop_id, product or "", qty)
+    line, status, detail = _resolve_priced_line(conn, shop_id, product or "", qty, unit)
     if status == "ambiguous":
         return detail
     if status in ("unknown", "unpriced"):
         _store_await_price(conn, shop_id, detail,
-                           {"tool": "sale", "qty": qty, "buyer": buyer_name})
+                           {"tool": "sale", "qty": qty, "buyer": buyer_name, "unit": unit})
         if status == "unknown":
             cap = detail[:1].upper() + detail[1:]
             tail = (f" and I'll add it and record {buyer_name}'s credit." if buyer_name else
                     " and I'll add it and record the sale.")
             return (f"📝 *{cap} isn't on your list yet.*\nReply with the price, e.g."
                     f" '{detail.lower()} R18',{tail}")
+        if _is_pack_unit(unit):
+            return (f"{_ask_price(detail)}\nSay one price, e.g. 'R2 each'"
+                    f" — or the pack price, e.g. '{_pack_echo(unit)} R60'.")
         return _ask_price(detail)
-    payload = {"product_id": line["product_id"], "product": line["name"], "qty": qty,
-               "total_cents": line["line_total"], "buyer": buyer_name}
+    payload = {"product_id": line["product_id"], "product": line["name"], "qty": line["qty"],
+               "total_cents": line["line_total"], "buyer": buyer_name,
+               "label": line["label"], "short": line["short"]}
     buyer_new = bool(buyer_name) and _get_customer(conn, shop_id, buyer_name) is None
     with _dry_run(conn):
         _apply_record_sale(conn, shop_id, payload, _action_id())
@@ -448,15 +551,18 @@ def record_sale(conn: sqlite3.Connection, shop_id: str, product: str, qty: float
         if buyer_name:
             cust = _get_customer(conn, shop_id, buyer_name)
             buyer_bal = balance_cents(conn, shop_id, cust["id"])
+    first = f"• {line['label']} = {cents_to_rand(line['line_total'])}"
+    left = f"• Stock left {_fmt_on_hand(stock, line['pack_name'], line['pack_size'])}"
     if buyer_name:
-        preview = (f"📝 *Save sale?*\n• {_fmt_qty(qty)} × {line['name']}"
-                   f" = {cents_to_rand(line['line_total'])} to {buyer_name}\n"
-                   f"• Balance {cents_to_rand(buyer_bal)}\n• Stock left {_fmt_qty(stock)}")
+        preview = (f"📝 *Save sale?*\n{first} to {buyer_name}\n"
+                   f"• Balance {cents_to_rand(buyer_bal)}\n{left}")
         if buyer_new:
             preview += "\n• New customer."
     else:
-        preview = (f"📝 *Save sale?*\n• {_fmt_qty(qty)} × {line['name']}"
-                   f" = {cents_to_rand(line['line_total'])} cash\n• Stock left {_fmt_qty(stock)}")
+        preview = f"📝 *Save sale?*\n{first} cash\n{left}"
+    if line["warn"]:
+        preview += (f"\n• ⚠️ No {line['unit_word']} size for {line['name']}"
+                    " — counted as singles.")
     if stock < 0:
         preview += "\n• ⚠️ Count says stock is short."
     return _propose(conn, shop_id, "record_sale", payload, preview)
@@ -470,17 +576,55 @@ def _coerce_pos_int(val) -> int | None:
     return val if val > 0 else None
 
 
-def _fmt_price_extras(cost: int | None, price: int | None) -> str:
+def _fmt_price_extras(cost: float | None, price: int | None,
+                      pack: int | None = None, pack_name: str = "pack") -> str:
     bits = []
     if cost is not None:
-        bits.append(f"cost {cents_to_rand(cost)}")
+        bits.append(f"cost {cents_to_rand(int(round(cost)))}")
     if price is not None:
         bits.append(f"sell {cents_to_rand(price)}")
+    if pack is not None:
+        bits.append(f"{pack_name} {cents_to_rand(pack)}")
     return f" ({', '.join(bits)})" if bits else ""
+
+
+def _plural_pack(pack_name: str) -> str:
+    return {"box": "boxes"}.get(pack_name, pack_name + "s")
+
+
+def _fmt_on_hand(units: float, pack_name: str | None, pack_size: float | None) -> str:
+    """Stock level as packs plus loose units ("1 box + 37 loose (137)")."""
+    if not pack_size:
+        return _fmt_qty(units)
+    if units <= 0:
+        return "0"
+    packs = int(units // pack_size)
+    loose = round(units - packs * pack_size, 2)
+    total = _fmt_qty(units)
+    if packs and loose:
+        word = pack_name if packs == 1 else _plural_pack(pack_name or "pack")
+        return f"{packs} {word} + {_fmt_qty(loose)} loose ({total})"
+    if packs:
+        word = pack_name if packs == 1 else _plural_pack(pack_name or "pack")
+        return f"{packs} {word} ({total})"
+    return total
+
+
+def _fmt_low_line(name: str, units: float, pack_name: str | None,
+                  pack_size: float | None) -> str:
+    if units <= 0:
+        return f"• {name} — out of stock ❌"
+    return f"• {name} — {_fmt_on_hand(units, pack_name, pack_size)} left"
+
+
+def _is_pack_unit(unit: str | None) -> bool:
+    toks = {(t.strip(" .!?,")) for t in (unit or "").lower().split()}
+    return bool(toks & _PACK_WORDS) or any(t.endswith("-pack") for t in toks)
 
 
 def _apply_add_stock(conn: sqlite3.Connection, shop_id: str, payload: dict, action_id: str):
     cost, price = payload.get("cost_cents"), payload.get("price_cents")
+    pack = payload.get("pack_price_cents")
     if payload["product_id"] is None:
         cur = conn.execute(
             "INSERT INTO products (shop_id, name, wholesaler, cost_cents, price_cents)"
@@ -488,12 +632,13 @@ def _apply_add_stock(conn: sqlite3.Connection, shop_id: str, payload: dict, acti
             (shop_id, payload["name"], payload.get("wholesaler") or "", cost, price),
         )
         product_id, created, old_wholesaler = cur.lastrowid, True, ""
-        old_cost = old_price = None
+        old_cost = old_price = old_pack = None
     else:
         product_id, created = payload["product_id"], False
-        row = conn.execute("SELECT wholesaler, cost_cents, price_cents FROM products WHERE id = ?",
-                           (product_id,)).fetchone()
-        old_wholesaler, old_cost, old_price = row["wholesaler"], row["cost_cents"], row["price_cents"]
+        row = conn.execute("SELECT wholesaler, cost_cents, price_cents, pack_price_cents,"
+                           " pack_name FROM products WHERE id = ?", (product_id,)).fetchone()
+        old_wholesaler = row["wholesaler"]
+        old_cost, old_price, old_pack = row["cost_cents"], row["price_cents"], row["pack_price_cents"]
         if payload.get("wholesaler") and not old_wholesaler:
             conn.execute("UPDATE products SET wholesaler = ? WHERE id = ?",
                          (payload["wholesaler"], product_id))
@@ -501,6 +646,9 @@ def _apply_add_stock(conn: sqlite3.Connection, shop_id: str, payload: dict, acti
             conn.execute("UPDATE products SET cost_cents = ? WHERE id = ?", (cost, product_id))
         if price is not None:
             conn.execute("UPDATE products SET price_cents = ? WHERE id = ?", (price, product_id))
+        if pack is not None:
+            conn.execute("UPDATE products SET pack_price_cents = ? WHERE id = ?",
+                         (pack, product_id))
     conn.execute("UPDATE products SET stock_qty = stock_qty + ? WHERE id = ?",
                  (payload["qty"], product_id))
     conn.execute(
@@ -510,27 +658,34 @@ def _apply_add_stock(conn: sqlite3.Connection, shop_id: str, payload: dict, acti
     )
     stock = conn.execute("SELECT stock_qty FROM products WHERE id = ?",
                          (product_id,)).fetchone()["stock_qty"]
-    extras = _fmt_price_extras(cost, price)
+    extras = _fmt_price_extras(cost, price, pack, payload.get("pack_name") or "pack")
+    prow = conn.execute("SELECT pack_name, pack_size FROM products WHERE id = ?",
+                        (product_id,)).fetchone()
+    hand = _fmt_on_hand(stock, prow["pack_name"], prow["pack_size"])
     if created:
         if extras:
             msg = (f"✅ *Stock saved*\n• {payload['name']} added:"
-                   f" {_fmt_qty(stock)} on hand{extras}")
+                   f" {hand} on hand{extras}")
         else:
             msg = (f"✅ *Stock saved*\n• {payload['name']} added:"
-                   f" {_fmt_qty(stock)} on hand\n• ❓ What is the price?")
+                   f" {hand} on hand\n• ❓ What is the price?")
         return (msg, "stock", f"stock new {payload['name']}",
                 {"product_id": product_id, "qty": payload["qty"], "created": True})
     return (
-        f"✅ *Stock saved*\n• {payload['name']}: {_fmt_qty(stock)} on hand{extras}",
+        f"✅ *Stock saved*\n• {payload['name']}: {hand} on hand{extras}",
         "stock", f"stock {payload['name']} +{_fmt_qty(payload['qty'])}",
         {"product_id": product_id, "qty": payload["qty"], "created": False,
-         "old_wholesaler": old_wholesaler, "old_cost": old_cost, "old_price": old_price},
+         "old_wholesaler": old_wholesaler, "old_cost": old_cost, "old_price": old_price,
+         "old_pack": old_pack},
     )
 
 
 def add_stock(conn: sqlite3.Connection, shop_id: str, product: str, qty: float,
               wholesaler: str | None = None, cost_cents: int | None = None,
-              price_cents: int | None = None) -> str:
+              price_cents: int | None = None, unit: str | None = None,
+              pack_price_cents: int | None = None) -> str:
+    """Add stock. qty is singles unless unit names a pack; a pack cost is
+    converted to cost per single."""
     ensure_shop(conn, shop_id)
     name = (product or "").strip()
     try:
@@ -544,43 +699,69 @@ def add_stock(conn: sqlite3.Connection, shop_id: str, product: str, qty: float,
     prod, ambiguous = _find_products(conn, shop_id, name)
     if prod is None and ambiguous:
         return _which_one(ambiguous)
-    cost, price = _coerce_pos_int(cost_cents), _coerce_pos_int(price_cents)
+    if prod is None and _is_pack_unit(unit):
+        return (f"❓ *{name} isn't on the shelf list.*\n"
+                f"Add it as singles first? e.g. 'add 200 {name.lower()}'.")
+    if prod is None:
+        units, is_pack, no_pack = qty, False, False
+        pack_name, pack_size = "", None
+    else:
+        pack_name, pack_size = prod["pack_name"], prod["pack_size"]
+        units, is_pack, no_pack = _resolve_units(pack_name, pack_size, qty, unit)
+    quoted_cost = _coerce_pos_int(cost_cents)
+    cost = quoted_cost / pack_size if (is_pack and quoted_cost) else quoted_cost
+    price = _coerce_pos_int(price_cents)
+    pack = _coerce_pos_int(pack_price_cents)
     payload = {"product_id": prod["id"] if prod else None, "name": prod["name"] if prod else name,
-               "qty": qty, "wholesaler": (wholesaler or "").strip(),
-               "cost_cents": cost, "price_cents": price}
+               "qty": units, "wholesaler": (wholesaler or "").strip(),
+               "cost_cents": cost, "price_cents": price, "pack_price_cents": pack,
+               "pack_name": pack_name}
     with _dry_run(conn):
         _apply_add_stock(conn, shop_id, payload, _action_id())
         pid = conn.execute("SELECT id FROM products WHERE shop_id = ? AND name = ?",
                            (shop_id, payload["name"])).fetchone()["id"]
         stock = conn.execute("SELECT stock_qty FROM products WHERE id = ?",
                              (pid,)).fetchone()["stock_qty"]
-    extras = _fmt_price_extras(cost, price)
+    extras = _fmt_price_extras(cost, price, pack, pack_name or "pack")
+    old_hand = _fmt_on_hand(prod["stock_qty"], pack_name, pack_size) if prod else ""
+    new_hand = _fmt_on_hand(stock, pack_name, pack_size)
     if prod is None:
         if extras:
-            preview = f"📝 *Add stock?*\n• New: {name} × {_fmt_qty(qty)}{extras}"
+            preview = f"📝 *Add stock?*\n• New: {name} × {_fmt_qty(units)}{extras}"
         else:
-            preview = (f"📝 *Add stock?*\n• New: {name} × {_fmt_qty(qty)}\n"
+            preview = (f"📝 *Add stock?*\n• New: {name} × {_fmt_qty(units)}\n"
                        "• Price still needed.")
+    elif is_pack:
+        preview = (f"📝 *Add stock?*\n• +{_fmt_qty(qty)} {_plural_pack(pack_name)}"
+                   f" {prod['name']} ({_fmt_qty(units)} units)\n"
+                   f"• Stock {old_hand} → {new_hand}{extras}")
     else:
-        preview = (f"📝 *Add stock?*\n• +{_fmt_qty(qty)} {prod['name']}\n"
-                   f"• Stock {_fmt_qty(prod['stock_qty'])} → {_fmt_qty(stock)}{extras}")
+        preview = (f"📝 *Add stock?*\n• +{_fmt_qty(units)} {prod['name']}\n"
+                   f"• Stock {old_hand} → {new_hand}{extras}")
+    if no_pack:
+        preview += (f"\n• ⚠️ No {_pack_echo(unit)} size for {prod['name']}"
+                    " — counted as singles.")
     if cost is not None and price is not None and cost > price:
         preview += "\n• ⚠️ Cost is higher than sell price."
     return _propose(conn, shop_id, "add_stock", payload, preview)
 
 
 def _apply_set_price(conn: sqlite3.Connection, shop_id: str, payload: dict, action_id: str):
-    conn.execute("UPDATE products SET price_cents = ? WHERE id = ?",
+    column = "pack_price_cents" if payload.get("for_pack") else "price_cents"
+    conn.execute(f"UPDATE products SET {column} = ? WHERE id = ?",
                  (payload["price_cents"], payload["product_id"]))
     old = payload["old_price"]
     new = cents_to_rand(payload["price_cents"])
-    msg = f"✅ *Price saved*\n• {payload['name']} is now {new}." if old is None else \
-        f"✅ *Price saved*\n• {payload['name']} {cents_to_rand(old)} → {new}."
-    return msg, "price", f"price {payload['name']} {new}", \
-        {"product_id": payload["product_id"], "old_price": old}
+    what = f"{payload['name']} {payload.get('pack_name')}" if payload.get("for_pack") else payload["name"]
+    msg = f"✅ *Price saved*\n• {what} is now {new}." if old is None else \
+        f"✅ *Price saved*\n• {what} {cents_to_rand(old)} → {new}."
+    return msg, "price", f"price {what} {new}", \
+        {"product_id": payload["product_id"], "old_price": old,
+         "for_pack": bool(payload.get("for_pack")), "pack_name": payload.get("pack_name") or ""}
 
 
-def set_price(conn: sqlite3.Connection, shop_id: str, product: str, price_cents: int) -> str:
+def set_price(conn: sqlite3.Connection, shop_id: str, product: str, price_cents: int,
+              for_pack: bool = False) -> str:
     ensure_shop(conn, shop_id)
     prod, ambiguous = _find_products(conn, shop_id, product or "")
     if prod is None:
@@ -588,17 +769,25 @@ def set_price(conn: sqlite3.Connection, shop_id: str, product: str, price_cents:
             return _which_one(ambiguous)
         return (f"❓ *{(product or '').strip()} isn't on the shelf list.*\n"
                 "Add it to stock first?")
+    if for_pack and not prod["pack_size"]:
+        return f"❓ {prod['name']} has no pack size. Set the single price instead?"
     try:
         price = int(price_cents)
     except (TypeError, ValueError):
         return _ask_price(prod["name"])
     if price <= 0:
         return _ask_price(prod["name"])
+    if for_pack:
+        old = prod["pack_price_cents"]
+        what = f"{prod['name']} {prod['pack_name']}"
+    else:
+        old = prod["price_cents"]
+        what = prod["name"]
     payload = {"product_id": prod["id"], "name": prod["name"],
-               "price_cents": price, "old_price": prod["price_cents"]}
-    old = prod["price_cents"]
-    preview = f"📝 *Set price?*\n• {prod['name']} → {cents_to_rand(price)}" if old is None else \
-        f"📝 *Set price?*\n• {prod['name']} {cents_to_rand(old)} → {cents_to_rand(price)}"
+               "price_cents": price, "old_price": old,
+               "for_pack": bool(for_pack), "pack_name": prod["pack_name"] or ""}
+    preview = f"📝 *Set price?*\n• {what} → {cents_to_rand(price)}" if old is None else \
+        f"📝 *Set price?*\n• {what} {cents_to_rand(old)} → {cents_to_rand(price)}"
     return _propose(conn, shop_id, "set_price", payload, preview)
 
 
@@ -818,21 +1007,21 @@ def list_stock(conn: sqlite3.Connection, shop_id: str) -> str:
     for cat in order:
         lines = [_CATEGORY_HEADS.get(cat, f"🏷️ *{cat}*")]
         for r in groups[cat]:
+            hand = _fmt_on_hand(r["stock_qty"], r["pack_name"], r["pack_size"])
             if r["price_cents"] is not None:
-                line = (f"• {r['name']}: {_fmt_qty(r['stock_qty'])} ×"
-                        f" {cents_to_rand(r['price_cents'])}")
+                line = f"• {r['name']}: {hand} × {cents_to_rand(r['price_cents'])}"
+                if r["pack_size"]:
+                    line += " each"
             else:
-                line = f"• {r['name']}: {_fmt_qty(r['stock_qty'])} (no price)"
+                line = f"• {r['name']}: {hand} (no price)"
             lines.append(line + _stock_flag(r["stock_qty"], r["reorder_level"]))
         blocks.append("\n".join(lines))
     low = [r for r in rows if r["stock_qty"] <= r["reorder_level"]]
     if low:
         lines = ["⚠️ *Running low*"]
         for r in sorted(low, key=lambda r: r["name"]):
-            if r["stock_qty"] <= 0:
-                lines.append(f"• {r['name']} — out of stock ❌")
-            else:
-                lines.append(f"• {r['name']} — {_fmt_qty(r['stock_qty'])} left")
+            lines.append(_fmt_low_line(r["name"], r["stock_qty"],
+                                       r["pack_name"], r["pack_size"]))
         blocks.append("\n".join(lines))
     else:
         blocks.append("✅ Nothing is running low.")
@@ -875,10 +1064,8 @@ def low_stock(conn: sqlite3.Connection, shop_id: str) -> str:
         return "✅ Stock looks fine. Nothing is low."
     lines = ["⚠️ *Low stock*"]
     for r in rows:
-        if r["stock_qty"] <= 0:
-            lines.append(f"• {r['name']} — out of stock ❌")
-        else:
-            lines.append(f"• {r['name']} — {_fmt_qty(r['stock_qty'])} left")
+        lines.append(_fmt_low_line(r["name"], r["stock_qty"],
+                                   r["pack_name"], r["pack_size"]))
     return "\n".join(lines)
 
 
@@ -893,8 +1080,15 @@ def restock_list(conn: sqlite3.Connection, shop_id: str) -> str:
     groups: dict[str, list[str]] = {}
     for r in rows:
         need = max(1, int(r["reorder_level"] * 2 - r["stock_qty"]))
-        groups.setdefault(r["wholesaler"] or "No wholesaler", []).append(
-            f"• {r['name']} — have {_fmt_qty(r['stock_qty'])}, order {need}")
+        have = _fmt_qty(r["stock_qty"])
+        if r["pack_size"]:
+            packs = math.ceil(need / r["pack_size"])
+            word = r["pack_name"] if packs == 1 else _plural_pack(r["pack_name"])
+            groups.setdefault(r["wholesaler"] or "No wholesaler", []).append(
+                f"• {r['name']} — have {have}, order {packs} {word}")
+        else:
+            groups.setdefault(r["wholesaler"] or "No wholesaler", []).append(
+                f"• {r['name']} — have {have}, order {need}")
     blocks = ["🛒 *Buy tomorrow*"]
     for w, items in groups.items():
         blocks.append(f"*{w}*\n" + "\n".join(items))
@@ -1100,6 +1294,9 @@ def _undo_stock(conn: sqlite3.Connection, shop_id: str, undo: dict, action_id: s
         if "old_price" in undo:
             sets.append("price_cents = ?")
             params.append(undo["old_price"])
+        if "old_pack" in undo:
+            sets.append("pack_price_cents = ?")
+            params.append(undo["old_pack"])
         conn.execute(f"UPDATE products SET {', '.join(sets)} WHERE id = ?", (*params, pid))
         return f"Undone: removed the stock added. {name} back to {_fmt_qty(stock)}."
     conn.execute("DELETE FROM stock_moves WHERE product_id = ?", (pid,))
@@ -1108,13 +1305,18 @@ def _undo_stock(conn: sqlite3.Connection, shop_id: str, undo: dict, action_id: s
 
 
 def _undo_price(conn: sqlite3.Connection, shop_id: str, undo: dict) -> str:
-    conn.execute("UPDATE products SET price_cents = ? WHERE id = ?",
+    column = "pack_price_cents" if undo.get("for_pack") else "price_cents"
+    conn.execute(f"UPDATE products SET {column} = ? WHERE id = ?",
                  (undo["old_price"], undo["product_id"]))
     name = conn.execute("SELECT name FROM products WHERE id = ?",
                         (undo["product_id"],)).fetchone()["name"]
+    if undo.get("for_pack"):
+        what = f"{name} {undo.get('pack_name')} price"
+    else:
+        what = f"{name} price"
     if undo["old_price"] is None:
-        return f"Undone: {name} price removed."
-    return f"Undone: {name} price back to {cents_to_rand(undo['old_price'])}."
+        return f"Undone: {what} removed."
+    return f"Undone: {what} back to {cents_to_rand(undo['old_price'])}."
 
 
 def _undo_expiry(conn: sqlite3.Connection, shop_id: str, undo: dict) -> str:
@@ -1191,10 +1393,12 @@ def _tool(name: str, desc: str, props: dict, required: list[str]) -> dict:
 
 TOOL_DEFS = [
     _tool("add_credit", "Put items someone TOOK on their credit book (asks for Yes first)."
-          " Use for 'took ... on the book'. No sale is recorded and stock is unchanged.",
+          " Use for 'took ... on the book'. No sale is recorded and stock is unchanged."
+          " qty is ALWAYS single units; pass unit only when the owner names a pack.",
           {"customer": {"type": "string"},
            "items": {"type": "array", "items": {"type": "object",
-                     "properties": {"product": {"type": "string"}, "qty": {"type": "number"}},
+                     "properties": {"product": {"type": "string"}, "qty": {"type": "number"},
+                                    "unit": {"type": "string"}},
                      "required": ["product", "qty"]}}}, ["customer", "items"]),
     _tool("record_payment", "Record a customer paying into the credit book.",
           {"customer": {"type": "string"}, "amount_cents": {"type": "integer"}},
@@ -1206,19 +1410,25 @@ TOOL_DEFS = [
           {"customer": {"type": "string"}}, ["customer"]),
     _tool("record_sale", "Record something SOLD: reduces stock and counts toward cash-up."
           " Use whenever the owner says they sold something."
-          " Omit buyer for cash, or name the buyer for a credit sale.",
+          " Omit buyer for cash, or name the buyer for a credit sale."
+          " qty is ALWAYS single units ('5 chappies' is 5 loose sweets); pass unit"
+          " only when the owner names a pack ('box', 'tray', 'ibhokisi').",
           {"product": {"type": "string"}, "qty": {"type": "number"},
-           "buyer": {"type": "string"}}, ["product"]),
+           "buyer": {"type": "string"}, "unit": {"type": "string"}}, ["product"]),
     _tool("add_stock", "Add stock ('add', 'got', 'restock', 'bought for the shop')."
           " Pass wholesaler only when the owner names a specific one; never guess."
-          " Pass cost_cents (what the owner paid) and price_cents (sell price) when stated"
-          " — 'got 12 Stoney 2L, cost R19 sell R25' sets both.",
+          " qty is singles unless unit names a pack ('2 boxes chappies'). cost_cents"
+          " is per pack when unit is a pack (it is converted), per single otherwise;"
+          " price_cents is always the single sell price; pack_price_cents the pack"
+          " sell price.",
           {"product": {"type": "string"}, "qty": {"type": "number"},
            "wholesaler": {"type": "string"}, "cost_cents": {"type": "integer"},
-           "price_cents": {"type": "integer"}}, ["product", "qty"]),
-    _tool("set_price", "Set a product's selling price in cents.",
-          {"product": {"type": "string"}, "price_cents": {"type": "integer"}},
-          ["product", "price_cents"]),
+           "price_cents": {"type": "integer"}, "unit": {"type": "string"},
+           "pack_price_cents": {"type": "integer"}}, ["product", "qty"]),
+    _tool("set_price", "Set a product's selling price in cents. Single price by"
+          " default; for_pack=true sets the pack sell price ('chappies box R95').",
+          {"product": {"type": "string"}, "price_cents": {"type": "integer"},
+           "for_pack": {"type": "boolean"}}, ["product", "price_cents"]),
     _tool("low_stock", "ONLY the products at or below reorder level. Not the full list.", {}, []),
     _tool("list_stock", "FULL stock list grouped by category: every item, quantity and sell"
           " price. Use for 'what do we have in stock', 'stock breakdown', 'stock on hand'."

@@ -20,18 +20,19 @@ from app.db import connect, init_db, now_iso  # noqa: E402
 DEMO_SHOP_ID = "27710000001"
 DEMO_SHOP_NAME = "MaZulu's Spaza"
 
-# name, price_cents, stock_qty, reorder_level, wholesaler, unit, category
+# name, price_cents, stock_qty, reorder_level, wholesaler, unit, category,
+# pack_name, pack_size, pack_price_cents (stock and prices are single units)
 PRODUCTS = [
-    ("Sasko White Bread 700g", 1850, 12, 6, "Devland", "loaf", "Bread"),
-    ("Albany Brown Bread 700g", 1900, 8, 6, "Devland", "loaf", "Bread"),
-    ("Iwisa Maize Meal 5kg", 9200, 6, 4, "Jumbo", "bag", "Groceries"),
-    ("Tastic Rice 2kg", 6500, 2, 4, "Jumbo", "bag", "Groceries"),
-    ("Lucky Star Pilchards 400g", 2850, 24, 12, "Devland", "tin", "Groceries"),
-    ("Coke 2L", 3600, 5, 6, "Coke Depot", "bottle", "Drinks"),
-    ("Stoney 2L", 3300, 8, 6, "Coke Depot", "bottle", "Drinks"),
-    ("Simba Chips 120g", 2400, 3, 10, "Jumbo", "packet", "Groceries"),
-    ("Fresh Milk 1L", 2700, 6, 6, "Devland", "bottle", "Dairy"),
-    ("Eggs 30s Tray", 9500, 4, 2, "Jumbo", "tray", "Groceries"),
+    ("Sasko White Bread 700g", 1850, 12, 6, "Devland", "loaf", "Bread", "", None, None),
+    ("Albany Brown Bread 700g", 1900, 8, 6, "Devland", "loaf", "Bread", "", None, None),
+    ("Iwisa Maize Meal 5kg", 9200, 6, 4, "Jumbo", "bag", "Groceries", "", None, None),
+    ("Tastic Rice 2kg", 6500, 2, 4, "Jumbo", "bag", "Groceries", "", None, None),
+    ("Lucky Star Pilchards 400g", 2850, 24, 12, "Devland", "tin", "Groceries", "", None, None),
+    ("Coke 2L", 3600, 5, 6, "Coke Depot", "bottle", "Drinks", "", None, None),
+    ("Stoney 2L", 3300, 8, 6, "Coke Depot", "bottle", "Drinks", "", None, None),
+    ("Simba Chips 120g", 2400, 3, 10, "Jumbo", "packet", "Groceries", "", None, None),
+    ("Fresh Milk 1L", 2700, 6, 6, "Devland", "bottle", "Dairy", "", None, None),
+    ("Eggs", 350, 90, 30, "Jumbo", "egg", "Groceries", "tray", 30, 9500),
 ]
 
 CUSTOMERS = ["Thandi", "Sipho", "Lerato", "Jabu", "Nomvula", "Bongani"]
@@ -40,7 +41,7 @@ CUSTOMERS = ["Thandi", "Sipho", "Lerato", "Jabu", "Nomvula", "Bongani"]
 CREDIT = [
     ("Sipho", 7300, "2x Sasko White Bread, 1x Coke 2L"),
     ("Thandi", 4550, "1x Tastic Rice 2kg (part), 1x Lucky Star"),
-    ("Jabu", 12000, "1x Iwisa 5kg, 1x Eggs 30s (part)"),
+    ("Jabu", 12000, "1x Iwisa 5kg, 8x Eggs (part)"),
 ]
 
 # product_name, qty, expiry_date, note
@@ -89,12 +90,15 @@ def seed_demo(shop_id: str = DEMO_SHOP_ID, conn: sqlite3.Connection | None = Non
             )
             cust_ids[name] = cur.lastrowid
         prod_ids: dict[str, int] = {}
-        for i, (name, price, qty, reorder, wholesaler, unit, category) in enumerate(PRODUCTS):
+        for i, (name, price, qty, reorder, wholesaler, unit, category,
+                  pack_name, pack_size, pack_price) in enumerate(PRODUCTS):
             cur = conn.execute(
                 """INSERT INTO products (shop_id, name, price_cents, stock_qty,
-                   reorder_level, wholesaler, unit, category)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (shop_id, name, price, qty, reorder, wholesaler, unit, category),
+                   reorder_level, wholesaler, unit, category,
+                   pack_name, pack_size, pack_price_cents)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (shop_id, name, price, qty, reorder, wholesaler, unit, category,
+                 pack_name, pack_size, pack_price),
             )
             prod_ids[name] = cur.lastrowid
             conn.execute(

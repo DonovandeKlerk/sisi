@@ -35,6 +35,9 @@ CREATE TABLE IF NOT EXISTS products (
   wholesaler    TEXT NOT NULL DEFAULT '',
   unit          TEXT NOT NULL DEFAULT '',
   category      TEXT NOT NULL DEFAULT '',
+  pack_name     TEXT NOT NULL DEFAULT '',
+  pack_size     REAL,
+  pack_price_cents INTEGER,
   updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   UNIQUE (shop_id, name)
 );
@@ -171,6 +174,9 @@ def init_db(conn: sqlite3.Connection) -> None:
     for sql in (
         "ALTER TABLE products ADD COLUMN cost_cents INTEGER",
         "ALTER TABLE products ADD COLUMN category TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE products ADD COLUMN pack_name TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE products ADD COLUMN pack_size REAL",
+        "ALTER TABLE products ADD COLUMN pack_price_cents INTEGER",
     ):
         try:
             conn.execute(sql)

@@ -30,46 +30,47 @@ WHOLESALER = "Jumbo Amanzimtoti"
 
 CATEGORIES = ["Bread", "Dairy", "Drinks", "Groceries", "Household", "Airtime"]
 
-# name, category, cost_low, cost_high, sell_low, sell_high (all cents, x50)
+# name, category, cost_low, cost_high, sell_low, sell_high (all cents, x50),
+# pack (pack_name, pack_size, pack_cost_l, pack_cost_h, pack_sell_l, pack_sell_h) or None.
+# singles costs/sells are per single unit; pack costs convert to cost per unit.
 CATALOG = [
-    ("Sasko White Bread 700g", "Bread", 1500, 1700, 1900, 2200),
-    ("Albany Brown Bread 700g", "Bread", 1600, 1800, 2000, 2300),
-    ("Bread Rolls 4s", "Bread", 1100, 1300, 1400, 1750),
-    ("Fresh Milk 1L", "Dairy", 2200, 2500, 2700, 3200),
-    ("Amasi 2L", "Dairy", 3400, 3800, 4200, 4800),
-    ("Stoney 2L", "Drinks", 2700, 3000, 3400, 3800),
-    ("Coke 2L", "Drinks", 2900, 3200, 3600, 4000),
-    ("Orange Juice 2L", "Drinks", 3200, 3600, 4000, 4500),
-    ("Iwisa Maize Meal 5kg", "Groceries", 7000, 8000, 8500, 10000),
-    ("Iwisa Maize Meal 10kg", "Groceries", 13500, 15000, 16000, 18500),
-    ("Sugar 2.5kg", "Groceries", 5200, 6000, 6500, 7500),
-    ("Tastic Rice 2kg", "Groceries", 4800, 5500, 6000, 7000),
-    ("Cooking Oil 750ml", "Groceries", 3000, 3500, 3800, 4500),
-    ("Joko Tea 100s", "Groceries", 4400, 5000, 5500, 6500),
-    ("Ricoffy 750g", "Groceries", 7800, 8800, 9500, 11000),
-    ("Eggs 30s Tray", "Groceries", 7200, 8200, 9000, 10500),
-    ("Loose Eggs each", "Groceries", 150, 200, 250, 350),
-    ("Lucky Star Pilchards 400g", "Groceries", 2200, 2500, 2800, 3300),
-    ("Koo Baked Beans 410g", "Groceries", 1900, 2200, 2500, 3000),
-    ("Simba Chips 120g", "Groceries", 1800, 2050, 2300, 2700),
-    ("Chappies 100s", "Groceries", 3300, 3700, 4200, 4800),
-    ("Table Salt 1kg", "Groceries", 800, 1000, 1200, 1600),
-    ("Candles 6s", "Household", 2700, 3100, 3500, 4200),
-    ("Lion Matches 10s", "Household", 1500, 1800, 2000, 2500),
-    ("Paraffin 1L", "Household", 2200, 2600, 2800, 3400),
-    ("Washing Powder 2kg", "Household", 6000, 7000, 7500, 9000),
-    ("Bath Soap", "Household", 1300, 1600, 1800, 2400),
-    ("Toilet Paper 10s", "Household", 7600, 8600, 9500, 11000),
-    ("Vodacom Airtime R30", "Airtime", 2800, 2900, 3000, 3000),
-    ("MTN Airtime R30", "Airtime", 2800, 2900, 3000, 3000),
-    ("Vodacom Data 1GB", "Airtime", 8300, 8500, 8900, 8900),
-    ("MTN Data 1GB", "Airtime", 8300, 8500, 8900, 8900),
+    ("Sasko White Bread 700g", "Bread", 1500, 1700, 1900, 2200, None),
+    ("Albany Brown Bread 700g", "Bread", 1600, 1800, 2000, 2300, None),
+    ("Bread Rolls", "Bread", 0, 0, 450, 450, ("packet", 4, 1300, 1600, 1900, 2200)),
+    ("Fresh Milk 1L", "Dairy", 2200, 2500, 2700, 3200, None),
+    ("Amasi 2L", "Dairy", 3400, 3800, 4200, 4800, None),
+    ("Stoney 2L", "Drinks", 2700, 3000, 3400, 3800, None),
+    ("Coke 2L", "Drinks", 2900, 3200, 3600, 4000, None),
+    ("Orange Juice 2L", "Drinks", 3200, 3600, 4000, 4500, None),
+    ("Iwisa Maize Meal 5kg", "Groceries", 7000, 8000, 8500, 10000, None),
+    ("Iwisa Maize Meal 10kg", "Groceries", 13500, 15000, 16000, 18500, None),
+    ("Sugar 2.5kg", "Groceries", 5200, 6000, 6500, 7500, None),
+    ("Tastic Rice 2kg", "Groceries", 4800, 5500, 6000, 7000, None),
+    ("Cooking Oil 750ml", "Groceries", 3000, 3500, 3800, 4500, None),
+    ("Joko Tea 100s", "Groceries", 4400, 5000, 5500, 6500, None),
+    ("Ricoffy 750g", "Groceries", 7800, 8800, 9500, 11000, None),
+    ("Eggs", "Groceries", 0, 0, 350, 350, ("tray", 30, 8800, 9800, 10500, 11500)),
+    ("Lucky Star Pilchards 400g", "Groceries", 2200, 2500, 2800, 3300, None),
+    ("Koo Baked Beans 410g", "Groceries", 1900, 2200, 2500, 3000, None),
+    ("Simba Chips 120g", "Groceries", 1800, 2050, 2300, 2700, None),
+    ("Chappies", "Groceries", 0, 0, 100, 100, ("box", 100, 7800, 8800, 8500, 9500)),
+    ("Table Salt 1kg", "Groceries", 800, 1000, 1200, 1600, None),
+    ("Candles", "Household", 0, 0, 600, 600, ("packet", 6, 2700, 3300, 3800, 4200)),
+    ("Matches", "Household", 0, 0, 200, 200, ("pack", 10, 1400, 1700, 2000, 2500)),
+    ("Paraffin 1L", "Household", 2200, 2600, 2800, 3400, None),
+    ("Washing Powder 2kg", "Household", 6000, 7000, 7500, 9000, None),
+    ("Bath Soap", "Household", 1300, 1600, 1800, 2400, None),
+    ("Toilet Paper 10s", "Household", 7600, 8600, 9500, 11000, None),
+    ("Vodacom Airtime R30", "Airtime", 2800, 2900, 3000, 3000, None),
+    ("MTN Airtime R30", "Airtime", 2800, 2900, 3000, 3000, None),
+    ("Vodacom Data 1GB", "Airtime", 8300, 8500, 8900, 8900, None),
+    ("MTN Data 1GB", "Airtime", 8300, 8500, 8900, 8900, None),
 ]
 
 CREDIT_CUSTOMERS = ["Sipho", "Thandi", "Mama Zodwa", "Bongani"]
 
 SHORT_LIFE = {"Fresh Milk 1L", "Amasi 2L", "Sasko White Bread 700g",
-              "Albany Brown Bread 700g", "Bread Rolls 4s", "Loose Eggs each"}
+              "Albany Brown Bread 700g", "Bread Rolls", "Eggs", "Chappies"}
 
 
 def _cents(rng: random.Random, low: int, high: int) -> int:
@@ -95,12 +96,24 @@ def seed_random_shop(shop_id: str = DEMO_NUMBER,
         low_picks = set(rng.sample([p[0] for p in picked], 4))
         out_of_stock = rng.choice(sorted(low_picks))
         prod_ids: dict[str, int] = {}
-        for i, (name, cat, cl, ch, sl, sh) in enumerate(picked):
-            cost, sell = _cents(rng, cl, ch), _cents(rng, sl, sh)
+        for i, (name, cat, cl, ch, sl, sh, pack) in enumerate(picked):
+            if pack:
+                pack_name, size, pcl, pch, psl, psh = pack
+                pack_cost = _cents(rng, pcl, pch)
+                cost, sell = pack_cost / size, _cents(rng, sl, sh)
+                pack_price = _cents(rng, psl, psh)
+                reorder = size // 2
+            else:
+                pack_name, size, pack_price = "", None, None
+                cost, sell = _cents(rng, cl, ch), _cents(rng, sl, sh)
             if name == out_of_stock:
-                qty, reorder = 0, rng.randint(4, 6)
+                qty = 0
+                reorder = size // 2 if pack else rng.randint(4, 6)
             elif name in low_picks:
-                qty, reorder = rng.randint(1, 2), rng.randint(4, 6)
+                qty = rng.randint(1, 2)
+                reorder = size // 2 if pack else rng.randint(4, 6)
+            elif pack:
+                qty = rng.randint(size, 3 * size)
             elif cat == "Airtime":
                 qty, reorder = rng.randint(6, 15), 3
             else:
@@ -108,9 +121,11 @@ def seed_random_shop(shop_id: str = DEMO_NUMBER,
                 qty = reorder + rng.randint(2, 14)
             cur = conn.execute(
                 """INSERT INTO products (shop_id, name, price_cents, cost_cents,
-                   stock_qty, reorder_level, wholesaler, category)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (shop_id, name, sell, cost, qty, reorder, WHOLESALER, cat),
+                   stock_qty, reorder_level, wholesaler, category,
+                   pack_name, pack_size, pack_price_cents)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (shop_id, name, sell, cost, qty, reorder, WHOLESALER, cat,
+                 pack_name, size, pack_price),
             )
             prod_ids[name] = cur.lastrowid
             conn.execute(

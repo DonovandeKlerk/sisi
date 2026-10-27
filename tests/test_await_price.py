@@ -49,7 +49,7 @@ def test_price_reply_completes_credit_sale(conn):
     record_sale(conn, SHOP, "Stoney 2L", 2, buyer="Sipho")
     msg, buttons = handle_text(conn, SHOP, "stoney 2l R25")
     assert buttons == ["Yes", "No"]
-    assert "2 × Stoney 2L = R50.00 to Sipho" in msg
+    assert "2 × Stoney 2L @ R25.00 = R50.00 to Sipho" in msg
     saved, _ = handle_text(conn, SHOP, "Yes")
     assert "✅ *Sale saved*" in saved and "Sipho owes R50.00 more" in saved
     row = conn.execute("SELECT price_cents, stock_qty FROM products"
@@ -76,7 +76,7 @@ def test_unpriced_known_item_ask_resumes_on_price(conn):
     assert record_sale(conn, SHOP, "Milk 1L", 1) == "❓ What is the price of Milk 1L?"
     preview, buttons = handle_text(conn, SHOP, "milk R22")
     assert buttons == ["Yes", "No"]
-    assert "1 × Milk 1L = R22.00 cash" in preview
+    assert "1 × Milk 1L @ R22.00 = R22.00 cash" in preview
 
 
 def test_multi_line_credit_pauses_on_unknown_line(conn):

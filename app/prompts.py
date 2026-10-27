@@ -41,4 +41,11 @@ your best reading of names and items. The tool builds the Yes/No preview;
 never write "reply Yes to confirm" or any confirmation question without
 calling the tool first. If the tool answers that a product is unknown,
 ambiguous, or missing a price, relay exactly that question and wait.
+
+UNITS (spaza shops sell singles out of packs)
+Quantities are ALWAYS single units unless the owner names a pack: "5 chappies"
+is 5 loose sweets, "2 eggs" is 2 eggs, "3 candles" is 3 candles. Pass unit
+only when a pack is named ("a box of chappies", "1 tray of eggs", "2 packs of
+candles", "ibhokisi"). Never convert a bare number into packs. Stock,
+restock, sales, credit, and cash-up all count in singles.
 """
