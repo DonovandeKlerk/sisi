@@ -18,17 +18,15 @@ import os
 
 import modal
 
-def _bake_u2net() -> None:
-    """Download the rembg u2net model once at build time (not per request)."""
-    from rembg import new_session
-    new_session("u2net")
-
-
 image = (
     modal.Image.debian_slim()
     .apt_install("ffmpeg", "fonts-dejavu-core")
     .pip_install_from_requirements("requirements.txt")
-    .run_function(_bake_u2net)
+    # Bake the rembg u2net model into the image (plain python -c: needs no
+    # app source, so it is safe to run before the code is added).
+    .run_commands(
+        "python -c \"from rembg import new_session; new_session('u2net')\""
+    )
     # Bake the app package into the image (deploy uploads only modal_app.py).
     .add_local_dir("app", remote_path="/root/app",
                    ignore=["__pycache__", "*.pyc", "*.pyo"])
