@@ -298,7 +298,7 @@ def test_sim_voice_404_when_live(voice_env, monkeypatch):
 
 
 def test_webhook_audio_message_end_to_end(voice_env, monkeypatch):
-    monkeypatch.setattr(main, "download_media", lambda _mid: b"ogg-bytes")
+    monkeypatch.setattr(main, "download_media", lambda _mid, _label="voice note": b"ogg-bytes")
     monkeypatch.setattr(agent, "transcribe_audio", lambda *a, **k: "undo")
     payload = {"object": "whatsapp_business_account", "entry": [{"changes": [{
         "value": {"messages": [{"id": "wamid.v1", "from": SHOP, "type": "audio",

@@ -22,6 +22,7 @@ from app.agent import handle_photo, handle_text, handle_voice
 from app.db import connect, init_db, now_iso
 from app.vision import VisionError
 from app.voice import VoiceError
+from app.vonage import VonageSender, download_vonage_media, parse_vonage_webhook
 from app.whatsapp import (
     FakeSender,
     IncomingMessage,
@@ -96,6 +97,31 @@ async def webhook_receive(request: Request, background_tasks: BackgroundTasks):
     return {"status": "ok"}
 
 
+@app.post("/webhook/vonage")
+async def webhook_vonage_receive(request: Request, background_tasks: BackgroundTasks):
+    # The Vonage sandbox signs nothing inbound, so there is no signature to
+    # check here; only the rate limit + body cap apply. Production Vonage
+    # apps should verify the request signature or JWT.
+    raw = await request.body()
+    if len(raw) > MAX_WEBHOOK_BYTES:
+        raise HTTPException(status_code=413, detail="payload too large")
+    try:
+        payload = json.loads(raw or b"{}")
+    except ValueError:
+        return {"status": "ignored"}
+    for msg in parse_vonage_webhook(payload):
+        if _rate_limited(msg.shop_id):
+            log.warning("rate-limited %s", msg.shop_id)
+            continue
+        background_tasks.add_task(process_message, msg)
+    return {"status": "ok"}
+
+
+@app.post("/webhook/vonage/status")
+async def webhook_vonage_status():
+    return {"status": "ok"}
+
+
 def _already_seen(message_id: str, shop_id: str) -> bool:
     conn = connect()
     try:
@@ -124,32 +150,42 @@ def _with_consent(conn, shop_id: str, reply: str) -> str:
     return reply + "\n\n" + CONSENT_LINE
 
 
+def _download_msg_media(msg: IncomingMessage, label: str) -> bytes | None:
+    """Fetch message media for either channel. None when the message has no media ref."""
+    if msg.media_url:
+        return download_vonage_media(msg.media_url)
+    if msg.media_id:
+        return download_media(msg.media_id, label)
+    return None
+
+
 def process_message(msg: IncomingMessage) -> None:
     """Background worker: one message, own connection, never raises."""
     try:
         if _already_seen(msg.message_id, msg.shop_id):
             log.info("duplicate %s ignored", msg.message_id)
             return
-        sender = get_sender()
+        sender = VonageSender() if msg.channel == "vonage" else get_sender()
         conn = connect()
         try:
             init_db(conn)
             if msg.kind == "media:audio":
-                if not msg.media_id:
-                    sender.send_text(msg.shop_id, "That voice note came out empty. Send it again?")
-                    return
                 try:
-                    audio = download_media(msg.media_id)
+                    audio = _download_msg_media(msg, "voice note")
+                    if audio is None:
+                        sender.send_text(msg.shop_id, "That voice note came out empty."
+                                                      " Send it again?")
+                        return
                     _, reply, buttons = handle_voice(conn, msg.shop_id, audio, ".ogg")
                 except VoiceError as e:
                     sender.send_text(msg.shop_id, str(e))
                     return
             elif msg.kind == "media:image":
-                if not msg.media_id:
-                    sender.send_text(msg.shop_id, "That photo came out empty. Send it again?")
-                    return
                 try:
-                    image = download_media(msg.media_id, "photo")
+                    image = _download_msg_media(msg, "photo")
+                    if image is None:
+                        sender.send_text(msg.shop_id, "That photo came out empty. Send it again?")
+                        return
                     _, reply, buttons = handle_photo(conn, msg.shop_id, image)
                 except (VisionError, VoiceError) as e:
                     sender.send_text(msg.shop_id, str(e))

@@ -99,6 +99,15 @@ Rollback: check out the last good commit and `modal deploy modal_app.py` again.
 
 Local alternative: `ngrok http 8000`, then point the webhook at the ngrok URL.
 
+## Vonage sandbox channel (alternative to Meta)
+
+Set `VONAGE_API_KEY`, `VONAGE_API_SECRET` (and optionally `VONAGE_WHATSAPP_FROM`,
+default `14157386102`), redeploy, and point the Vonage Messages sandbox at
+`https://...modal.run/webhook/vonage` (inbound) and
+`https://...modal.run/webhook/vonage/status` (receipts). Vonage messages flow
+through the same agent, voice, and vision handlers; replies go back via
+Vonage. The Meta `/webhook` path is unchanged.
+
 Hardening in place: signature verification (fails closed when `APP_SECRET` is
 set), 256 KB webhook body cap, 30/min per-shop rate limit, retries with backoff
 on outbound calls, consent line on first contact, `delete my data` erasure, and

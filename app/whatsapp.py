@@ -37,6 +37,8 @@ class IncomingMessage:
     text: str | None  # text body, button title, or None when unsupported
     timestamp: str = ""
     media_id: str | None = None  # WhatsApp media id for audio/image/video
+    media_url: str | None = None  # Vonage-hosted media URL (vonage channel)
+    channel: str = "meta"  # inbound channel: "meta" or "vonage"
 
 
 def verify_signature(raw_body: bytes, signature_header: str | None, app_secret: str) -> bool:

@@ -1,0 +1,252 @@
+"""Vonage channel: parsing, sender shape, endpoint wiring. HTTP mocked."""
+
+import json
+from types import SimpleNamespace
+
+import pytest
+from fastapi.testclient import TestClient
+
+import app.agent as agent
+import app.llm as llm
+import app.main as main
+import app.vonage as vonage
+from app.main import app
+from app.voice import VoiceError
+from app.vonage import (
+    VonageSender,
+    _split_text,
+    download_vonage_media,
+    parse_vonage_webhook,
+)
+from app.whatsapp import reset_fake
+from seed.seed_demo import DEMO_SHOP_ID, seed_demo
+
+SHOP = DEMO_SHOP_ID
+
+
+@pytest.fixture()
+def vg_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("SISI_DB", str(tmp_path / "vg.db"))
+    monkeypatch.setenv("VONAGE_API_KEY", "vg-key")
+    monkeypatch.setenv("VONAGE_API_SECRET", "vg-secret")
+    monkeypatch.delenv("VONAGE_WHATSAPP_FROM", raising=False)
+    monkeypatch.delenv("WHATSAPP_PHONE_NUMBER_ID", raising=False)
+    monkeypatch.delenv("WHATSAPP_TOKEN", raising=False)
+    monkeypatch.setattr(llm, "TOKEN_LOG", tmp_path / "usage.log")
+    reset_fake()
+    main._rate_hits.clear()
+    seed_demo(SHOP)
+    return tmp_path
+
+
+def _vg_payload(message: dict, mid: str = "vg-uuid-1") -> dict:
+    return {"from": {"number": SHOP, "type": "whatsapp"},
+            "to": {"number": "14157386102", "type": "whatsapp"},
+            "message_uuid": mid, "timestamp": "2026-10-27T00:00:00Z",
+            "message": message}
+
+
+# --- parsing ---------------------------------------------------------------
+
+
+def test_parse_text_audio_image():
+    msgs = parse_vonage_webhook(_vg_payload({"message_type": "text", "text": "hi"}))
+    assert len(msgs) == 1
+    assert (msgs[0].shop_id, msgs[0].kind, msgs[0].text, msgs[0].channel) == (SHOP, "text", "hi", "vonage")
+
+    msgs = parse_vonage_webhook(_vg_payload({"message_type": "audio",
+                                             "audio": {"url": "https://m.test/a"}}))
+    assert len(msgs) == 1 and msgs[0].kind == "media:audio"
+    assert msgs[0].media_url == "https://m.test/a" and msgs[0].text is None
+
+    msgs = parse_vonage_webhook(_vg_payload({"message_type": "image",
+                                             "image": {"url": "https://m.test/i"}}))
+    assert len(msgs) == 1 and msgs[0].kind == "media:image"
+    assert msgs[0].media_url == "https://m.test/i"
+
+
+def test_parse_reply_unknown_and_garbage():
+    msgs = parse_vonage_webhook(_vg_payload({"message_type": "reply",
+                                             "reply": {"id": "Yes", "title": "Yes"}}))
+    assert len(msgs) == 1 and (msgs[0].kind, msgs[0].text) == ("button", "Yes")
+    assert parse_vonage_webhook(_vg_payload({"message_type": "sticker"})) == []
+    assert parse_vonage_webhook({}) == []
+    assert parse_vonage_webhook({"message": "nope"}) == []
+    assert parse_vonage_webhook(_vg_payload({"message_type": "text"}, mid="")) != []
+
+
+# --- sender ----------------------------------------------------------------
+
+
+class _FakePost:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, url, auth=None, json=None, timeout=None):
+        self.calls.append({"url": url, "auth": auth, "json": json})
+
+        class Resp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"message_uuid": "out-1"}
+
+        return Resp()
+
+
+def test_sender_request_shape(vg_env, monkeypatch):
+    fake = _FakePost()
+    monkeypatch.setattr(vonage.httpx, "post", fake)
+    VonageSender().send_text("+27710000001", "hello there")
+    assert len(fake.calls) == 1
+    call = fake.calls[0]
+    assert call["url"] == "https://messages-sandbox.nexmo.com/v1/messages"
+    assert call["auth"] == ("vg-key", "vg-secret")
+    assert call["json"] == {"from": "14157386102", "to": "27710000001",
+                            "channel": "whatsapp", "message_type": "text",
+                            "text": "hello there"}
+
+
+def test_sender_splits_long_replies(vg_env, monkeypatch):
+    fake = _FakePost()
+    monkeypatch.setattr(vonage.httpx, "post", fake)
+    body = "word " * 1200  # 6000 chars
+    VonageSender().send_text(SHOP, body.strip())
+    assert len(fake.calls) == 2
+    assert all(len(c["json"]["text"]) <= 4096 for c in fake.calls)
+    assert " ".join(c["json"]["text"] for c in fake.calls) == body.strip()
+    assert _split_text("") == []
+
+
+def test_sender_buttons_as_text(vg_env, monkeypatch):
+    fake = _FakePost()
+    monkeypatch.setattr(vonage.httpx, "post", fake)
+    VonageSender().send_buttons(SHOP, "Save?", ["Yes", "No"])
+    assert len(fake.calls) == 1
+    text = fake.calls[0]["json"]["text"]
+    assert "Save?" in text and "Yes" in text and "No" in text
+
+
+def test_sender_missing_creds_sends_nothing(vg_env, monkeypatch):
+    monkeypatch.delenv("VONAGE_API_KEY")
+    fake = _FakePost()
+    monkeypatch.setattr(vonage.httpx, "post", fake)
+    with pytest.raises(RuntimeError, match="VONAGE_API_KEY"):
+        VonageSender().send_text(SHOP, "hi")
+    assert fake.calls == []
+
+
+# --- media download --------------------------------------------------------
+
+
+def test_download_vonage_media(vg_env, monkeypatch):
+    seen = {}
+
+    class Resp:
+        content = b"media-bytes"
+
+        def raise_for_status(self):
+            pass
+
+    def fake_get(url, auth=None, timeout=None, follow_redirects=None):
+        seen["url"] = url
+        seen["auth"] = auth
+        return Resp()
+
+    monkeypatch.setattr(vonage.httpx, "get", fake_get)
+    assert download_vonage_media("https://m.test/a") == b"media-bytes"
+    assert seen == {"url": "https://m.test/a", "auth": ("vg-key", "vg-secret")}
+
+
+def test_download_vonage_media_missing_creds(vg_env, monkeypatch):
+    monkeypatch.delenv("VONAGE_API_SECRET")
+    with pytest.raises(VoiceError, match="couldn't fetch"):
+        download_vonage_media("https://m.test/a")
+
+
+# --- endpoint wiring (model + HTTP stubbed) --------------------------------
+
+
+def _resp(content=None, calls=None):
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content,
+                                                         tool_calls=calls or []))],
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2))
+
+
+def _scripted_llm(monkeypatch):
+    def fake(messages):
+        if any(isinstance(m, dict) and m.get("role") == "tool" for m in messages):
+            tool = next(m["content"] for m in reversed(messages)
+                        if isinstance(m, dict) and m.get("role") == "tool")
+            return _resp(f"OK: {tool}")
+        user_text = next(m["content"] for m in reversed(messages)
+                         if isinstance(m, dict) and m.get("role") == "user")
+        if "owe" in user_text:
+            return _resp(calls=[SimpleNamespace(
+                id="c1", function=SimpleNamespace(name="get_balance",
+                                                  arguments='{"customer":"Sipho"}'))])
+        return _resp("huh?")
+
+    monkeypatch.setattr(llm, "_complete", fake)
+
+
+def _post_vonage(client, message, mid="vg-uuid-1"):
+    return client.post("/webhook/vonage", json=_vg_payload(message, mid))
+
+
+def test_vonage_text_end_to_end(vg_env, monkeypatch):
+    _scripted_llm(monkeypatch)
+    fake = _FakePost()
+    monkeypatch.setattr(vonage.httpx, "post", fake)
+    client = TestClient(app)
+    r = _post_vonage(client, {"message_type": "text", "text": "How much does Sipho owe?"})
+    assert r.status_code == 200 and r.json() == {"status": "ok"}
+    assert len(fake.calls) == 1
+    body = fake.calls[0]["json"]["text"]
+    assert "R73.00" in body and "delete my data" in body  # shared handler + consent
+    from app.whatsapp import get_sender
+
+    assert get_sender().pop_shop(SHOP) == []  # vonage reply did not use the meta sender
+
+
+def test_vonage_voice_note_end_to_end(vg_env, monkeypatch):
+    _scripted_llm(monkeypatch)
+    monkeypatch.setattr(main, "download_vonage_media", lambda _url: b"ogg-bytes")
+    monkeypatch.setattr(agent, "transcribe_audio", lambda *a, **k: "How much does Sipho owe?")
+    fake = _FakePost()
+    monkeypatch.setattr(vonage.httpx, "post", fake)
+    client = TestClient(app)
+    r = _post_vonage(client, {"message_type": "audio", "audio": {"url": "https://m.test/a"}},
+                     "vg-uuid-2")
+    assert r.status_code == 200
+    assert len(fake.calls) == 1
+    body = fake.calls[0]["json"]["text"]
+    assert body.startswith("Heard:") and "R73.00" in body
+
+
+def test_vonage_image_end_to_end(vg_env, monkeypatch):
+    monkeypatch.setenv("SISI_TODAY", "2026-11-01")
+    monkeypatch.setattr(main, "download_vonage_media", lambda _url: b"jpg-bytes")
+    monkeypatch.setattr(agent, "read_expiry_photo", lambda *a, **k: [
+        {"product": "Fresh Milk 1L", "qty": 2, "expiry_date": "2026-10-30"}])
+    fake = _FakePost()
+    monkeypatch.setattr(vonage.httpx, "post", fake)
+    client = TestClient(app)
+    r = _post_vonage(client, {"message_type": "image", "image": {"url": "https://m.test/i"}},
+                     "vg-uuid-3")
+    assert r.status_code == 200
+    assert len(fake.calls) == 1
+    body = fake.calls[0]["json"]["text"]
+    assert "2 x Fresh Milk 1L 30 Oct has expired" in body
+    assert "Reply: Yes / No" in body  # preview buttons rendered for vonage
+
+
+def test_vonage_status_and_bad_json(vg_env):
+    client = TestClient(app)
+    assert client.post("/webhook/vonage/status").status_code == 200
+    assert client.post("/webhook/vonage/status", json={"message": {"x": 1}}).status_code == 200
+    bad = client.post("/webhook/vonage", content=b"not json",
+                      headers={"Content-Type": "application/json"})
+    assert bad.status_code == 200 and bad.json() == {"status": "ignored"}
