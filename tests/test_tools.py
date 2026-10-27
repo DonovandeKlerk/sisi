@@ -339,6 +339,21 @@ def test_demo_reset(conn):
     assert get_balance(conn, SHOP, "Sipho") == "Sipho owes R73.00."
 
 
+def test_delete_my_data_erases_shop(conn):
+    from app.tools import delete_my_data
+
+    _seeded(conn)
+    add_credit(conn, SHOP, "Sipho", [{"product": "Coke 2L", "qty": 1}])
+    confirm_pending(conn, SHOP)
+    assert delete_my_data(conn, SHOP).startswith("Done.")
+    for table in ("customers", "products", "credit_entries", "payments", "sales",
+                  "stock_moves", "expiry_items", "pending_actions", "actions"):
+        assert _count(conn, table) == 0, table
+    shop = conn.execute("SELECT * FROM shops WHERE shop_id = ?", (SHOP,)).fetchone()
+    assert shop is not None and shop["consent_given_at"] is None
+    assert get_balance(conn, SHOP, "Sipho") == "No one named Sipho is on the book."
+
+
 def test_tool_registry_complete():
     names = {t["function"]["name"] for t in TOOL_DEFS}
     assert names == set(TOOL_FUNCS)

@@ -8,16 +8,18 @@ background task with its own DB connection.
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
+import time
 import traceback
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 
 from app.agent import handle_photo, handle_text, handle_voice
-from app.db import connect, init_db
+from app.db import connect, init_db, now_iso
 from app.vision import VisionError
 from app.voice import VoiceError
 from app.whatsapp import (
@@ -35,6 +37,26 @@ log = logging.getLogger("sisi")
 app = FastAPI(title="Sisi")
 
 UNSUPPORTED_REPLY = "I can't read that kind of message yet. Send text, a voice note, or a photo of the dates."
+CONSENT_LINE = ("PS: I keep your shop records on this number so I can help."
+                " Reply 'delete my data' any time to erase them.")
+MAX_WEBHOOK_BYTES = 256 * 1024
+
+# Per-shop inbound rate limit (sliding window). In-memory: correct for a single
+# warm container; back with a shared store if serving from several instances.
+RATE_MAX = 30
+RATE_WINDOW = 60.0
+_rate_hits: dict[str, list[float]] = {}
+
+
+def _rate_limited(shop_id: str) -> bool:
+    now = time.monotonic()
+    hits = _rate_hits.setdefault(shop_id, [])
+    while hits and hits[0] <= now - RATE_WINDOW:
+        hits.pop(0)
+    if len(hits) >= RATE_MAX:
+        return True
+    hits.append(now)
+    return False
 
 
 @app.get("/health")
@@ -54,6 +76,8 @@ def webhook_verify(request: Request):
 @app.post("/webhook")
 async def webhook_receive(request: Request, background_tasks: BackgroundTasks):
     raw = await request.body()
+    if len(raw) > MAX_WEBHOOK_BYTES:
+        raise HTTPException(status_code=413, detail="payload too large")
     secret = os.environ.get("APP_SECRET", "")
     if secret:
         if not verify_signature(raw, request.headers.get("X-Hub-Signature-256"), secret):
@@ -65,6 +89,9 @@ async def webhook_receive(request: Request, background_tasks: BackgroundTasks):
     except ValueError:
         return {"status": "ignored"}
     for msg in parse_webhook(payload):
+        if _rate_limited(msg.shop_id):
+            log.warning("rate-limited %s", msg.shop_id)
+            continue
         background_tasks.add_task(process_message, msg)
     return {"status": "ok"}
 
@@ -81,6 +108,20 @@ def _already_seen(message_id: str, shop_id: str) -> bool:
         return cur.rowcount == 0
     finally:
         conn.close()
+
+
+def _with_consent(conn, shop_id: str, reply: str) -> str:
+    """Append the POPIA consent line on a shop's first-ever reply."""
+    row = conn.execute("SELECT consent_given_at FROM shops WHERE shop_id = ?",
+                       (shop_id,)).fetchone()
+    if row is not None and row["consent_given_at"] is not None:
+        return reply
+    conn.execute("INSERT OR IGNORE INTO shops (shop_id, name) VALUES (?, ?)",
+                 (shop_id, f"Shop {shop_id}"))
+    conn.execute("UPDATE shops SET consent_given_at = ? WHERE shop_id = ?",
+                 (now_iso(), shop_id))
+    conn.commit()
+    return reply + "\n\n" + CONSENT_LINE
 
 
 def process_message(msg: IncomingMessage) -> None:
@@ -114,10 +155,10 @@ def process_message(msg: IncomingMessage) -> None:
                     sender.send_text(msg.shop_id, str(e))
                     return
             elif msg.text is None:
-                sender.send_text(msg.shop_id, UNSUPPORTED_REPLY)
-                return
+                reply, buttons = UNSUPPORTED_REPLY, None
             else:
                 reply, buttons = handle_text(conn, msg.shop_id, msg.text)
+            reply = _with_consent(conn, msg.shop_id, reply)
         finally:
             conn.close()
         if buttons:
@@ -158,6 +199,23 @@ async def sim_voice(request: Request, shop: str):
     finally:
         conn.close()
     return {"transcript": transcript, "reply": reply, "buttons": buttons or []}
+
+
+@app.post("/_admin/seed")
+def admin_seed(token: str, shop: str):
+    """Reseed the fictional demo shop. Guarded by VERIFY_TOKEN; fails closed."""
+    expected = os.environ.get("VERIFY_TOKEN", "")
+    if not expected or not hmac.compare_digest(token, expected):
+        raise HTTPException(status_code=403, detail="forbidden")
+    from app.tools import demo_reset
+
+    conn = connect()
+    try:
+        init_db(conn)
+        message = demo_reset(conn, shop)
+    finally:
+        conn.close()
+    return {"status": "ok", "shop": shop, "message": message}
 
 
 @app.post("/_sim/photo")

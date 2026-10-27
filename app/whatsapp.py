@@ -19,6 +19,8 @@ from dataclasses import dataclass
 
 import httpx
 
+from app.net import call_with_retries
+
 log = logging.getLogger("sisi.whatsapp")
 
 GRAPH_BASE = "https://graph.facebook.com"
@@ -91,13 +93,17 @@ def download_media(media_id: str, label: str = "voice note") -> bytes:
     if not token:
         raise VoiceError(f"I couldn't fetch that {label}. Please send it again?")
     headers = {"Authorization": f"Bearer {token}"}
-    try:
+
+    def fetch() -> bytes:
         meta = httpx.get(f"{GRAPH_BASE}/{version}/{media_id}", headers=headers, timeout=15)
         meta.raise_for_status()
         url = meta.json().get("url", "")
         data = httpx.get(url, headers=headers, timeout=30)
         data.raise_for_status()
         return data.content
+
+    try:
+        return call_with_retries(fetch)
     except httpx.HTTPError as e:
         log.warning("media download failed: %r", e)
         if label == "voice note":
@@ -159,15 +165,18 @@ class CloudApiSender(WhatsAppSender):
         return f"{GRAPH_BASE}/{self.version}/{self.phone_number_id}/messages"
 
     def _post(self, data: dict) -> dict:
-        resp = httpx.post(
-            self.url,
-            headers={"Authorization": f"Bearer {self.token}",
-                     "Content-Type": "application/json"},
-            json=data,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        return resp.json()
+        def send():
+            resp = httpx.post(
+                self.url,
+                headers={"Authorization": f"Bearer {self.token}",
+                         "Content-Type": "application/json"},
+                json=data,
+                timeout=15,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+        return call_with_retries(send)
 
     def send_text(self, to: str, body: str) -> None:
         self._post({"messaging_product": "whatsapp", "to": to, "type": "text",

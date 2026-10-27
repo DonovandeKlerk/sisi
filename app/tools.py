@@ -786,6 +786,31 @@ def demo_reset(conn: sqlite3.Connection, shop_id: str) -> str:
     return f"Fresh start. {DEMO_SHOP_NAME} is loaded again."
 
 
+def delete_my_data(conn: sqlite3.Connection, shop_id: str) -> str:
+    """Erase everything stored for one shop (POPIA). Keeps only an empty shop row."""
+    ensure_shop(conn, shop_id)
+    for table in (
+        "conversation_turns",
+        "messages_seen",
+        "pending_actions",
+        "expiry_items",
+        "stock_moves",
+        "sales",
+        "payments",
+        "credit_entries",
+        "products",
+        "customers",
+        "actions",
+    ):
+        conn.execute(f"DELETE FROM {table} WHERE shop_id = ?", (shop_id,))
+    conn.execute(
+        "UPDATE shops SET consent_given_at = NULL, language = 'en' WHERE shop_id = ?",
+        (shop_id,),
+    )
+    conn.commit()
+    return "Done. I erased everything I had for this number. Send anything to start fresh."
+
+
 # ---------------------------------------------------------------------------
 # Undo: reverse the last confirmed action exactly (LIFO, seed rows excluded)
 # ---------------------------------------------------------------------------

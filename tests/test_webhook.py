@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app.llm as llm
+import app.main as main
 import app.whatsapp as wa
 from app.main import app
 from app.whatsapp import (
@@ -34,6 +35,7 @@ def sim_env(tmp_path, monkeypatch):
     monkeypatch.delenv("WHATSAPP_TOKEN", raising=False)
     monkeypatch.setattr(llm, "TOKEN_LOG", tmp_path / "usage.log")
     reset_fake()
+    main._rate_hits.clear()
     seed_demo(SHOP)
     return tmp_path
 
@@ -258,6 +260,60 @@ def test_webhook_dedupes_message_id(sim_env, monkeypatch):
     assert _post_text(client, "Sipho took two bread and a Coke", "wamid.9").status_code == 200
     out = client.get("/_sim/outbox", params={"shop": SHOP}).json()["messages"]
     assert len(out) == 1  # retry delivered once
+
+
+def test_consent_line_on_first_reply_only(sim_env, monkeypatch):
+    _scripted_model(monkeypatch)
+    client = TestClient(app)
+    _post_text(client, "How much does Sipho owe?", "wamid.k1")
+    first = client.get("/_sim/outbox", params={"shop": SHOP}).json()["messages"]
+    assert len(first) == 1 and "delete my data" in first[0]["body"]
+    _post_text(client, "How much does Sipho owe?", "wamid.k2")
+    second = client.get("/_sim/outbox", params={"shop": SHOP}).json()["messages"]
+    assert len(second) == 1 and "delete my data" not in second[0]["body"]
+
+
+def test_webhook_body_cap(sim_env):
+    client = TestClient(app)
+    big = b"x" * (main.MAX_WEBHOOK_BYTES + 1)
+    assert client.post("/webhook", content=big).status_code == 413
+
+
+def test_rate_limit_drops_but_stays_200(sim_env, monkeypatch):
+    _scripted_model(monkeypatch)
+    client = TestClient(app)
+    for i in range(main.RATE_MAX):
+        assert _post_text(client, "hi", f"wamid.r{i}").status_code == 200
+    over = _post_text(client, "hi", "wamid.rover")
+    assert over.status_code == 200  # no retry storm from Meta
+    out = client.get("/_sim/outbox", params={"shop": SHOP}).json()["messages"]
+    assert len(out) == main.RATE_MAX
+
+
+def test_admin_seed_guarded_and_working(sim_env):
+    import sqlite3
+
+    client = TestClient(app)
+    assert client.post("/_admin/seed", params={"token": "wrong", "shop": SHOP}).status_code == 403
+    conn = sqlite3.connect(str(sim_env / "sim.db"))
+    conn.execute("DELETE FROM customers WHERE shop_id = ?", (SHOP,))
+    conn.commit()
+    conn.close()
+    ok = client.post("/_admin/seed", params={"token": "test-verify", "shop": SHOP})
+    assert ok.status_code == 200
+    conn = sqlite3.connect(str(sim_env / "sim.db"))
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM customers WHERE shop_id = ?",
+                            (SHOP,)).fetchone()[0] == 6
+    finally:
+        conn.close()
+
+
+def test_admin_seed_fails_closed_without_token(sim_env, monkeypatch):
+    monkeypatch.delenv("VERIFY_TOKEN")
+    client = TestClient(app)
+    assert client.post("/_admin/seed", params={"token": "test-verify",
+                                               "shop": SHOP}).status_code == 403
 
 
 def test_unsupported_type_gets_graceful_reply(sim_env):

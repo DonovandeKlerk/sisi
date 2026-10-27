@@ -73,3 +73,10 @@ def test_demo_reset_command(conn):
     msg, _ = try_deterministic(conn, SHOP, "demo reset")
     assert msg.startswith("Fresh start.")
     assert get_balance(conn, SHOP, "Sipho") == "Sipho owes R73.00."
+
+
+def test_delete_my_data_command(conn):
+    seed_demo(SHOP, conn)
+    msg, buttons = try_deterministic(conn, SHOP, "Please delete my data")
+    assert msg.startswith("Done.") and buttons is None
+    assert get_balance(conn, SHOP, "Sipho") == "No one named Sipho is on the book."

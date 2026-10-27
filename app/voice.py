@@ -21,6 +21,7 @@ import httpx
 
 from app import llm as _llm
 from app.db import now_iso
+from app.net import call_with_retries
 
 TRANSCRIBE_URL = "https://api.meta.ai/v1/asr/transcribe"
 ASR_MODEL = "muse-voice-transcribe-1.0"
@@ -103,7 +104,7 @@ def transcribe_wav(wav: bytes, shop_id: str = "", extra_keywords: list[str] | No
         "languageBias": _language_bias(),
         "keywords": keywords[:50],
     })
-    try:
+    def send():
         resp = httpx.post(
             TRANSCRIBE_URL,
             headers={"Authorization": f"Bearer {key}"},
@@ -112,6 +113,10 @@ def transcribe_wav(wav: bytes, shop_id: str = "", extra_keywords: list[str] | No
             timeout=60,
         )
         resp.raise_for_status()
+        return resp
+
+    try:
+        resp = call_with_retries(send)
     except httpx.HTTPStatusError as e:
         _print_api_error(e.response.text)
         raise VoiceError(CANT_HEAR) from e

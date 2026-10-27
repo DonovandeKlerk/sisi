@@ -78,6 +78,32 @@ WHATSAPP_PHONE_NUMBER_ID=...
 
 Also set `APP_SECRET` (webhook signature check) and `VERIFY_TOKEN` (webhook verification) before pointing Meta at `/webhook`.
 
+## Deploy (Modal)
+
+```bash
+modal setup                                     # once: browser login
+modal secret create sisi-env --from-dotenv .env   # once per secret change
+modal deploy modal_app.py                       # prints the public URL
+```
+
+Paste the printed `https://...modal.run/webhook` URL into the WhatsApp app's
+webhook settings (with your `VERIFY_TOKEN`). The app ([modal_app.py](modal_app.py))
+runs one warm container with ffmpeg in the image and SQLite on a persistent
+`sisi-data` volume. Seed the demo shop remotely after deploy:
+
+```bash
+curl -X POST 'https://...modal.run/_admin/seed?token=$VERIFY_TOKEN&shop=27710000001'
+```
+
+Rollback: check out the last good commit and `modal deploy modal_app.py` again.
+
+Local alternative: `ngrok http 8000`, then point the webhook at the ngrok URL.
+
+Hardening in place: signature verification (fails closed when `APP_SECRET` is
+set), 256 KB webhook body cap, 30/min per-shop rate limit, retries with backoff
+on outbound calls, consent line on first contact, `delete my data` erasure, and
+no secrets in code or logs (`pip-audit` clean).
+
 ## Honest notes
 
 - Muse Voice Transcribe does not officially support isiZulu/Afrikaans. Sisi uses an English language bias plus a keywords list of local brands and slang (Sasko, Albany, Iwisa, ibhuku, skoloto, …) and **always shows the owner what she understood before saving**.

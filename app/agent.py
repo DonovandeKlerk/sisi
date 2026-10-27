@@ -12,6 +12,7 @@ from app.tools import (
     cancel_pending,
     check_expiry_photo,
     confirm_pending,
+    delete_my_data,
     demo_reset,
     ensure_shop,
     get_pending,
@@ -22,6 +23,7 @@ YES_WORDS = {"yes", "y", "yebo", "yeah", "ja", "ewe", "ok", "okay", "sharp", "sh
 NO_WORDS = {"no", "n", "nope", "cha", "hayi", "nee", "aowa"}
 UNDO_WORDS = {"undo"}
 RESET_WORDS = {"demo reset", "reset demo"}
+DELETE_WORDS = {"delete my data", "erase my data", "forget me"}
 _FILLER = ("thank you", "thanks", "please", "sisi", "ta")
 
 
@@ -31,9 +33,12 @@ def _normalize(text: str) -> str:
     changed = True
     while changed:
         changed = False
-        for tail in _FILLER:
-            if word.endswith(" " + tail):
-                word = word[: -len(tail) - 1].strip(" .!?,")
+        for fix in _FILLER:
+            if word.endswith(" " + fix):
+                word = word[: -len(fix) - 1].strip(" .!?,")
+                changed = True
+            elif word.startswith(fix + " "):
+                word = word[len(fix) + 1:].strip(" .!?,")
                 changed = True
     return word
 
@@ -50,6 +55,8 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
         return undo_last(conn, shop_id), None
     if word in RESET_WORDS:
         return demo_reset(conn, shop_id), None
+    if word in DELETE_WORDS:
+        return delete_my_data(conn, shop_id), None
     return None
 
 
