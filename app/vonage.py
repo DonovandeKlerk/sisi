@@ -99,6 +99,32 @@ class VonageSender(WhatsAppSender):
         self._post_media(to, "file", {"url": url, "name": filename[:255],
                                       "caption": caption[:1000]})
 
+    def mark_read(self, message_id: str) -> bool:
+        """PATCH the message read + show the WhatsApp typing indicator.
+
+        Uses VONAGE_API_BASE (sandbox default). Best-effort: the sandbox may
+        not support it, so failures only log.
+        """
+        if not message_id or not self.api_key or not self.api_secret:
+            return False
+        base = os.environ.get("VONAGE_API_BASE",
+                              "https://messages-sandbox.nexmo.com").rstrip("/")
+        try:
+            resp = httpx.patch(f"{base}/v1/messages/{message_id}",
+                               auth=(self.api_key, self.api_secret),
+                               json={"status": "read",
+                                     "replying_indicator": {"show": "true",
+                                                            "type": "text"}},
+                               timeout=5)
+            resp.raise_for_status()
+            log.info("vonage mark-read %s status=%s", message_id,
+                     resp.status_code)
+            return True
+        except Exception:
+            log.warning("vonage mark-read failed (sandbox may not support it)",
+                        exc_info=True)
+            return False
+
 
 def download_vonage_media(url: str) -> bytes:
     """Fetch Vonage-hosted media bytes with basic auth. Raises VoiceError."""

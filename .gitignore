@@ -1,9 +1,12 @@
 # Secrets and local config
 .env
+.env.local
 *.db
 *.db-journal
 data/
 token_usage.log
+deploy.log
+web.url
 
 # Python
 __pycache__/
@@ -30,3 +33,4 @@ htmlcov/
 # Video build
 video/node_modules/
 video/out/
+video/recordings/

@@ -1664,10 +1664,10 @@ def confirm_reset_shop(conn: sqlite3.Connection, shop_id: str) -> str:
 
 def _remove_shop_files(conn: sqlite3.Connection, shop_id: str, *logos: str) -> None:
     import os as _os
-    from app.reports import LOGOS_DIR
+    from app import reports as _reports
     paths = [p for p in logos if p]
     safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
-    paths += [str(LOGOS_DIR / f"{safe}-{v}.png") for v in ("cutout", "badge")]
+    paths += [str(_reports.LOGOS_DIR / f"{safe}-{v}.png") for v in ("cutout", "badge")]
     for row in conn.execute("SELECT pdf_path, png_path FROM reports WHERE shop_id = ?",
                             (shop_id,)).fetchall():
         paths += [row["pdf_path"], row["png_path"]]
@@ -2716,7 +2716,7 @@ def save_shop_logo(conn: sqlite3.Connection, shop_id: str, image: bytes) -> str:
         return "❌ That file is not a photo. Send your logo as a photo."
     if done["original"] is None:
         return "❌ That file is not a photo. Send your logo as a photo."
-    _reports.LOGOS_DIR.mkdir(parents=True, exist_ok=True)
+    _reports.ensure_dirs()
     safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
     orig_path = str(_reports.LOGOS_DIR / f"{safe}-orig.png")
     cut_path = str(_reports.LOGOS_DIR / f"{safe}-cutout.png")
@@ -2780,6 +2780,7 @@ def switch_logo(conn: sqlite3.Connection, shop_id: str, mode: str) -> str:
     conn.commit()
     brand = _reports.shop_brand(conn, shop_id)
     what = "original" if mode == "original" else "background-free logo"
+    _reports.ensure_dirs()
     out = f"✅ *Using your {what} on documents.*"
     base = _os.environ.get("SISI_PUBLIC_URL", "").rstrip("/")
     if base:

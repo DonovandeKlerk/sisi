@@ -230,8 +230,9 @@ def test_webhook_image_message_end_to_end(photo_env, monkeypatch):
     r = client.post("/webhook", content=raw, headers={"X-Hub-Signature-256": f"sha256={sig}"})
     assert r.status_code == 200
     out = client.get("/_sim/outbox", params={"shop": SHOP}).json()["messages"]
-    assert len(out) == 1 and out[0]["type"] == "buttons"
-    assert "• 2 × Fresh Milk 1L 30 Oct — expired" in out[0]["body"]
+    assert len(out) == 2 and out[0]["body"].startswith("⏳")
+    assert out[1]["type"] == "buttons"
+    assert "• 2 × Fresh Milk 1L 30 Oct — expired" in out[1]["body"]
 
 
 def test_download_media_photo_label(photo_env):

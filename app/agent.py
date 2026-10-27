@@ -246,6 +246,21 @@ _STAFF_BLOCKED_EXACT = {"undo", "demo reset", "reset demo", "delete my data",
                         "setup", "reset shop", "yes erase everything"}
 
 
+def slow_status(text: str) -> str | None:
+    """Busy line for slow text work (reports, statements). None when fast."""
+    word = _normalize(text or "")
+    if word in ("month-end report", "month end report", "monthend report",
+                "month-end", "month end", "monthend"):
+        return "⏳ Building your month-end report…"
+    if word.startswith("report ") and parse_month_name(word[7:]):
+        return "⏳ Building your month-end report…"
+    if word.startswith("statement") or word in ("statements for everyone who owes",
+                                                "statements for everyone",
+                                                "all statements"):
+        return "⏳ Drawing up the statement…"
+    return None
+
+
 def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
     """Returns (message, buttons_or_None), or None if the LLM should handle it."""
     ensure_shop(conn, shop_id)

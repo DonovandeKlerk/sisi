@@ -23,6 +23,9 @@ from seed.seed_demo import DEMO_SHOP_ID, seed_demo
 SHOP = DEMO_SHOP_ID
 
 
+PATCH_CALLS: list = []
+
+
 @pytest.fixture()
 def vg_env(tmp_path, monkeypatch):
     monkeypatch.setenv("SISI_DB", str(tmp_path / "vg.db"))
@@ -32,6 +35,14 @@ def vg_env(tmp_path, monkeypatch):
     monkeypatch.delenv("WHATSAPP_PHONE_NUMBER_ID", raising=False)
     monkeypatch.delenv("WHATSAPP_TOKEN", raising=False)
     monkeypatch.setattr(llm, "TOKEN_LOG", tmp_path / "usage.log")
+
+    def _fake_patch(url, **kw):
+        PATCH_CALLS.append({"url": url, **kw})
+        return SimpleNamespace(status_code=200,
+                               raise_for_status=lambda: None)
+
+    monkeypatch.setattr(vonage.httpx, "patch", _fake_patch)
+    PATCH_CALLS.clear()
     reset_fake()
     main._rate_hits.clear()
     seed_demo(SHOP)
@@ -234,8 +245,9 @@ def test_vonage_voice_note_end_to_end(vg_env, monkeypatch):
     r = _post_vonage(client, {"message_type": "audio", "audio": {"url": "https://m.test/a"}},
                      "vg-uuid-2")
     assert r.status_code == 200
-    assert len(fake.calls) == 1
-    body = fake.calls[0]["json"]["text"]
+    assert len(fake.calls) == 2
+    assert fake.calls[0]["json"]["text"].startswith("⏳")
+    body = fake.calls[1]["json"]["text"]
     assert body.startswith("Heard:") and "R73.00" in body
 
 
@@ -253,8 +265,9 @@ def test_vonage_image_end_to_end(vg_env, monkeypatch):
     r = _post_vonage(client, {"message_type": "image", "image": {"url": "https://m.test/i"}},
                      "vg-uuid-3")
     assert r.status_code == 200
-    assert len(fake.calls) == 1
-    body = fake.calls[0]["json"]["text"]
+    assert len(fake.calls) == 2
+    assert fake.calls[0]["json"]["text"].startswith("⏳")
+    body = fake.calls[1]["json"]["text"]
     assert "• 2 × Fresh Milk 1L 30 Oct — expired" in body
     assert "Reply: Yes / No" in body  # preview buttons rendered for vonage
 
@@ -314,3 +327,20 @@ def test_vonage_status_and_bad_json(vg_env):
     bad = client.post("/webhook/vonage", content=b"not json",
                       headers={"Content-Type": "application/json"})
     assert bad.status_code == 200 and bad.json() == {"status": "ignored"}
+
+
+def test_mark_read_patch_shape(vg_env):
+    assert VonageSender().mark_read("uuid-9") is True
+    assert len(PATCH_CALLS) == 1
+    call = PATCH_CALLS[0]
+    assert call["url"] == "https://messages-sandbox.nexmo.com/v1/messages/uuid-9"
+    assert call["json"] == {"status": "read",
+                            "replying_indicator": {"show": "true", "type": "text"}}
+
+
+def test_mark_read_failure_is_silent(vg_env, monkeypatch):
+    def _boom(url, **kw):
+        raise RuntimeError("nope")
+
+    monkeypatch.setattr(vonage.httpx, "patch", _boom)
+    assert VonageSender().mark_read("uuid-9") is False

@@ -50,8 +50,8 @@ from app.main import app as fastapi_app  # noqa: E402
 def web():
     # Force the volume path: a local SISI_DB value from the secret would
     # silently write to the container's ephemeral disk and lose shop data.
-    os.environ["SISI_DB"] = "/data/sisi.db"
-    os.environ.setdefault("SISI_REPORTS", "/data/reports")
+    _use_volume()
+    os.environ["SISI_SPAWN"] = "1"
     return fastapi_app
 
 
@@ -59,9 +59,26 @@ def web():
 def nudges():
     """Quarter-hour tick: 19:00 SAST book nudge, Sunday snapshot, expiry warns."""
     import logging
+    _use_volume()
 
-    os.environ["SISI_DB"] = "/data/sisi.db"
-    os.environ.setdefault("SISI_REPORTS", "/data/reports")
     from app.schedule import run_due
     for job in run_due():
         logging.getLogger("sisi").info("scheduled %s -> %s", job["key"], job["shop"])
+
+
+def _use_volume() -> None:
+    """Point the DB and all generated files at the persistent volume."""
+    os.environ["SISI_DB"] = "/data/sisi.db"
+    os.environ["SISI_REPORTS"] = "/data/reports"
+    os.environ["SISI_LOGOS"] = "/data/logos"
+    from app.reports import ensure_dirs
+    ensure_dirs()
+
+
+@app.function(timeout=300)
+def worker(msg: dict):
+    """Spawned per inbound message so webhooks return 200 instantly."""
+    _use_volume()
+    from app.main import process_message
+    from app.whatsapp import IncomingMessage
+    process_message(IncomingMessage(**msg))

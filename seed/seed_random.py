@@ -288,9 +288,9 @@ def seed_random_shop(shop_id: str = DEMO_NUMBER,
             " VALUES (?, ?, 'zu', 'Main Road, Amanzimtoti', ?)",
             (shop_id, SHOP_NAME, shop_id),
         )
-        from app.reports import LOGOS_DIR, make_sample_logo
+        from app import reports as _reports
         safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
-        logo = make_sample_logo(str(LOGOS_DIR / f"{safe}.png"))
+        logo = _reports.make_sample_logo(str(_reports.LOGOS_DIR / f"{safe}.png"))
         conn.execute("UPDATE shops SET logo_path = ? WHERE shop_id = ?",
                      (logo, shop_id))
         _seed_shop_books(conn, shop_id, rng, today, ts)

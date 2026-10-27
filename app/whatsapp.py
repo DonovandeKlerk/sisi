@@ -163,6 +163,10 @@ class WhatsAppSender:
     def send_file(self, to: str, url: str, filename: str, caption: str = "") -> None:
         raise NotImplementedError
 
+    def mark_read(self, message_id: str) -> bool:
+        """Best-effort read receipt (+typing where supported). Never raises."""
+        return False
+
 
 class FakeSender(WhatsAppSender):
     """In-memory sender for local dev and tests. Thread-safe."""
@@ -192,6 +196,10 @@ class FakeSender(WhatsAppSender):
             self.sent.append({"to": to, "type": "file", "url": url,
                               "filename": filename, "body": caption})
         log.info("fake -> %s: file %s", to, url)
+
+    def mark_read(self, message_id: str) -> bool:
+        log.info("fake mark read %s", message_id)
+        return True
 
     def pop_shop(self, shop_id: str) -> list[dict]:
         """Take and clear queued messages for one shop (simulator polling)."""
@@ -253,6 +261,17 @@ class CloudApiSender(WhatsAppSender):
         self._post({"messaging_product": "whatsapp", "to": to, "type": "document",
                     "document": {"link": url, "filename": filename[:255],
                                  "caption": caption[:1024]}})
+
+    def mark_read(self, message_id: str) -> bool:
+        if not message_id:
+            return False
+        try:
+            self._post({"messaging_product": "whatsapp", "status": "read",
+                        "message_id": message_id})
+            return True
+        except Exception:
+            log.warning("meta mark-read failed", exc_info=True)
+            return False
 
 
 _fake = FakeSender()

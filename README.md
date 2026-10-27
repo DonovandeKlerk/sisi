@@ -1,28 +1,39 @@
 # Sisi — the spaza sister who never forgets
 
-Sisi is a WhatsApp-first assistant for South African spaza shop owners. The owner sends a voice note in her own words ("Sipho took two bread and a 2L Coke on the book"), a photo of a shelf or wholesaler slip, or a short text, and Sisi keeps the credit book (ibhuku), stock and sales, low-stock alerts, a restock list grouped by wholesaler, expiry checks, the daily cash-up, and a compliance helper for registration and the Spaza Shop Support Fund. Every write is shown as a short preview with Yes/No buttons and nothing is saved until the owner confirms; every saved action can be undone.
+Sisi is a WhatsApp-first assistant for South African spaza shop owners. The owner sends a voice note in her own words ("Sipho took two bread and a 2L Coke on the book"), a photo of a shelf or wholesaler slip, or a short text, and Sisi keeps the books. Every write is shown as a short preview with Yes/No buttons and nothing is saved until the owner confirms; every saved action can be undone.
+
+**Features.** Guided 6-step setup (name, address, contact, logo, float, language) · credit book with limits, overdue flags and reminders · stock and sales in single units out of packs · cash book (till, petty, bank) with float, counts, expenses and drawings · handwritten book-page photos and wholesaler receipt photos with duplicate detection · restock orders with forwardable wholesaler messages · month-end P&L / balance sheet / cash flow as branded PDF + PNG card · customer statements (PNG + PDF) · branded shop logo with background removal · staff numbers with permissions · 19:00 book nudge and Sunday snapshot · expiry and price-change alerts · compliance helper for registration and the Spaza Shop Support Fund.
 
 **The problem.** After the 2024 foodborne-illness deaths linked to spaza shops, every spaza had to register with its municipality (registration closed 28 Feb 2025); of 44,696 verified shops only about 15,000 hold trading permits. The R500 million Spaza Shop Support Fund offers up to R100,000 per shop but is gated by paperwork, and government warns of fake paid "application assistants" — applications are free. Sources: [gov.za media statement, 29 May 2026](https://www.gov.za), [the dtic, 6 Jun 2025](https://www.thedtic.gov.za), [SAnews, 17 Apr 2025](https://www.sanews.gov.za), [spazashopfund.co.za](https://spazashopfund.co.za).
 Video stats: ±150,000 spaza shops (UCT Case Writing Centre; Accenture Africa 2023 via Daily Investor), 5.2% of GDP and 2.6 million jobs (UCT via supermarket.co.za).
 
 **Built during the hackathon.** Everything in this repo was built during the Meta Global AI Developer Hackathon 2026 (26 Oct – 4 Nov 2026). No earlier code was imported. The git history shows when each feature was built.
 
-## Architecture
+## Architecture (WhatsApp → Vonage → Modal → Muse)
 
 ```mermaid
 flowchart LR
-    Owner -- voice/photo/text --> WA[WhatsApp Cloud API]
-    WA -- webhook --> API[FastAPI]
+    Owner -- voice/photo/text --> WA[WhatsApp]
+    WA -- inbound --> VON[Vonage Messages sandbox]
+    VON -- "/webhook/vonage" --> API[FastAPI on Modal]
+    WA -- "/webhook (alt)" --> API
+    API -- spawn --> Worker[worker: slow jobs off-request]
     API --> Agent[agent.py: Yes/No/Undo deterministic]
     Agent --> Voice[Muse Voice Transcribe]
     Agent --> Vision[Muse Spark vision + SAM 3.1]
     Agent --> LLM[Muse Spark tool loop]
     LLM --> Tools[tools.py: dry-run preview]
-    Tools --> DB[(SQLite per-shop data)]
-    Agent -- reply + Yes/No buttons --> WA
+    Tools --> DB[(SQLite + files on Modal volume)]
+    Agent -- reply + Yes/No buttons --> VON
+    CRON[15-min tick: nudges, snapshots, expiry] --> Agent
 ```
 
-## Meta models
+The Meta Cloud API webhook stays as an alternative path; Vonage is the live
+channel. Webhooks return 200 instantly: each message is handled by a spawned
+Modal worker (background task locally), with read receipts, typing indicators
+and ⏳ status lines while slow work runs.
+
+## AI models (Meta Muse)
 
 | Job | Model | How |
 |---|---|---|
@@ -95,6 +106,20 @@ WHATSAPP_PHONE_NUMBER_ID=...
 Also set `APP_SECRET` (webhook signature check) and `VERIFY_TOKEN` (webhook verification) before pointing Meta at `/webhook`.
 
 ## Deploy (Modal)
+
+Push to `main` deploys automatically: [deploy.yml](.github/workflows/deploy.yml)
+runs the full suite on Python 3.12 and, only if green, runs
+`modal deploy modal_app.py` and fails unless `/health` returns 200. It
+authenticates with repo secrets `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET`; app
+secrets stay in the Modal secret `sisi-env`, never in GitHub.
+
+Manual deploy does the same three steps:
+
+```bash
+./scripts/deploy.sh                             # tests, deploy, health check
+```
+
+Or step by step:
 
 ```bash
 modal setup                                     # once: browser login

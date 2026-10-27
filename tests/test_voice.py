@@ -312,7 +312,8 @@ def test_webhook_audio_message_end_to_end(voice_env, monkeypatch):
     r = client.post("/webhook", content=raw, headers={"X-Hub-Signature-256": f"sha256={sig}"})
     assert r.status_code == 200
     out = client.get("/_sim/outbox", params={"shop": SHOP}).json()["messages"]
-    assert len(out) == 1 and out[0]["body"].startswith("Heard: “undo”")
+    assert len(out) == 2 and out[0]["body"].startswith("⏳")
+    assert out[1]["body"].startswith("Heard: “undo”")
 
 
 def test_webhook_audio_without_media_id(voice_env):
@@ -328,4 +329,5 @@ def test_webhook_audio_without_media_id(voice_env):
     assert client.post("/webhook", content=raw,
                        headers={"X-Hub-Signature-256": f"sha256={sig}"}).status_code == 200
     out = client.get("/_sim/outbox", params={"shop": SHOP}).json()["messages"]
-    assert len(out) == 1 and "empty" in out[0]["body"]
+    assert len(out) == 2 and out[0]["body"].startswith("⏳")
+    assert "empty" in out[1]["body"]

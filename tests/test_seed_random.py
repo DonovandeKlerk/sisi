@@ -49,7 +49,7 @@ def test_two_items_near_expiry(conn):
 
 
 def test_four_credit_customers_with_balances(conn):
-    seed_random_shop(SHOP, conn)
+    seed_random_shop(SHOP, conn, seed=7)
     out = list_debtors(conn, SHOP)
     for name in ["Sipho", "Thandi", "Mama Zodwa", "Bongani"]:
         assert name in out, name

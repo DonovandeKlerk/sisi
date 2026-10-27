@@ -98,8 +98,28 @@ async def webhook_receive(request: Request, background_tasks: BackgroundTasks):
         if _rate_limited(msg.shop_id):
             log.warning("rate-limited %s", msg.shop_id)
             continue
-        background_tasks.add_task(process_message, msg)
+        try:
+            get_sender().mark_read(msg.message_id)
+        except Exception:
+            log.warning("mark-read failed", exc_info=True)
+        _dispatch(background_tasks, msg)
     return {"status": "ok"}
+
+
+def _dispatch(background_tasks: BackgroundTasks, msg: IncomingMessage) -> None:
+    """Run handle-now in a spawned Modal worker on Modal, else a background task.
+
+    Either way the webhook returns 200 instantly; slow work (vision, voice,
+    rembg, reports) never blocks the receipt.
+    """
+    if os.environ.get("SISI_SPAWN") == "1":
+        try:
+            import modal
+            modal.Function.from_name("sisi", "worker").spawn(msg.__dict__)
+            return
+        except Exception:
+            log.warning("modal spawn failed; using background task", exc_info=True)
+    background_tasks.add_task(process_message, msg)
 
 
 @app.post("/webhook/vonage")
@@ -124,7 +144,11 @@ async def webhook_vonage_receive(request: Request, background_tasks: BackgroundT
         if _rate_limited(msg.shop_id):
             log.warning("rate-limited %s", msg.shop_id)
             continue
-        background_tasks.add_task(process_message, msg)
+        try:
+            VonageSender().mark_read(msg.message_id)
+        except Exception:
+            log.warning("mark-read failed", exc_info=True)
+        _dispatch(background_tasks, msg)
     return {"status": "ok"}
 
 
@@ -170,6 +194,28 @@ def _download_msg_media(msg: IncomingMessage, label: str) -> bytes | None:
     return None
 
 
+FRIENDLY_ERROR = "😅 Something went wrong, please try again."
+
+
+def _slow_line(conn, msg: IncomingMessage) -> str | None:
+    """Busy indicator for slow work. None when the reply will be instant."""
+    from app.agent import slow_status
+    if msg.kind == "media:audio":
+        return "⏳ Listening to your voice note…"
+    if msg.kind == "media:image":
+        if (msg.caption or "").strip().lower() == "logo":
+            return "⏳ Working on your logo…"
+        from app.setup import setup_step
+        from app.tools import resolve_sender
+        owner, staff = resolve_sender(conn, msg.shop_id)
+        if staff is None and setup_step(conn, owner) == 4:
+            return "⏳ Working on your logo…"
+        return "⏳ Reading your photo…"
+    if msg.kind == "text" and msg.text:
+        return slow_status(msg.text)
+    return None
+
+
 def process_message(msg: IncomingMessage) -> None:
     """Background worker: one message, own connection, never raises."""
     try:
@@ -179,62 +225,82 @@ def process_message(msg: IncomingMessage) -> None:
             log.info("duplicate %s ignored", msg.message_id)
             return
         sender = VonageSender() if msg.channel == "vonage" else get_sender()
-        conn = connect()
         try:
-            init_db(conn)
-            from app.tools import ensure_shop
-            ensure_shop(conn, msg.shop_id)
-            conn.execute("UPDATE shops SET channel = ? WHERE shop_id = ?",
-                         (msg.channel or "meta", msg.shop_id))
-            conn.commit()
-            if msg.kind == "media:audio":
-                try:
-                    audio = _download_msg_media(msg, "voice note")
-                    if audio is None:
-                        sender.send_text(msg.shop_id, "That voice note came out empty."
-                                                      " Send it again?")
-                        return
-                    _, reply, buttons = handle_voice(conn, msg.shop_id, audio, ".ogg")
-                except VoiceError as e:
-                    sender.send_text(msg.shop_id, str(e))
-                    return
-            elif msg.kind == "media:image":
-                try:
-                    image = _download_msg_media(msg, "photo")
-                    if image is None:
-                        sender.send_text(msg.shop_id, "That photo came out empty. Send it again?")
-                        return
-                    _, reply, buttons = handle_photo(conn, msg.shop_id, image,
-                                                     msg.caption or "")
-                except (VisionError, VoiceError) as e:
-                    sender.send_text(msg.shop_id, str(e))
-                    return
-            elif msg.text is None:
-                reply, buttons = UNSUPPORTED_REPLY, None
-            else:
-                reply, buttons = handle_text(conn, msg.shop_id, msg.text)
-            reply = _with_consent(conn, msg.shop_id, reply)
-        finally:
-            conn.close()
-        if buttons:
-            sender.send_buttons(msg.shop_id, reply, buttons)
-        else:
-            sender.send_text(msg.shop_id, reply)
-        for item in take_media(msg.shop_id):
+            _handle_message(sender, msg)
+        except Exception:
+            log.error("process_message failed:\n%s", traceback.format_exc())
             try:
-                if item.get("kind") == "file":
-                    sender.send_file(msg.shop_id, item["url"],
-                                     item.get("filename") or "sisi-report.pdf",
-                                     item.get("caption") or "")
-                else:
-                    sender.send_image(msg.shop_id, item["url"],
-                                      item.get("caption") or "")
+                sender.send_text(msg.shop_id, FRIENDLY_ERROR)
             except Exception:
-                log.error("media send failed:\n%s", traceback.format_exc())
-        log.info("%s -> %s (%s)", msg.shop_id, msg.message_id,
-                 "buttons" if buttons else "text")
+                log.error("friendly fallback failed:\n%s", traceback.format_exc())
     except Exception:
         log.error("process_message failed:\n%s", traceback.format_exc())
+
+
+def _handle_message(sender, msg: IncomingMessage) -> None:
+    """Handle one message; raises to process_message for the friendly fallback."""
+    from app.reports import ensure_dirs
+    ensure_dirs()
+    conn = connect()
+    try:
+        init_db(conn)
+        from app.tools import ensure_shop
+        ensure_shop(conn, msg.shop_id)
+        conn.execute("UPDATE shops SET channel = ? WHERE shop_id = ?",
+                     (msg.channel or "meta", msg.shop_id))
+        conn.commit()
+        try:
+            line = _slow_line(conn, msg)
+            if line:
+                sender.send_text(msg.shop_id, line)
+        except Exception:
+            log.warning("status line failed", exc_info=True)
+        if msg.kind == "media:audio":
+            try:
+                audio = _download_msg_media(msg, "voice note")
+                if audio is None:
+                    sender.send_text(msg.shop_id, "That voice note came out empty."
+                                                  " Send it again?")
+                    return
+                _, reply, buttons = handle_voice(conn, msg.shop_id, audio, ".ogg")
+            except VoiceError as e:
+                sender.send_text(msg.shop_id, str(e))
+                return
+        elif msg.kind == "media:image":
+            try:
+                image = _download_msg_media(msg, "photo")
+                if image is None:
+                    sender.send_text(msg.shop_id, "That photo came out empty. Send it again?")
+                    return
+                _, reply, buttons = handle_photo(conn, msg.shop_id, image,
+                                                 msg.caption or "")
+            except (VisionError, VoiceError) as e:
+                sender.send_text(msg.shop_id, str(e))
+                return
+        elif msg.text is None:
+            reply, buttons = UNSUPPORTED_REPLY, None
+        else:
+            reply, buttons = handle_text(conn, msg.shop_id, msg.text)
+        reply = _with_consent(conn, msg.shop_id, reply)
+    finally:
+        conn.close()
+    if buttons:
+        sender.send_buttons(msg.shop_id, reply, buttons)
+    else:
+        sender.send_text(msg.shop_id, reply)
+    for item in take_media(msg.shop_id):
+        try:
+            if item.get("kind") == "file":
+                sender.send_file(msg.shop_id, item["url"],
+                                 item.get("filename") or "sisi-report.pdf",
+                                 item.get("caption") or "")
+            else:
+                sender.send_image(msg.shop_id, item["url"],
+                                  item.get("caption") or "")
+        except Exception:
+            log.error("media send failed:\n%s", traceback.format_exc())
+    log.info("%s -> %s (%s)", msg.shop_id, msg.message_id,
+             "buttons" if buttons else "text")
 
 
 @app.get("/media/{token}")

@@ -90,8 +90,8 @@ def step_prompt(conn: sqlite3.Connection, shop_id: str, step: int, intro: bool =
         body = (f"{head}\nI'll use {shop_id} as your contact number."
                 "\nReply Yes to keep it, or send another number.")
     elif step == 4:
-        body = (f"{head}\nSend your shop logo as a photo — I'll remove its"
-                " background. (or 'skip' for a name-only header)")
+        body = ("🖼️ *Step 4 of 6: Logo*\nJust send your logo as a photo,"
+                " no caption needed. Or reply *skip*.")
     elif step == 5:
         body = (f"{head}\nWhat is your opening float? Reply like"
                 " '1500 cash, 300 petty'.")
@@ -229,6 +229,7 @@ def _finish(conn: sqlite3.Connection, shop_id: str) -> str:
                          date.fromisoformat(today_str()), now_iso())
         conn.commit()
     brand = _reports.shop_brand(conn, shop_id)
+    _reports.ensure_dirs()
     out = (f"✅ *You're all set, {brand['name']}!*\n\nTry these:\n"
            "• 'sold 2 bread' — record a sale\n"
            "• 'Sipho took 1 coke' — credit sale\n"
