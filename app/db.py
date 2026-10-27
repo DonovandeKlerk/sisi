@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS products (
   reorder_level REAL NOT NULL DEFAULT 0,
   wholesaler    TEXT NOT NULL DEFAULT '',
   unit          TEXT NOT NULL DEFAULT '',
+  category      TEXT NOT NULL DEFAULT '',
   updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   UNIQUE (shop_id, name)
 );
@@ -104,6 +105,14 @@ CREATE TABLE IF NOT EXISTS pending_actions (
   resolved_at  TEXT
 );
 
+CREATE TABLE IF NOT EXISTS await_price (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  shop_id    TEXT NOT NULL REFERENCES shops(shop_id),
+  product    TEXT NOT NULL,
+  spec_json  TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
 CREATE TABLE IF NOT EXISTS actions (
   action_id  TEXT PRIMARY KEY,
   shop_id    TEXT NOT NULL REFERENCES shops(shop_id),
@@ -137,6 +146,7 @@ CREATE INDEX IF NOT EXISTS idx_sales_shop ON sales(shop_id);
 CREATE INDEX IF NOT EXISTS idx_stock_shop ON stock_moves(shop_id);
 CREATE INDEX IF NOT EXISTS idx_expiry_shop ON expiry_items(shop_id);
 CREATE INDEX IF NOT EXISTS idx_pending_shop ON pending_actions(shop_id);
+CREATE INDEX IF NOT EXISTS idx_await_shop ON await_price(shop_id);
 CREATE INDEX IF NOT EXISTS idx_actions_shop ON actions(shop_id);
 CREATE INDEX IF NOT EXISTS idx_turns_shop ON conversation_turns(shop_id);
 """
@@ -158,7 +168,10 @@ def connect(path: str | Path | None = None) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
-    for sql in ("ALTER TABLE products ADD COLUMN cost_cents INTEGER",):
+    for sql in (
+        "ALTER TABLE products ADD COLUMN cost_cents INTEGER",
+        "ALTER TABLE products ADD COLUMN category TEXT NOT NULL DEFAULT ''",
+    ):
         try:
             conn.execute(sql)
         except sqlite3.OperationalError:

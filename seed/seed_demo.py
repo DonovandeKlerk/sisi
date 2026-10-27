@@ -20,18 +20,18 @@ from app.db import connect, init_db, now_iso  # noqa: E402
 DEMO_SHOP_ID = "27710000001"
 DEMO_SHOP_NAME = "MaZulu's Spaza"
 
-# name, price_cents, stock_qty, reorder_level, wholesaler, unit
+# name, price_cents, stock_qty, reorder_level, wholesaler, unit, category
 PRODUCTS = [
-    ("Sasko White Bread 700g", 1850, 12, 6, "Devland", "loaf"),
-    ("Albany Brown Bread 700g", 1900, 8, 6, "Devland", "loaf"),
-    ("Iwisa Maize Meal 5kg", 9200, 6, 4, "Jumbo", "bag"),
-    ("Tastic Rice 2kg", 6500, 2, 4, "Jumbo", "bag"),
-    ("Lucky Star Pilchards 400g", 2850, 24, 12, "Devland", "tin"),
-    ("Coke 2L", 3600, 5, 6, "Coke Depot", "bottle"),
-    ("Stoney 2L", 3300, 8, 6, "Coke Depot", "bottle"),
-    ("Simba Chips 120g", 2400, 3, 10, "Jumbo", "packet"),
-    ("Fresh Milk 1L", 2700, 6, 6, "Devland", "bottle"),
-    ("Eggs 30s Tray", 9500, 4, 2, "Jumbo", "tray"),
+    ("Sasko White Bread 700g", 1850, 12, 6, "Devland", "loaf", "Bread"),
+    ("Albany Brown Bread 700g", 1900, 8, 6, "Devland", "loaf", "Bread"),
+    ("Iwisa Maize Meal 5kg", 9200, 6, 4, "Jumbo", "bag", "Groceries"),
+    ("Tastic Rice 2kg", 6500, 2, 4, "Jumbo", "bag", "Groceries"),
+    ("Lucky Star Pilchards 400g", 2850, 24, 12, "Devland", "tin", "Groceries"),
+    ("Coke 2L", 3600, 5, 6, "Coke Depot", "bottle", "Drinks"),
+    ("Stoney 2L", 3300, 8, 6, "Coke Depot", "bottle", "Drinks"),
+    ("Simba Chips 120g", 2400, 3, 10, "Jumbo", "packet", "Groceries"),
+    ("Fresh Milk 1L", 2700, 6, 6, "Devland", "bottle", "Dairy"),
+    ("Eggs 30s Tray", 9500, 4, 2, "Jumbo", "tray", "Groceries"),
 ]
 
 CUSTOMERS = ["Thandi", "Sipho", "Lerato", "Jabu", "Nomvula", "Bongani"]
@@ -56,6 +56,7 @@ def wipe_shop(conn: sqlite3.Connection, shop_id: str) -> None:
         "conversation_turns",
         "messages_seen",
         "pending_actions",
+        "await_price",
         "expiry_items",
         "stock_moves",
         "sales",
@@ -88,11 +89,12 @@ def seed_demo(shop_id: str = DEMO_SHOP_ID, conn: sqlite3.Connection | None = Non
             )
             cust_ids[name] = cur.lastrowid
         prod_ids: dict[str, int] = {}
-        for i, (name, price, qty, reorder, wholesaler, unit) in enumerate(PRODUCTS):
+        for i, (name, price, qty, reorder, wholesaler, unit, category) in enumerate(PRODUCTS):
             cur = conn.execute(
                 """INSERT INTO products (shop_id, name, price_cents, stock_qty,
-                   reorder_level, wholesaler, unit) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (shop_id, name, price, qty, reorder, wholesaler, unit),
+                   reorder_level, wholesaler, unit, category)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (shop_id, name, price, qty, reorder, wholesaler, unit, category),
             )
             prod_ids[name] = cur.lastrowid
             conn.execute(

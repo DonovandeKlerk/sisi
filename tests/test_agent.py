@@ -80,3 +80,13 @@ def test_delete_my_data_command(conn):
     msg, buttons = try_deterministic(conn, SHOP, "Please delete my data")
     assert msg.startswith("Done.") and buttons is None
     assert get_balance(conn, SHOP, "Sipho") == "No one named Sipho is on the book."
+
+
+def test_demo_help_lists_every_command(conn):
+    seed_demo(SHOP, conn)
+    msg, buttons = try_deterministic(conn, SHOP, "demo help")
+    assert buttons is None
+    for word in ["stock list", "add stock", "sale", "credit sale", "who owes",
+                 "cash-up", "low stock", "restock", "expiry photo", "compliance",
+                 "scam", "delete my data", "undo"]:
+        assert word in msg.lower(), word

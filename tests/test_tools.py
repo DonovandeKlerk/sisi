@@ -107,7 +107,7 @@ def test_missing_price_is_a_question(conn):
 
 def test_unknown_and_ambiguous_products(conn):
     _seeded(conn)
-    assert "don't have" in add_credit(conn, SHOP, "Sipho", [{"product": "Unicorn Flakes", "qty": 1}])
+    assert "isn't on your list yet" in add_credit(conn, SHOP, "Sipho", [{"product": "Unicorn Flakes", "qty": 1}])
     out = add_credit(conn, SHOP, "Sipho", [{"product": "bread", "qty": 1}])
     assert out.startswith("Which one:")
     assert "Sasko" in out and "Albany" in out
@@ -359,6 +359,7 @@ def test_tool_registry_complete():
     assert names == set(TOOL_FUNCS)
     for expected in ["add_credit", "record_payment", "get_balance", "list_debtors",
                      "draft_reminder", "record_sale", "add_stock", "set_price", "low_stock",
+                     "list_stock", "best_sellers",
                      "restock_list", "cash_up", "check_expiry_photo", "read_slip_photo",
                      "compliance_guide", "undo_last"]:
         assert expected in names
