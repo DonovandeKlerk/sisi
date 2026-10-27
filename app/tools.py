@@ -1642,9 +1642,12 @@ def demo_reset(conn: sqlite3.Connection, shop_id: str) -> str:
     return f"🎉 Fresh start. {DEMO_SHOP_NAME} is loaded again."
 
 
-def _remove_shop_files(conn: sqlite3.Connection, shop_id: str, logo: str = "") -> None:
+def _remove_shop_files(conn: sqlite3.Connection, shop_id: str, *logos: str) -> None:
     import os as _os
-    paths = [logo] if logo else []
+    from app.reports import LOGOS_DIR
+    paths = [p for p in logos if p]
+    safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
+    paths += [str(LOGOS_DIR / f"{safe}-{v}.png") for v in ("cutout", "badge")]
     for row in conn.execute("SELECT pdf_path, png_path FROM reports WHERE shop_id = ?",
                             (shop_id,)).fetchall():
         paths += [row["pdf_path"], row["png_path"]]
@@ -1663,7 +1666,8 @@ def delete_my_data(conn: sqlite3.Connection, shop_id: str) -> str:
         return blocked
     ensure_shop(conn, shop_id)
     shop = ensure_shop(conn, shop_id)
-    _remove_shop_files(conn, shop_id, shop["logo_path"] if "logo_path" in shop.keys() else "")
+    _remove_shop_files(conn, shop_id, shop["logo_path"] if "logo_path" in shop.keys() else "",
+                       shop["logo_orig_path"] if "logo_orig_path" in shop.keys() else "")
     for table in (
         "conversation_turns",
         "messages_seen",
@@ -1690,7 +1694,7 @@ def delete_my_data(conn: sqlite3.Connection, shop_id: str) -> str:
         conn.execute(f"DELETE FROM {table} WHERE shop_id = ?", (shop_id,))
     conn.execute(
         "UPDATE shops SET consent_given_at = NULL, language = 'en', address = '',"
-        " phone = '', logo_path = '' WHERE shop_id = ?",
+        " phone = '', logo_path = '', logo_orig_path = '' WHERE shop_id = ?",
         (shop_id,),
     )
     conn.commit()
@@ -2676,36 +2680,51 @@ def show_shop_profile(conn: sqlite3.Connection, shop_id: str) -> str:
 
 
 def save_shop_logo(conn: sqlite3.Connection, shop_id: str, image: bytes) -> str:
-    import io as _io
     import os as _os
 
-    from PIL import Image, ImageOps
-
+    from app import logo as _logo
     from app import reports as _reports
 
     from app.agent import queue_media as _queue
+    blocked = _staff_blocked()
+    if blocked:
+        return blocked
     ensure_shop(conn, shop_id)
     try:
-        img = Image.open(_io.BytesIO(image or b"")).convert("RGB")
+        done = _logo.process_upload(image or b"")
     except Exception:
         return "❌ That file is not a photo. Send your logo as a photo."
-    gray = ImageOps.grayscale(img)
-    bbox = ImageOps.invert(gray).getbbox()
-    if bbox:
-        img = img.crop(bbox)
-    side = min(img.size)
-    left = (img.width - side) // 2
-    img = img.crop((left, (img.height - side) // 2, left + side,
-                    (img.height - side) // 2 + side)).resize((512, 512))
+    if done["original"] is None:
+        return "❌ That file is not a photo. Send your logo as a photo."
     _reports.LOGOS_DIR.mkdir(parents=True, exist_ok=True)
     safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
-    logo_path = str(_reports.LOGOS_DIR / f"{safe}.png")
-    img.save(logo_path, "PNG")
-    conn.execute("UPDATE shops SET logo_path = ? WHERE shop_id = ?",
-                 (logo_path, shop_id))
+    orig_path = str(_reports.LOGOS_DIR / f"{safe}-orig.png")
+    cut_path = str(_reports.LOGOS_DIR / f"{safe}-cutout.png")
+    with open(orig_path, "wb") as f:
+        f.write(done["original"])
+    if done["used_cutout"]:
+        with open(cut_path, "wb") as f:
+            f.write(done["cutout"])
+        display = cut_path
+        note = "I removed the background."
+    else:
+        badge_path = str(_reports.LOGOS_DIR / f"{safe}-badge.png")
+        with open(badge_path, "wb") as f:
+            f.write(done["badge"])
+        display = badge_path
+        note = "I kept it on a white badge so it stays readable."
+    conn.execute("UPDATE shops SET logo_path = ?, logo_orig_path = ? WHERE shop_id = ?",
+                 (display, orig_path, shop_id))
+    conn.execute("INSERT INTO flags (shop_id, key, value) VALUES (?, 'logo-mode', 'cutout')"
+                 " ON CONFLICT (shop_id, key) DO UPDATE SET value = 'cutout'",
+                 (shop_id,))
+    conn.execute("INSERT INTO flags (shop_id, key, value) VALUES (?, 'logo-review', '1')"
+                 " ON CONFLICT (shop_id, key) DO UPDATE SET value = '1'",
+                 (shop_id,))
     conn.commit()
     brand = _reports.shop_brand(conn, shop_id)
-    out = f"✅ *Logo saved*\n• It will head your {brand['name']} documents."
+    out = (f"✅ *Logo saved*\n• {note}\n"
+           "• Logo looks good? Reply Yes, or 'use original logo'.")
     base = _os.environ.get("SISI_PUBLIC_URL", "").rstrip("/")
     if base:
         card = str(_reports.REPORTS_DIR / f"{safe}-profile.png")
@@ -2715,6 +2734,55 @@ def save_shop_logo(conn: sqlite3.Connection, shop_id: str, image: bytes) -> str:
                           "caption": "Your new header", "filename": ""}])
         out += "\n\n📎 Preview below."
     return out
+
+
+def switch_logo(conn: sqlite3.Connection, shop_id: str, mode: str) -> str:
+    """Switch the header logo between the cut-out and the original upload."""
+    import os as _os
+
+    from app import reports as _reports
+
+    from app.agent import queue_media as _queue
+    blocked = _staff_blocked()
+    if blocked:
+        return blocked
+    ensure_shop(conn, shop_id)
+    brand = _reports.shop_brand(conn, shop_id)
+    if not brand["logo"] and not brand["logo_orig"]:
+        return "No logo yet — send your logo as a photo with caption 'logo'."
+    if mode == "original" and not brand["logo_orig"]:
+        return "I only have one version of your logo."
+    conn.execute("INSERT INTO flags (shop_id, key, value) VALUES (?, 'logo-mode', ?)"
+                 " ON CONFLICT (shop_id, key) DO UPDATE SET value = excluded.value",
+                 (shop_id, mode))
+    conn.execute("DELETE FROM flags WHERE shop_id = ? AND key = 'logo-review'",
+                 (shop_id,))
+    conn.commit()
+    brand = _reports.shop_brand(conn, shop_id)
+    what = "original" if mode == "original" else "background-free logo"
+    out = f"✅ *Using your {what} on documents.*"
+    base = _os.environ.get("SISI_PUBLIC_URL", "").rstrip("/")
+    if base:
+        safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
+        card = str(_reports.REPORTS_DIR / f"{safe}-profile.png")
+        _reports.render_shop_card(brand, card)
+        token = _reports.store_card(conn, shop_id, "profile", card)
+        _queue(shop_id, [{"kind": "image", "url": f"{base}/media/{token}?f=png",
+                          "caption": "Your header", "filename": ""}])
+        out += "\n\n📎 Preview below."
+    return out
+
+
+def confirm_logo(conn: sqlite3.Connection, shop_id: str) -> str | None:
+    """Accept the fresh logo after the Yes-review. None when not reviewing."""
+    row = conn.execute("SELECT value FROM flags WHERE shop_id = ? AND key = 'logo-review'",
+                       (shop_id,)).fetchone()
+    if row is None:
+        return None
+    conn.execute("DELETE FROM flags WHERE shop_id = ? AND key = 'logo-review'",
+                 (shop_id,))
+    conn.commit()
+    return "✅ *Great — your logo will head your documents.*"
 
 
 def _queue_statement(conn: sqlite3.Connection, shop_id: str, data: dict,

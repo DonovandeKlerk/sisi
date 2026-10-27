@@ -35,11 +35,20 @@ def shop_brand(conn, shop_id: str) -> dict:
     """Owner-supplied branding for document headers. Never invented."""
     tools.ensure_shop(conn, shop_id)
     shop = tools.ensure_shop(conn, shop_id)
-    logo = shop["logo_path"] or ""
+    keys = shop.keys()
+    display = shop["logo_path"] or ""
+    orig = shop["logo_orig_path"] if "logo_orig_path" in keys else ""
+    if not orig:
+        orig = display  # legacy single-file logos
+    mode = conn.execute("SELECT value FROM flags WHERE shop_id = ? AND key = 'logo-mode'",
+                        (shop_id,)).fetchone()
+    logo = orig if (mode and mode["value"] == "original") else display
     if logo and not Path(logo).exists():
         logo = ""
+    if orig and not Path(orig).exists():
+        orig = ""
     return {"name": shop["name"], "address": shop["address"] or "",
-            "phone": shop["phone"] or "", "logo": logo,
+            "phone": shop["phone"] or "", "logo": logo, "logo_orig": orig,
             "language": shop["language"] or "en"}
 
 
@@ -567,9 +576,15 @@ def _pdf_brand_header(story: list, st: dict, brand: dict, doc_title: str,
     from reportlab.platypus import Image as RLImage
     from reportlab.platypus import Paragraph, Spacer
     cells: list = []
+    logo_w = 0.0
     if brand["logo"]:
         try:
-            cells.append(RLImage(brand["logo"], width=32, height=32))
+            from PIL import Image as PILImage
+            with PILImage.open(brand["logo"]) as im:
+                aspect = im.width / max(im.height, 1)
+            logo_h = 30.0
+            logo_w = min(max(logo_h * aspect, 12.0), 90.0)
+            cells.append(RLImage(brand["logo"], width=logo_w, height=logo_h))
         except Exception:
             cells.append(Paragraph("", st["body"]))
     lines = [f"<b>{brand['name']}</b>"]
@@ -578,7 +593,7 @@ def _pdf_brand_header(story: list, st: dict, brand: dict, doc_title: str,
         lines.append(contact)
     lines.append(f"{doc_title} · {date_str}")
     cells.append(Paragraph("<br/>".join(lines), st["body"]))
-    widths = [40, width - 40] if brand["logo"] else [width]
+    widths = [logo_w + 8, width - logo_w - 8] if brand["logo"] else [width]
     story.append(_pdf_table([cells if brand["logo"] else cells], widths, header=False))
     story.append(Spacer(1, 6))
 
@@ -839,27 +854,46 @@ def render_order_png(payload: dict, brand: dict, path: str, day: str) -> str:
 
 
 def render_shop_card(brand: dict, path: str) -> str:
-    from PIL import Image
+    from PIL import Image, ImageDraw
     W, H = 1080, 640
     img = Image.new("RGB", (W, H), _hex(SISI["paper"]))
-    _png_brand_header(img, brand, "Shop profile", today_str())
+    y = _png_brand_header(img, brand, "Shop profile", today_str())
+    dr = ImageDraw.Draw(img)
+    dr.text((60, y), "Statement · Total outstanding R0.00", font=_card_font(40),
+            fill=_hex(SISI["ink"]))
+    dr.text((60, y + 62), "This is how your header looks on documents.",
+            font=_card_font(34), fill=_hex(SISI["muted"]))
     _png_footer(img)
     img.save(path, "PNG")
     return path
 
 
 def _paste_logo(img, logo_path: str, box: tuple[int, int, int]) -> None:
-    """Paste a squared owner logo thumbnail. Silent no-op when missing."""
+    """Paste the owner logo with transparency, scaled to the header height.
+
+    No box or border; a subtle drop shadow keeps cut-outs readable on the
+    dark green header. Silent no-op when missing.
+    """
     if not logo_path:
         return
-    from PIL import Image
+    from PIL import Image, ImageFilter
     try:
-        logo = Image.open(logo_path).convert("RGB")
+        logo = Image.open(logo_path).convert("RGBA")
     except OSError:
         return
     x, y, size = box
-    logo.thumbnail((size, size))
-    img.paste(logo, (x + (size - logo.width) // 2, y + (size - logo.height) // 2))
+    logo.thumbnail((size, size), Image.LANCZOS)
+    px, py = x + (size - logo.width) // 2, y + (size - logo.height) // 2
+    base = img.convert("RGBA")
+    shadow = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    alpha = logo.getchannel("A").point(lambda v: v * 60 // 255)
+    blob = Image.new("RGBA", (logo.width, logo.height), (0, 0, 0, 0))
+    blob.putalpha(alpha)
+    shadow.paste(blob, (px + 4, py + 6), blob)
+    shadow = shadow.filter(ImageFilter.GaussianBlur(6))
+    base.alpha_composite(shadow)
+    base.paste(logo, (px, py), logo)
+    img.paste(base.convert("RGB"))
 
 
 def render_card(d: dict, path: str, brand: dict | None = None) -> str:

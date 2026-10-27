@@ -48,7 +48,9 @@ from app.tools import (
     customer_statement,
     record_sale,
     resolve_sender,
+    confirm_logo,
     save_shop_logo,
+    switch_logo,
     set_customer_limit,
     set_expiry,
     set_nudge,
@@ -216,7 +218,8 @@ _STAFF_BLOCKED_EXACT = {"undo", "demo reset", "reset demo", "delete my data",
                         "statements for everyone who owes",
                         "statements for everyone", "all statements",
                         "shop profile", "show shop profile",
-                        "my shop profile", "show my shop profile"}
+                        "my shop profile", "show my shop profile",
+                        "logo", "use original logo", "remove logo background"}
 
 
 def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
@@ -239,6 +242,10 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
         return build_order(conn, shop_id), None
     if word == "send it" or word.startswith("send it "):
         return send_order(conn, shop_id, word[7:].strip() or None), None
+    if word == "use original logo":
+        return switch_logo(conn, shop_id, "original"), None
+    if word == "remove logo background":
+        return switch_logo(conn, shop_id, "cutout"), None
     if word.startswith("remove "):
         if get_order_draft(conn, shop_id) is None:
             return "No order draft. Say 'order stock' first.", None
@@ -255,6 +262,9 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
             if waiting is not None:
                 return (f"Still need the price — reply with it, e.g. '{waiting['product']} R18'.",
                         None)
+            seen = confirm_logo(conn, shop_id)
+            if seen is not None:
+                return seen, None
         return confirm_pending(conn, shop_id), None
     if word in NO_WORDS:
         if get_pending(conn, shop_id) is None and get_await_price(conn, shop_id) is not None:

@@ -7,6 +7,19 @@ import pytest
 from app.db import init_db
 
 
+@pytest.fixture(autouse=True)
+def _clean_global_state():
+    from app.agent import LAST_PHOTO, MEDIA_OUTBOX
+    from app.whatsapp import reset_fake
+    MEDIA_OUTBOX.clear()
+    LAST_PHOTO.clear()
+    reset_fake()
+    yield
+    MEDIA_OUTBOX.clear()
+    LAST_PHOTO.clear()
+    reset_fake()
+
+
 @pytest.fixture()
 def conn(tmp_path, monkeypatch):
     monkeypatch.setenv("SISI_DB", str(tmp_path / "test.db"))

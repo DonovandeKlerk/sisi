@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS shops (
   address    TEXT NOT NULL DEFAULT '',
   phone      TEXT NOT NULL DEFAULT '',
   logo_path  TEXT NOT NULL DEFAULT '',
+  logo_orig_path TEXT NOT NULL DEFAULT '',
   channel    TEXT NOT NULL DEFAULT '',
   consent_given_at TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
@@ -285,6 +286,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         "ALTER TABLE shops ADD COLUMN address TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE shops ADD COLUMN phone TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE shops ADD COLUMN logo_path TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE shops ADD COLUMN logo_orig_path TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE shops ADD COLUMN channel TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE customers ADD COLUMN credit_limit_cents INTEGER",
         "ALTER TABLE sales ADD COLUMN recorded_by TEXT NOT NULL DEFAULT ''",
