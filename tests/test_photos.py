@@ -56,6 +56,8 @@ def test_read_shop_photo_bad_json(monkeypatch):
 
 def test_handle_photo_other_helps(conn, monkeypatch):
     seed_demo(SHOP, conn)
+    conn.execute("UPDATE shops SET language = 'en' WHERE shop_id = ?", (SHOP,))
+    conn.commit()
     monkeypatch.setattr(agent, "read_shop_photo", lambda image, shop="": _doc("other"))
     _, reply, buttons = handle_photo(conn, SHOP, b"photo-1")
     assert buttons is None
@@ -66,6 +68,8 @@ def test_duplicate_photo_detected_after_save(conn, monkeypatch):
     from app.agent import handle_text
 
     seed_demo(SHOP, conn)
+    conn.execute("UPDATE shops SET language = 'en' WHERE shop_id = ?", (SHOP,))
+    conn.commit()
     calls = []
 
     def fake_read(image, shop=""):

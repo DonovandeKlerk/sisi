@@ -21,6 +21,8 @@ import httpx
 
 from app import llm as _llm
 from app.db import now_iso
+from app.i18n import STRINGS, item_keywords
+from app.i18n import t as _t
 from app.net import call_with_retries
 
 TRANSCRIBE_URL = "https://api.meta.ai/v1/asr/transcribe"
@@ -33,7 +35,7 @@ KEYWORDS = [
     "ishelf", "imali",
 ]
 
-CANT_HEAR = "I couldn't hear that voice note. Please send it again?"
+CANT_HEAR = STRINGS["en"]["voice_cant_hear"]
 
 
 class VoiceError(Exception):
@@ -50,9 +52,9 @@ def to_wav_16k_mono(audio: bytes, suffix: str = ".ogg") -> bytes:
     """Convert any WhatsApp audio to 16 kHz mono PCM wav via ffmpeg."""
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
-        raise VoiceError("Voice notes are not working right now. Please type instead.")
+        raise VoiceError(_t("voice_broken"))
     if not audio:
-        raise VoiceError(CANT_HEAR)
+        raise VoiceError(_t("voice_cant_hear"))
     with tempfile.TemporaryDirectory(prefix="sisi-voice-") as tmp:
         src = Path(tmp) / f"in{suffix or '.ogg'}"
         dst = Path(tmp) / "out.wav"
@@ -64,10 +66,10 @@ def to_wav_16k_mono(audio: bytes, suffix: str = ".ogg") -> bytes:
                 capture_output=True, text=True, timeout=30,
             )
         except subprocess.TimeoutExpired as e:
-            raise VoiceError(CANT_HEAR) from e
+            raise VoiceError(_t("voice_cant_hear")) from e
         if proc.returncode != 0 or not dst.exists():
             print(f"ffmpeg failed: {proc.stderr[:500]}", file=sys.stderr)
-            raise VoiceError(CANT_HEAR)
+            raise VoiceError(_t("voice_cant_hear"))
         return dst.read_bytes()
 
 
@@ -90,12 +92,16 @@ def transcribe_wav(wav: bytes, shop_id: str = "", extra_keywords: list[str] | No
     """Send 16 kHz mono wav to Muse Voice Transcribe; return the transcript."""
     key = os.environ.get("MODEL_API_KEY", "")
     if not key:
-        raise VoiceError("Voice notes are not working right now. Please type instead.")
+        raise VoiceError(_t("voice_broken"))
     if len(wav) > MAX_AUDIO_BYTES:
-        raise VoiceError("That voice note is too long. Send a shorter one?")
+        raise VoiceError(_t("voice_too_long"))
     keywords = list(KEYWORDS)
     for kw in extra_keywords or []:
         if kw and kw not in keywords:
+            keywords.append(kw)
+    # Local item words in all four languages fill the leftover slots.
+    for kw in item_keywords():
+        if kw not in keywords:
             keywords.append(kw)
     request_part = json.dumps({
         "mode": "ENDPOINTING",
@@ -119,10 +125,10 @@ def transcribe_wav(wav: bytes, shop_id: str = "", extra_keywords: list[str] | No
         resp = call_with_retries(send)
     except httpx.HTTPStatusError as e:
         _print_api_error(e.response.text)
-        raise VoiceError(CANT_HEAR) from e
+        raise VoiceError(_t("voice_cant_hear")) from e
     except httpx.HTTPError as e:
         print(f"Sisi voice request failed: {e!r}"[:500], file=sys.stderr)
-        raise VoiceError(CANT_HEAR) from e
+        raise VoiceError(_t("voice_cant_hear")) from e
     _log_stt(shop_id, len(wav))
     try:
         payload = resp.json()

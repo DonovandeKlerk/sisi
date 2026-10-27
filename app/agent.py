@@ -12,6 +12,8 @@ from datetime import datetime, timedelta, timezone
 
 from app import reports
 from app.db import today_str
+from app.i18n import (CURRENT_LANG, NAMES, STRINGS, detect, normalize_lang,
+                      owner_lang, t as _t)
 from app.setup import (
     answer as setup_answer,
     flush_logo,
@@ -52,17 +54,21 @@ from app.tools import (
     parse_month_name,
     propose_book_page,
     propose_receipt,
+    propose_reminder_offer,
     add_staff,
     confirm_reset_shop,
     customer_statement,
     record_sale,
+    resend_last_media,
     resolve_sender,
     reset_shop,
     confirm_logo,
     save_shop_logo,
     switch_logo,
+    set_customer_language,
     set_customer_limit,
     set_expiry,
+    set_owner_language,
     set_nudge,
     who_recorded_today,
     statements_for_all,
@@ -118,40 +124,25 @@ NO_WORDS = {"no", "n", "nope", "cha", "hayi", "nee", "aowa"}
 UNDO_WORDS = {"undo"}
 RESET_WORDS = {"demo reset", "reset demo"}
 DELETE_WORDS = {"delete my data", "erase my data", "forget me"}
-HELP_WORDS = {"demo help", "help", "what can you do", "commands"}
+HELP_WORDS = {"demo help", "help", "what can you do", "commands",
+              "hulp", "usizo", "uncedo"}
 
-DEMO_HELP = (
-    "❓ *Demo help — try me*\n"
-    "\n"
-    "• *stock list* — 'what do we have in stock?'\n"
-    "• *add stock* — 'add 20 bread at R18'\n"
-    "• *sale* — 'sold 2 coke'\n"
-    "• *credit sale* — 'Sipho took 2 bread'\n"
-    "• *who owes* — 'who owes?'\n"
-    "• *cash-up* — 'cash up'\n"
-    "• *low stock* — 'what is low?'\n"
-    "• *restock* — 'what must I buy tomorrow?'\n"
-    "• *order stock* — build an order, 'send it' to forward\n"
-    "• *float* — 'float R500' sets the till float\n"
-    "• *counted* — 'counted R1240' checks the till\n"
-    "• *month-end* — 'month-end report' for the books\n"
-    "• *profile* — 'set shop name …', 'show my shop profile'\n"
-    "• *statement* — 'statement for Sipho'\n"
-    "• *limit* — 'set Sipho limit R300'\n"
-    "• *expiry* — 'bread expires Friday'\n"
-    "• *nudge* — 'nudge at 20:00', 'nudge off'\n"
-    "• *staff* — 'add staff 082… Thandi', 'who recorded today'\n"
-    "• *setup* — 'setup' re-runs the 6-step guide\n"
-    "• *reset* — 'reset demo' (fresh demo) or 'reset shop' (erase all)\n"
-    "• *expiry photo* — send a photo of a date stamp\n"
-    "• *compliance* — 'can I get the spaza fund?'\n"
-    "• *scam check* — 'is this fund agent a scam?'\n"
-    "• *undo* — 'undo'\n"
-    "• *delete my data* — wipes this number\n"
-    "\n"
-    "🔒 *Privacy:* your records stay on this number. Reply 'delete my data' to erase them."
-)
+DEMO_HELP = STRINGS["en"]["help_menu"]
+"""English help menu (tests import this); live replies use t("help_menu")."""
+
+
 _FILLER = ("thank you", "thanks", "please", "sisi", "ta")
+
+
+def _set_message_lang(conn: sqlite3.Connection, shop_id: str,
+                        text: str | None) -> str:
+    """Reply language: detected from this message, else the owner's saved one.
+
+    Returns the language code. Scheduled sends use the owner's language.
+    """
+    code = detect(text, default=owner_lang(conn, shop_id))
+    CURRENT_LANG.set(code)
+    return code
 
 
 def _normalize(text: str) -> str:
@@ -236,7 +227,8 @@ def _parse_float(text: str) -> dict:
 
 _STAFF_BLOCKED_PREFIX = ("month-end", "month end", "monthend", "report ",
                                "statement", "set ", "add staff", "delete ",
-                               "reset ", "nudge", "undo")
+                               "reset ", "nudge", "undo", "speak", "khuluma",
+                               "praat", "thetha")
 _STAFF_BLOCKED_EXACT = {"undo", "demo reset", "reset demo", "delete my data",
                         "erase my data", "forget me",
                         "statements for everyone who owes",
@@ -252,14 +244,134 @@ def slow_status(text: str) -> str | None:
     word = _normalize(text or "")
     if word in ("month-end report", "month end report", "monthend report",
                 "month-end", "month end", "monthend"):
-        return "⏳ Building your month-end report…"
+        return _t("ag_busy_report")
     if word.startswith("report ") and parse_month_name(word[7:]):
-        return "⏳ Building your month-end report…"
-    if word.startswith("statement") or word in ("statements for everyone who owes",
-                                                "statements for everyone",
-                                                "all statements"):
-        return "⏳ Drawing up the statement…"
+        return _t("ag_busy_report")
+    if word.startswith(("statement", "statements", "staat", "strokie",
+                          "isitatimende", "sitatimende", "istatimenti")) \
+            or word in ("statements for everyone who owes",
+                        "statements for everyone", "all statements"):
+        return _t("ag_busy_stmt")
+    if "this month" not in word and (
+            word.startswith("receipt") or word.startswith("slip")
+            or "make a picture" in word or "something to send" in word
+            or "send it to" in word or "send this to" in word):
+        return _t("ag_busy_stmt")
     return None
+
+
+_STATEMENT_TRIGGERS = ("statement", "isitatimende", "sitatimende", "receipt",
+                       "irisithi", "risithi", "iresithi", "slip",
+                       "staat", "strokie", "afskrif", "istatimenti",
+                       "isiliphu",
+                       "something to send", "to send to", "send it to",
+                       "send this to", "make a picture", "picture for")
+
+
+def _customer_in_text(word: str, names: list[str]) -> str | None:
+    for name in sorted(names, key=len, reverse=True):
+        if not name.strip():
+            continue
+        # optional isiZulu possessive prefix: sikaSipho, kaSipho, owaSipho
+        if re.search(rf"\b(?:sika|ka|owa|wa)?{re.escape(name.strip().lower())}\b",
+                     word):
+            return name
+    return None
+
+
+def try_statement_request(conn: sqlite3.Connection, shop_id: str,
+                          text: str) -> str | None:
+    """Statement/receipt/slip requests naming a customer. None otherwise."""
+    word = _normalize(text or "")
+    if word.startswith("statement for "):
+        return customer_statement(conn, shop_id, word[len("statement for "):])
+    if "this month" in word and "statement" not in word:
+        return None  # 'show my receipts this month' is the receipts list
+    if re.search(r"\b(paid|payment|khokha|settled?|ibhadalile|betaal|hlawul\w*)\b",
+                   word):
+        return None  # payment recordings belong to the credit flow
+    if not any(t in word for t in _STATEMENT_TRIGGERS):
+        return None
+    names = [r["name"] for r in conn.execute(
+        "SELECT name FROM customers WHERE shop_id = ?", (shop_id,)).fetchall()]
+    hit = _customer_in_text(word, names)
+    if hit is None:
+        return None
+    return customer_statement(conn, shop_id, hit)
+
+
+_QUESTION_STARTS = ("how ", "what ", "when ", "who ", "which ", "why ",
+                    "is ", "are ", "do ", "does ", "can ", "ngaki", "malini",
+                    "ngubani", "nini", "yini", "kanjani",
+                    "hoeveel", "wat ", "wanneer", "wie ", "hoekom", "kan ",
+                    "yintoni", "kutheni", "yimalini", "ndinga")
+
+
+def try_reminder_command(conn: sqlite3.Connection, shop_id: str,
+                         text: str) -> str | None:
+    """Reminder commands and direct 'remind me' requests. None otherwise."""
+    from app.reminders import (cancel_numbered, confirm_text, detect_context,
+                               list_reminders, move_numbered, parse_request,
+                               parse_snooze_minutes, save_reminder,
+                               snooze_last)
+    word = _normalize(text or "")
+    if word in ("my reminders", "reminders", "show reminders",
+                "list reminders", "my herinneringe", "herinneringe",
+                "wys herinneringe", "izikhumbuzo zam", "bonisa izikhumbuzo"):
+        return list_reminders(conn, shop_id)
+    m = re.match(r"cancel reminder (\d+)$", word)
+    if m:
+        return cancel_numbered(conn, shop_id, int(m.group(1)))
+    m = re.match(r"move reminder (\d+) to (.+)$", word)
+    if m:
+        return move_numbered(conn, shop_id, int(m.group(1)),
+                             m.group(2).strip())
+    mins = parse_snooze_minutes(word)
+    if mins is not None:
+        return snooze_last(conn, shop_id, mins)
+    if "?" in word:
+        return None
+    parsed = parse_request(text)
+    if parsed is None:
+        return None
+    if parsed["summary"].lower().startswith(_QUESTION_STARTS):
+        return None  # 'remind me how much…' is a question for the books
+    context = detect_context(conn, shop_id, text)
+    save_reminder(conn, shop_id, parsed["due"], parsed["summary"], context,
+                  parsed["recurrence"])
+    return confirm_text(parsed["due"], parsed["summary"],
+                        parsed["recurrence"])
+
+
+def try_offer_time(conn: sqlite3.Connection, shop_id: str,
+                   text: str) -> str | None:
+    """A bare time answering a reminder offer ('6am' after the proposal)."""
+    from app.reminders import parse_bare_time
+    pend = get_pending(conn, shop_id)
+    if pend is None or pend["action_type"] != "reminder_offer":
+        return None
+    hm = parse_bare_time(text)
+    if hm is None:
+        return None
+    payload = json.loads(pend["payload_json"])
+    due = datetime.fromisoformat(payload["due_at"])
+    due = due.replace(hour=hm[0], minute=hm[1], second=0, microsecond=0)
+    payload["due_at"] = due.isoformat()
+    conn.execute("UPDATE pending_actions SET payload_json = ? WHERE id = ?",
+                 (json.dumps(payload), pend["id"]))
+    conn.commit()
+    return confirm_pending(conn, shop_id)
+
+
+def try_reminder_offer(conn: sqlite3.Connection, shop_id: str,
+                       text: str) -> str | None:
+    """Offer a reminder for a mentioned future date. None otherwise."""
+    from app.reminders import offer_scan
+    found = offer_scan(text)
+    if found is None:
+        return None
+    return propose_reminder_offer(conn, shop_id, found["due"].isoformat(),
+                                  found["summary"])
 
 
 def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
@@ -270,6 +382,9 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
                               or word.startswith(_STAFF_BLOCKED_PREFIX)):
         from app.tools import _staff_blocked
         return _staff_blocked(), None
+    m = re.match(r"(speak|khuluma|praat|thetha)\s+(.+)$", word)
+    if m and normalize_lang(m.group(2).strip()) is not None:
+        return set_owner_language(conn, shop_id, m.group(2).strip()), None
     m = re.match(r"add staff ([\d\s+()\-]{9,}) (.+)$", (text or "").strip(),
                    re.IGNORECASE)
     if m and _STAFF_NAME.get() is None:
@@ -278,6 +393,12 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
         return who_recorded_today(conn, shop_id), None
     if word == "float" or word.startswith("float "):
         return set_float(conn, shop_id, _parse_float(word)), None
+    statement = try_statement_request(conn, shop_id, text)
+    if statement is not None:
+        return statement, None
+    reminder = try_reminder_command(conn, shop_id, text)
+    if reminder is not None:
+        return reminder, None
     if word in ORDER_WORDS:
         return build_order(conn, shop_id), None
     if word == "send it" or word.startswith("send it "):
@@ -288,20 +409,20 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
         return switch_logo(conn, shop_id, "cutout"), None
     if word.startswith("remove "):
         if get_order_draft(conn, shop_id) is None:
-            return "No order draft. Say 'order stock' first.", None
+            return _t("order_no_draft"), None
         return edit_order_remove(conn, shop_id, word[7:].strip()), None
     if word.startswith("add ") and get_order_draft(conn, shop_id) is not None \
             and not _price_amounts(word):
         parsed = _parse_order_add(word)
         if parsed is None:
-            return "❓ Say it like 'add chappies 2 boxes'.", None
+            return _t("ag_order_add_hint"), None
         return edit_order_add(conn, shop_id, *parsed), None
     if word in YES_WORDS:
         if get_pending(conn, shop_id) is None:
             waiting = get_await_price(conn, shop_id)
             if waiting is not None:
-                return (f"Still need the price — reply with it, e.g. '{waiting['product']} R18'.",
-                        None)
+                return (_t("ag_price_needed",
+                           product=waiting['product']), None)
             seen = confirm_logo(conn, shop_id)
             if seen is not None:
                 return seen, None
@@ -309,9 +430,12 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
     if word in NO_WORDS:
         if get_pending(conn, shop_id) is None and get_await_price(conn, shop_id) is not None:
             clear_await_price(conn, shop_id)
-            return "OK, I dropped that sale.", None
+            return _t("ag_sale_dropped"), None
         clear_await_price(conn, shop_id)
         return cancel_pending(conn, shop_id), None
+    offered = try_offer_time(conn, shop_id, text)
+    if offered is not None:
+        return offered, None
     if word in UNDO_WORDS:
         return undo_last(conn, shop_id), None
     if word == "undo book":
@@ -344,6 +468,15 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
     if word in ("nudge off", "nudge on") or word.startswith("nudge at "):
         setting = word[9:].strip() if word.startswith("nudge at ") else word[6:]
         return set_nudge(conn, shop_id, setting), None
+    if word in ("daily plan off", "daily plan on") \
+            or word.startswith("daily plan at "):
+        from app.schedule import set_daily_plan
+        setting = word[14:].strip() if word.startswith("daily plan at ") \
+            else word[11:]
+        return set_daily_plan(conn, shop_id, setting), None
+    if word == "daily plan":
+        from app.schedule import daily_plan, sast_now
+        return daily_plan(conn, shop_id, sast_now().date().isoformat()), None
     m = re.match(r"(.+) expires? (.+)$", word)
     if m and "expiry" not in word and not word.startswith(
             ("what ", "when ", "which ", "list ", "show ", "check ")):
@@ -355,21 +488,27 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
         except ValueError:
             cents = 0
         return set_customer_limit(conn, shop_id, m.group(1).strip(), cents), None
+    m = re.match(r"set (.+) language (.+)$", word)
+    if m:
+        return set_customer_language(conn, shop_id, m.group(1).strip(),
+                                     m.group(2).strip()), None
     if word in ("show my shop profile", "shop profile", "show shop profile",
                 "my shop profile"):
         return show_shop_profile(conn, shop_id), None
     if word in ("statements for everyone who owes",
                 "statements for everyone", "all statements"):
         return statements_for_all(conn, shop_id), None
-    if word.startswith("statement for "):
-        return customer_statement(conn, shop_id, word[len("statement for "):]), None
+    if word == "resend":
+        return resend_last_media(conn, shop_id), None
     if word == "logo":
         image = _fresh_photo(shop_id)
         if image is None:
-            return ("Send your logo as a photo with the caption 'logo',"
-                    " then I'll head your documents with it."), None
+            return _t("logo_howto"), None
         LAST_PHOTO.pop(shop_id, None)
         return save_shop_logo(conn, shop_id, image), None
+    offer = try_reminder_offer(conn, shop_id, text)
+    if offer is not None:
+        return offer, None
     return None
 
 
@@ -423,8 +562,7 @@ def try_price_reply(conn: sqlite3.Connection, shop_id: str, text: str) -> str | 
     if len(amounts) > 1:
         if not mentioned:
             return None
-        return (f"One price at a time — reply with just the {product} price,"
-                f" e.g. '{product} R18'.")
+        return _t("ag_one_price", product=product)
     if not mentioned:
         others = conn.execute("SELECT name FROM products WHERE shop_id = ?",
                               (shop_id,)).fetchall()
@@ -439,8 +577,8 @@ def try_price_reply(conn: sqlite3.Connection, shop_id: str, text: str) -> str | 
     prod = find_product(conn, shop_id, product)
     if _is_pack_unit(text):
         if prod is None or not prod["pack_size"]:
-            return (f"❓ *{product} has no {_pack_echo(text)} size yet.*\n"
-                    f"Reply with the single price, e.g. '{product.lower()} R2'.")
+            return _t("ag_pack_price_ask", product=product,
+                            echo=_pack_echo(text), low=product.lower())
         ensure_pack_price(conn, shop_id, product, amounts[0])
     else:
         ensure_product_price(conn, shop_id, product, amounts[0])
@@ -460,6 +598,7 @@ def handle_voice(conn: sqlite3.Connection, shop_id: str, audio: bytes,
     """
     shop_id, _ = _enter(conn, shop_id)
     ensure_shop(conn, shop_id)
+    CURRENT_LANG.set(owner_lang(conn, shop_id))
     extra = [r["name"] for r in conn.execute(
         "SELECT name FROM customers WHERE shop_id = ?", (shop_id,)).fetchall()]
     extra += [r["name"] for r in conn.execute(
@@ -469,10 +608,10 @@ def handle_voice(conn: sqlite3.Connection, shop_id: str, audio: bytes,
     except VoiceError as e:
         return None, str(e), None
     if not transcript:
-        return None, "I couldn't hear anything in that voice note. Send it again?", None
+        return None, _t("ag_voice_empty"), None
     reply, buttons = handle_text(conn, shop_id, transcript)
     shown = transcript if len(transcript) <= 100 else transcript[:97] + "…"
-    return transcript, f"Heard: “{shown}”\n{reply}", buttons
+    return transcript, _t("ag_heard", shown=shown, reply=reply), buttons
 
 
 _PHOTO_EMOJI = {"expiry": "📸", "book_page": "📒", "receipt": "🧾"}
@@ -486,6 +625,7 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
     """
     shop_id, staff = _enter(conn, shop_id)
     ensure_shop(conn, shop_id)
+    _set_message_lang(conn, shop_id, caption)
     LAST_PHOTO[shop_id] = (image or b"", datetime.now(timezone.utc))
     if staff is None and setup_step(conn, shop_id):
         from app.setup import handle_photo as setup_photo
@@ -496,8 +636,8 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
             save_turn(conn, shop_id, "assistant", got)
             return None, got, None
         step = setup_step(conn, shop_id) or 1
-        reply = ("📷 Noted — but first, let's finish setting up.\n\n"
-                 + setup_prompt(conn, shop_id, step))
+        reply = _t("ag_photo_setup",
+                   prompt=setup_prompt(conn, shop_id, step))
         save_turn(conn, shop_id, "user", "[photo]")
         save_turn(conn, shop_id, "assistant", reply)
         return None, reply, None
@@ -511,7 +651,7 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
     if seen is not None:
         day = (seen["created_at"] or "")[:10]
         emoji = _PHOTO_EMOJI.get(seen["kind"], "📸")
-        return None, f"{emoji} I already saved this photo on {day}. Send a different one.", None
+        return None, _t("ag_photo_dup", emoji=emoji, day=day), None
     before = get_pending(conn, shop_id)
     before_id = before["id"] if before else None
     try:
@@ -528,8 +668,7 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
     elif kind == "receipt":
         reply = propose_receipt(conn, shop_id, doc.get("receipt", {}), photo_hash=digest)
     else:
-        reply = ("I can't tell what this is yet. Send a shelf date stamp,"
-                 " your book page, or a till slip.")
+        reply = _t("ag_photo_unknown")
         save_turn(conn, shop_id, "assistant", reply)
         return doc, reply, None
     save_turn(conn, shop_id, "assistant", reply)
@@ -541,6 +680,12 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
 def handle_text(conn: sqlite3.Connection, shop_id: str, text: str):
     shop_id, staff = _enter(conn, shop_id)
     ensure_shop(conn, shop_id)
+    if staff is None and needs_setup(conn, shop_id):
+        # Setup answers are data (names, numbers, yes), not language
+        # signals; the step-6 language answer is authoritative.
+        CURRENT_LANG.set(owner_lang(conn, shop_id))
+    else:
+        _set_message_lang(conn, shop_id, text)
     if staff is None:
         word0 = _normalize(text or "")
         if word0 == "setup":
@@ -566,8 +711,8 @@ def handle_text(conn: sqlite3.Connection, shop_id: str, text: str):
         if word0 in HELP_WORDS:
             mark_paused(conn, shop_id)
             save_turn(conn, shop_id, "user", text)
-            save_turn(conn, shop_id, "assistant", DEMO_HELP)
-            return DEMO_HELP, None
+            save_turn(conn, shop_id, "assistant", _t("help_menu"))
+            return _t("help_menu"), None
         if needs_setup(conn, shop_id):
             if setup_step(conn, shop_id) is None:
                 message = start_setup(conn, shop_id)
@@ -628,8 +773,8 @@ def _maybe_first_offer(conn: sqlite3.Connection, shop_id: str, message: str) -> 
         (shop_id, month)).fetchone()["s"]
     if not sales:
         return message
-    return (message + f"\n\n📊 It's the 1st — reply 'month-end report'"
-            f" for your {reports.month_label(month)} books.")
+    return message + _t("ag_first_offer",
+                               month=reports.month_label(month))
 
 
 def try_line_correction(conn: sqlite3.Connection, shop_id: str, text: str) -> str | None:

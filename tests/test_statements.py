@@ -107,10 +107,12 @@ def test_batch_clean_book(conn):
 
 
 def test_isizulu_ask_line(conn, ledger, tmp_path):
+    from app.i18n import doc_lang
     conn.execute("UPDATE shops SET language = 'zu' WHERE shop_id = ?", (SHOP,))
-    data = reports.statement_data(conn, SHOP, "Sipho")
-    pdf = reports.render_statement_pdf(data, reports.shop_brand(conn, SHOP),
-                                       str(tmp_path / "st.pdf"))
+    with doc_lang("zu"):
+        data = reports.statement_data(conn, SHOP, "Sipho")
+        pdf = reports.render_statement_pdf(data, reports.shop_brand(conn, SHOP),
+                                           str(tmp_path / "st.pdf"))
     assert "Ngicela ukhokhe".encode() in open(pdf, "rb").read()
 
 

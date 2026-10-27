@@ -95,7 +95,7 @@ def test_demo_reset_dispatches_per_number(conn):
 
 def test_reset_demo_command_for_live_number(conn):
     msg, buttons = try_deterministic(conn, DEMO_NUMBER, "reset demo")
-    assert buttons is None and "Step 1 of 6" in msg
+    assert buttons is None and "Step 1 of 7" in msg
 
 
 def test_reset_clears_await_price_and_conversation(conn):

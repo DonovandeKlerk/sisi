@@ -90,6 +90,8 @@ def test_add_and_remove_lines(conn):
 
 def test_order_commands_through_agent(conn):
     seed_demo(SHOP, conn)
+    conn.execute("UPDATE shops SET language = 'en' WHERE shop_id = ?", (SHOP,))
+    conn.commit()
     _costs(conn)
     msg, _ = handle_text(conn, SHOP, "order stock")
     assert msg.startswith("📋 *Order draft*")

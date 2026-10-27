@@ -36,6 +36,8 @@ def test_float_sets_opening_once(conn):
 
 def test_float_command_parses_accounts(conn):
     seed_demo(SHOP, conn)
+    conn.execute("UPDATE shops SET language = 'en' WHERE shop_id = ?", (SHOP,))
+    conn.commit()
     msg, _ = handle_text(conn, SHOP, "float R1200 petty R300")
     assert "• Till R1200.00" in msg and "• Petty cash R300.00" in msg
 

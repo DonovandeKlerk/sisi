@@ -65,7 +65,7 @@ def test_step4_accepts_formats_and_sizes(conn):
                   b"RIFF" + b"0" * 4 + b"WEBP" + b"0" * 500,
                   b"raw-bytes-huge" * 200000):
         _, reply, _ = handle_photo(conn, SHOP, image)
-        assert "Logo received" in reply and "Step 5 of 6" in reply
+        assert "Logo received" in reply and "Step 5 of 7" in reply
         assert _flag(conn, "logo-polish") == "pending"
         assert os.path.exists(ensure_shop(conn, SHOP)["logo_orig_path"])
         conn.execute("UPDATE flags SET value = '4' WHERE shop_id = ?"
@@ -86,7 +86,8 @@ def test_failure_arrives_after_all_set(conn):
     handle_photo(conn, SHOP, _png())
     _set_flag(conn, "logo-polish", "failed")
     handle_text(conn, SHOP, "1500 cash, 300 petty")
-    msg, _ = handle_text(conn, SHOP, "english")
+    handle_text(conn, SHOP, "english")
+    msg, _ = handle_text(conn, SHOP, "yes")
     assert msg.startswith("✅ *You're all set")
     assert LOGO_FAILED in msg
     assert msg.index("You're all set") < msg.index("couldn't clean up")
@@ -104,7 +105,8 @@ def test_success_arrives_after_all_set_with_card(conn, tmp_path, monkeypatch):
     conn.commit()
     _set_flag(conn, "logo-polish", "done")
     handle_text(conn, SHOP, "1500 cash, 300 petty")
-    msg, _ = handle_text(conn, SHOP, "english")
+    handle_text(conn, SHOP, "english")
+    msg, _ = handle_text(conn, SHOP, "yes")
     assert msg.index("You're all set") < msg.index(LOGO_READY)
     captions = [m["caption"] for m in MEDIA_OUTBOX.get(SHOP, [])]
     assert "Your polished logo" in captions
@@ -116,7 +118,8 @@ def test_pending_then_next_message_delivers(conn, tmp_path, monkeypatch):
     _to_step4(conn)
     handle_photo(conn, SHOP, _png())
     handle_text(conn, SHOP, "1500 cash, 300 petty")
-    msg, _ = handle_text(conn, SHOP, "english")
+    handle_text(conn, SHOP, "english")
+    msg, _ = handle_text(conn, SHOP, "yes")
     assert "logo is ready" not in msg and "couldn't clean" not in msg
     logo = tmp_path / "logos" / "cut.png"
     logo.parent.mkdir(parents=True, exist_ok=True)
@@ -136,17 +139,18 @@ def test_step_errors_skip_and_still_finish(conn, monkeypatch):
     monkeypatch.setattr(tools, "set_shop_name",
                         lambda c, s, n: (_ for _ in ()).throw(IOError("boom")))
     msg, _ = handle_text(conn, SHOP, "hi")
-    assert "Step 1 of 6" in msg
+    assert "Step 1 of 7" in msg
     msg, _ = handle_text(conn, SHOP, "Kwamama")
-    assert "Skipped step 1" in msg and "Step 2 of 6" in msg
+    assert "Skipped step 1" in msg and "Step 2 of 7" in msg
     monkeypatch.setattr(tools, "set_float",
                         lambda c, s, a: (_ for _ in ()).throw(IOError("boom")))
     handle_text(conn, SHOP, "12 Main Rd")
     handle_text(conn, SHOP, "yes")
     handle_text(conn, SHOP, "skip")
     msg, _ = handle_text(conn, SHOP, "1500 cash, 300 petty")
-    assert "Skipped step 5" in msg and "Step 6 of 6" in msg
-    msg, _ = handle_text(conn, SHOP, "english")
+    assert "Skipped step 5" in msg and "Step 6 of 7" in msg
+    handle_text(conn, SHOP, "english")
+    msg, _ = handle_text(conn, SHOP, "yes")
     assert msg.startswith("✅ *You're all set")
     assert setup_step(conn, SHOP) is None
 

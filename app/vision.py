@@ -20,6 +20,8 @@ from datetime import date
 from pathlib import Path
 
 from app import config
+from app.i18n import STRINGS
+from app.i18n import t as _t
 from app.llm import get_client, log_usage, print_api_error
 
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
@@ -63,7 +65,7 @@ EXPIRY_PROMPT = (
     "set stamp_count to 0 with an empty items list."
 )
 
-CANT_READ = "I couldn't read that photo. Try a closer shot of the date stamp."
+CANT_READ = STRINGS["en"]["vis_cant_read"]
 
 SHOP_PHOTO_SCHEMA = {
     "name": "shop_photo",
@@ -226,9 +228,9 @@ def _complete_vision(messages: list, response_format: dict) -> object:
 def read_expiry_photo(image: bytes, shop_id: str = "") -> list[dict]:
     """Read expiry findings from a photo. Returns [] when no dates are readable."""
     if not os.environ.get("MODEL_API_KEY", ""):
-        raise VisionError("I can't read photos right now. Tell me the dates in words?")
+        raise VisionError(_t("vis_broken"))
     if not image or len(image) > MAX_IMAGE_BYTES:
-        raise VisionError(CANT_READ)
+        raise VisionError(_t("vis_cant_read"))
     prepared, mime = _prepare_image(image)
     data_url = f"data:{mime};base64," + base64.b64encode(prepared).decode("ascii")
     messages = [{"role": "user", "content": [
@@ -240,12 +242,12 @@ def read_expiry_photo(image: bytes, shop_id: str = "") -> list[dict]:
             messages, {"type": "json_schema", "json_schema": EXPIRY_SCHEMA})
     except Exception as e:  # noqa: BLE001 - API outage must not crash the chat
         print_api_error(e)
-        raise VisionError(CANT_READ) from e
+        raise VisionError(_t("vis_cant_read")) from e
     log_usage(shop_id, config.model_name(), getattr(resp, "usage", None))
     try:
         payload = json.loads(resp.choices[0].message.content or "{}")
     except (ValueError, AttributeError, IndexError):
-        raise VisionError(CANT_READ) from None
+        raise VisionError(_t("vis_cant_read")) from None
     findings = []
     for item in payload.get("items") or []:
         if not isinstance(item, dict):
@@ -285,9 +287,9 @@ def _sane_date(val) -> str:
 def read_shop_photo(image: bytes, shop_id: str = "") -> dict:
     """Classify a shop photo and extract its lines (one strict-schema call)."""
     if not os.environ.get("MODEL_API_KEY", ""):
-        raise VisionError("I can't read photos right now. Tell me the dates in words?")
+        raise VisionError(_t("vis_broken"))
     if not image or len(image) > MAX_IMAGE_BYTES:
-        raise VisionError(CANT_READ)
+        raise VisionError(_t("vis_cant_read"))
     prepared, mime = _prepare_image(image)
     data_url = f"data:{mime};base64," + base64.b64encode(prepared).decode("ascii")
     messages = [{"role": "user", "content": [
@@ -299,12 +301,12 @@ def read_shop_photo(image: bytes, shop_id: str = "") -> dict:
             messages, {"type": "json_schema", "json_schema": SHOP_PHOTO_SCHEMA})
     except Exception as e:  # noqa: BLE001 - API outage must not crash the chat
         print_api_error(e)
-        raise VisionError(CANT_READ) from e
+        raise VisionError(_t("vis_cant_read")) from e
     log_usage(shop_id, config.model_name(), getattr(resp, "usage", None))
     try:
         doc = json.loads(resp.choices[0].message.content or "{}")
     except (ValueError, AttributeError, IndexError):
-        raise VisionError(CANT_READ) from None
+        raise VisionError(_t("vis_cant_read")) from None
     try:
         kinds = {"cash", "credit", "payment", "unreadable"}
         book = doc.get("book") or {}
@@ -356,4 +358,4 @@ def read_shop_photo(image: bytes, shop_id: str = "") -> dict:
             doc["doc_type"] = "other"
         return doc
     except (ValueError, AttributeError) as e:
-        raise VisionError(f"{CANT_READ} (bad vision JSON: {e})") from e
+        raise VisionError(f"{_t('vis_cant_read')} (bad vision JSON: {e})") from e

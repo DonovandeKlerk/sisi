@@ -33,6 +33,11 @@ def photo_env(tmp_path, monkeypatch):
     monkeypatch.setattr(llm, "TOKEN_LOG", tmp_path / "usage.log")
     reset_fake()
     seed_demo(SHOP)
+    import app.db as _db
+    _c = _db.connect()
+    _c.execute("UPDATE shops SET language = 'en' WHERE shop_id = ?", (SHOP,))
+    _c.commit()
+    _c.close()
     return tmp_path
 
 

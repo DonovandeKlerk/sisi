@@ -172,6 +172,8 @@ def test_questions_and_errors_format(conn):
 
 def test_await_price_replies_format(conn):
     seed_demo(SHOP, conn)
+    conn.execute("UPDATE shops SET language = 'en' WHERE shop_id = ?", (SHOP,))
+    conn.commit()
     out = assert_format(record_sale(conn, SHOP, "Vetkoek", 2, buyer="Sipho"))
     assert out.startswith("📝 *Vetkoek isn't on your list yet.*")
     msg, _ = handle_text(conn, SHOP, "yes")

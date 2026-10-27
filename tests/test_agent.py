@@ -72,7 +72,7 @@ def test_demo_reset_command(conn):
     try_deterministic(conn, SHOP, "yes")
     msg, _ = try_deterministic(conn, SHOP, "demo reset")
     assert msg.startswith("🏪 *Let's set up your shop.*")
-    assert "Step 1 of 6" in msg
+    assert "Step 1 of 7" in msg
     assert conn.execute("SELECT COUNT(*) n FROM customers WHERE shop_id = ?",
                         (SHOP,)).fetchone()["n"] == 0
 

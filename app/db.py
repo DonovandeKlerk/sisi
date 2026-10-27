@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS customers (
   shop_id    TEXT NOT NULL REFERENCES shops(shop_id),
   name       TEXT NOT NULL COLLATE NOCASE,
   credit_limit_cents INTEGER,
+  language TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   UNIQUE (shop_id, name)
 );
@@ -241,6 +242,35 @@ CREATE TABLE IF NOT EXISTS flags (
   PRIMARY KEY (shop_id, key)
 );
 
+CREATE TABLE IF NOT EXISTS send_queue (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  to_number    TEXT NOT NULL,
+  channel      TEXT NOT NULL DEFAULT '',
+  kind         TEXT NOT NULL,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  status       TEXT NOT NULL DEFAULT 'queued',
+  attempts     INTEGER NOT NULL DEFAULT 0,
+  next_at      REAL,
+  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS send_pacing (
+  to_number TEXT PRIMARY KEY,
+  last_sent REAL NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS reminders (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  shop_id     TEXT NOT NULL REFERENCES shops(shop_id),
+  due_at      TEXT NOT NULL,
+  summary     TEXT NOT NULL DEFAULT '',
+  context_json TEXT NOT NULL DEFAULT '{}',
+  recurrence  TEXT NOT NULL DEFAULT 'none',
+  status      TEXT NOT NULL DEFAULT 'pending',
+  created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  sent_at     TEXT NOT NULL DEFAULT ''
+);
+
 CREATE INDEX IF NOT EXISTS idx_customers_shop ON customers(shop_id);
 CREATE INDEX IF NOT EXISTS idx_products_shop ON products(shop_id);
 CREATE INDEX IF NOT EXISTS idx_credit_shop ON credit_entries(shop_id);
@@ -258,6 +288,8 @@ CREATE INDEX IF NOT EXISTS idx_actions_shop ON actions(shop_id);
 CREATE INDEX IF NOT EXISTS idx_turns_shop ON conversation_turns(shop_id);
 CREATE INDEX IF NOT EXISTS idx_reports_shop ON reports(shop_id);
 CREATE INDEX IF NOT EXISTS idx_flags_shop ON flags(shop_id);
+CREATE INDEX IF NOT EXISTS idx_sendq_to ON send_queue(to_number, status, next_at);
+CREATE INDEX IF NOT EXISTS idx_rem_due ON reminders(status, due_at);
 """
 
 
@@ -289,6 +321,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         "ALTER TABLE shops ADD COLUMN logo_orig_path TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE shops ADD COLUMN channel TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE customers ADD COLUMN credit_limit_cents INTEGER",
+        "ALTER TABLE customers ADD COLUMN language TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE sales ADD COLUMN recorded_by TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE credit_entries ADD COLUMN recorded_by TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE payments ADD COLUMN recorded_by TEXT NOT NULL DEFAULT ''",

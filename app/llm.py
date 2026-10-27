@@ -138,20 +138,23 @@ def chat(conn: sqlite3.Connection, shop_id: str, text: str) -> str:
             resp = _complete(messages)
         except Exception as e:  # noqa: BLE001 - API outage must not crash the chat
             print_api_error(e)
-            reply = "My signal dropped just now. Please say that again."
+            from app.i18n import t as _t
+            reply = _t("llm_dropped")
             save_turn(conn, shop_id, "assistant", reply)
             return reply
         log_usage(shop_id, model, getattr(resp, "usage", None), round_no)
         msg = resp.choices[0].message
         calls = list(getattr(msg, "tool_calls", None) or [])
         if not calls:
-            reply = (msg.content or "").strip() or "Say that again for me?"
+            from app.i18n import t as _t
+            reply = (msg.content or "").strip() or _t("llm_say_again")
             save_turn(conn, shop_id, "assistant", reply)
             return reply
         messages.append(msg)
         for call in calls:
             result = _run_tool(conn, shop_id, call.function.name, call.function.arguments)
             messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
-    reply = "That one is tricky. Ask me again in fewer words?"
+    from app.i18n import t as _t
+    reply = _t("llm_tricky")
     save_turn(conn, shop_id, "assistant", reply)
     return reply

@@ -10,14 +10,17 @@ from app.db import init_db
 @pytest.fixture(autouse=True)
 def _clean_global_state():
     from app.agent import LAST_PHOTO, MEDIA_OUTBOX
+    from app.i18n import CURRENT_LANG
     from app.whatsapp import reset_fake
     MEDIA_OUTBOX.clear()
     LAST_PHOTO.clear()
     reset_fake()
+    CURRENT_LANG.set("en")
     yield
     MEDIA_OUTBOX.clear()
     LAST_PHOTO.clear()
     reset_fake()
+    CURRENT_LANG.set("en")
 
 
 @pytest.fixture()

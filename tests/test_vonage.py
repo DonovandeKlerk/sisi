@@ -46,6 +46,11 @@ def vg_env(tmp_path, monkeypatch):
     reset_fake()
     main._rate_hits.clear()
     seed_demo(SHOP)
+    import app.db as _db
+    _c = _db.connect()
+    _c.execute("UPDATE shops SET language = 'en' WHERE shop_id = ?", (SHOP,))
+    _c.commit()
+    _c.close()
     return tmp_path
 
 

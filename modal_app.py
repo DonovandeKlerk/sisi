@@ -90,3 +90,24 @@ def polish_logo(shop_id: str) -> str:
     _use_volume()
     from app.setup import finish_polish
     return finish_polish(shop_id)
+
+
+@app.function(schedule=modal.Period(minutes=1), timeout=120)
+def every_minute():
+    """Fire due reminders exactly once + drain leftover queued sends."""
+    import logging
+    _use_volume()
+    from app.db import connect, init_db
+    from app.reminders import send_due
+    from app.sendqueue import drain_all
+    from app.vonage import VonageSender
+    from app.whatsapp import get_sender
+    conn = connect()
+    try:
+        init_db(conn)
+        for rid in send_due(conn):
+            logging.getLogger("sisi").info("reminder %s fired", rid)
+        drain_all(conn, lambda channel: VonageSender()
+                  if channel == "vonage" else get_sender())
+    finally:
+        conn.close()

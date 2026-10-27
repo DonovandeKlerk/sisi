@@ -21,16 +21,20 @@ STEPS = {
     4: "🖼️",
     5: "💵",
     6: "🗣️",
+    7: "☀️",
 }
-TOTAL = 6
+TOTAL = 7
 
 CHANGE_WORDS = {
-    "name": 1, "business name": 1, "shop name": 1,
-    "address": 2,
+    "name": 1, "business name": 1, "shop name": 1, "naam": 1, "igama": 1,
+    "address": 2, "adres": 2, "ikheli": 2, "idilesi": 2,
     "phone": 3, "number": 3, "contact": 3, "contact number": 3,
+    "telefoon": 3, "ifoni": 3, "inombolo": 3,
     "logo": 4, "picture": 4,
-    "float": 5, "cash": 5, "money": 5,
-    "language": 6, "zulu": 6, "english": 6,
+    "float": 5, "cash": 5, "money": 5, "imali": 5, "geld": 5,
+    "language": 6, "zulu": 6, "english": 6, "taal": 6, "ulimi": 6,
+    "ulwimi": 6,
+    "plan": 7, "daily plan": 7, "icebo": 7, "dagplan": 7,
 }
 
 
@@ -83,31 +87,30 @@ def start_setup(conn: sqlite3.Connection, shop_id: str, reseed: bool = False) ->
 
 
 def step_prompt(conn: sqlite3.Connection, shop_id: str, step: int, intro: bool = False) -> str:
+    from app.i18n import t
     from app.tools import ensure_shop
-    head = f"Step {step} of {TOTAL} {STEPS[step]}"
+    head = t("setup_head", n=step, total=TOTAL, emoji=STEPS[step])
     if step == 1:
-        body = ("🏪 *Let's set up your shop.*\n\nStep 1 of 6 🏪\n"
-                "What is your business name?" if intro else
-                f"{head}\nWhat is your business name?")
+        body = t("setup_intro") if intro else t("setup_name", head=head)
     elif step == 2:
-        body = f"{head}\nWhat is your shop address? (or 'skip')"
+        body = t("setup_address", head=head)
     elif step == 3:
-        body = (f"{head}\nI'll use {shop_id} as your contact number."
-                "\nReply Yes to keep it, or send another number.")
+        body = t("setup_phone", head=head, shop=shop_id)
     elif step == 4:
-        body = ("🖼️ *Step 4 of 6: Logo*\nJust send your logo as a photo,"
-                " no caption needed. Or reply *skip*.")
+        body = t("setup_logo")
     elif step == 5:
-        body = (f"{head}\nWhat is your opening float? Reply like"
-                " '1500 cash, 300 petty'.")
+        body = t("setup_float", head=head)
+    elif step == 6:
+        body = t("setup_lang", head=head)
     else:
-        body = f"{head}\nWhich language? Reply English or isiZulu."
+        body = t("setup_plan", head=head)
     paused = _flag(conn, shop_id, "setup-paused")
     if paused and not intro:
         conn.execute("DELETE FROM flags WHERE shop_id = ? AND key = 'setup-paused'",
                      (shop_id,))
         conn.commit()
-        return f"Let's finish setting up, step {step} of {TOTAL} {STEPS[step]}\n\n{body}"
+        return t("setup_resume", n=step, total=TOTAL, emoji=STEPS[step],
+                 body=body)
     return body
 
 
@@ -137,7 +140,8 @@ def answer(conn: sqlite3.Connection, shop_id: str, sender: str, text: str) -> st
     except Exception:
         log.warning("setup advance failed; finishing", exc_info=True)
         return _safe_finish(conn, shop_id)
-    return f"⚠️ Skipped step {step} — let's keep going.\n\n{nxt}"
+    from app.i18n import t
+    return t("setup_skipped", n=step, next=nxt)
 
 
 def _safe_finish(conn: sqlite3.Connection, shop_id: str) -> str:
@@ -148,32 +152,41 @@ def _safe_finish(conn: sqlite3.Connection, shop_id: str) -> str:
         _set_flag(conn, shop_id, "setup-done", "1")
     except Exception:
         log.warning("safe finish flag write failed", exc_info=True)
-    return "✅ *You're all set!*\n\nTry 'sold 2 bread' or 'cash up'."
+    from app.i18n import t
+    return t("setup_safe")
+
+
+BACK_WORDS = ("back", "buyela", "terug")
+SKIP_WORDS = ("skip", "yeqa", "slaan oor", "tsiba")
+CHANGE_PREFIXES = ("change ", "verander ", "shintsha ", "tshintsha ")
 
 
 def _answer(conn: sqlite3.Connection, shop_id: str, sender: str, text: str) -> str:
     """Handle one setup reply. Returns the next prompt or the finish card."""
     from app.agent import _parse_float
+    from app.i18n import CURRENT_LANG, normalize_lang, t
     from app.tools import set_float, set_shop_address, set_shop_name, set_shop_phone
     step = setup_step(conn, shop_id) or 1
     word = " ".join((text or "").strip().lower().split())
-    if word == "back":
+    if word in BACK_WORDS:
         return _goto(conn, shop_id, max(1, step - 1))
-    if word.startswith("change "):
-        target = CHANGE_WORDS.get(word[7:].strip())
-        if target is None:
-            return ("Which part? Say 'change name', 'address', 'phone',"
-                    f" 'logo', 'float' or 'language'.\n\n{step_prompt(conn, shop_id, step)}")
-        _set_flag(conn, shop_id, "setup-return", str(step))
-        return _goto(conn, shop_id, target)
+    for prefix in CHANGE_PREFIXES:
+        if word.startswith(prefix):
+            target = CHANGE_WORDS.get(word[len(prefix):].strip())
+            if target is None:
+                return t("setup_which",
+                         prompt=step_prompt(conn, shop_id, step))
+            _set_flag(conn, shop_id, "setup-return", str(step))
+            return _goto(conn, shop_id, target)
     if step == 1:
         name = (text or "").strip()
         if not name or len(name) < 2:
-            return f"Give me your business name.\n\n{step_prompt(conn, shop_id, 1)}"
+            return t("setup_name_invalid",
+                     prompt=step_prompt(conn, shop_id, 1))
         set_shop_name(conn, shop_id, name[:60])
-        return _advance(conn, shop_id, 1, f"✅ *{name[:60]}* — nice name.")
+        return _advance(conn, shop_id, 1, t("setup_name_nice", name=name[:60]))
     if step == 2:
-        if word != "skip":
+        if word not in SKIP_WORDS:
             set_shop_address(conn, shop_id, (text or "").strip()[:120])
         return _advance(conn, shop_id, 2, None)
     if step == 3:
@@ -183,33 +196,59 @@ def _answer(conn: sqlite3.Connection, shop_id: str, sender: str, text: str) -> s
         else:
             digits = "".join(c for c in (text or "") if c.isdigit())
             if len(digits) < 9:
-                return ("Send a valid number, or reply Yes to keep"
-                        f" {sender}.\n\n{step_prompt(conn, shop_id, 3)}")
+                return t("setup_phone_invalid", sender=sender,
+                         prompt=step_prompt(conn, shop_id, 3))
             set_shop_phone(conn, shop_id, digits)
         return _advance(conn, shop_id, 3, None)
     if step == 4:
-        if word == "skip":
+        if word in SKIP_WORDS:
             return _advance(conn, shop_id, 4, None)
-        return ("Send your logo as a photo, or reply 'skip'.\n\n"
-                f"{step_prompt(conn, shop_id, 4)}")
+        return t("setup_logo_send", prompt=step_prompt(conn, shop_id, 4))
     if step == 5:
         amounts = _parse_float(f"float {(text or '')}")
         if not amounts:
-            return ("Tell me the float like '1500 cash, 300 petty'.\n\n"
-                    f"{step_prompt(conn, shop_id, 5)}")
+            return t("setup_float_invalid",
+                     prompt=step_prompt(conn, shop_id, 5))
         set_float(conn, shop_id, amounts)
         return _advance(conn, shop_id, 5, None)
-    if word in ("english", "en"):
-        conn.execute("UPDATE shops SET language = 'en' WHERE shop_id = ?",
+    if step == 6:
+        code = normalize_lang(word)
+        if code is not None:
+            conn.execute("UPDATE shops SET language = ? WHERE shop_id = ?",
+                         (code, shop_id))
+            conn.commit()
+            CURRENT_LANG.set(code)
+            return _advance(conn, shop_id, 6, None)
+        return t("setup_lang_invalid", prompt=step_prompt(conn, shop_id, 6))
+    return _answer_plan(conn, shop_id, word, text)
+
+
+PLAN_YES = ("yes", "y", "yebo", "yeah", "ja", "ewe", "ok", "okay", "sharp",
+            "shap", "sure", "on", "please")
+PLAN_NO = ("no", "nope", "nah", "nee", "off", "hayi", "cha", "aikona")
+
+
+def _answer_plan(conn: sqlite3.Connection, shop_id: str, word: str,
+                 text: str) -> str:
+    """Step 7: daily plan Yes / time / No, then the finish card."""
+    from app.i18n import t
+    from app.reminders import parse_bare_time
+    if word in PLAN_YES:
+        conn.execute("DELETE FROM flags WHERE shop_id = ? AND key = 'plan_off'",
                      (shop_id,))
         conn.commit()
         return _finish(conn, shop_id)
-    if word in ("isizulu", "zulu", "zu"):
-        conn.execute("UPDATE shops SET language = 'zu' WHERE shop_id = ?",
+    if word in PLAN_NO:
+        _set_flag(conn, shop_id, "plan_off", "1")
+        return _finish(conn, shop_id)
+    hm = parse_bare_time(text)
+    if hm is not None:
+        _set_flag(conn, shop_id, "plan_time", f"{hm[0]:02d}:{hm[1]:02d}")
+        conn.execute("DELETE FROM flags WHERE shop_id = ? AND key = 'plan_off'",
                      (shop_id,))
         conn.commit()
         return _finish(conn, shop_id)
-    return f"Reply English or isiZulu.\n\n{step_prompt(conn, shop_id, 6)}"
+    return t("setup_plan_invalid", prompt=step_prompt(conn, shop_id, 7))
 
 
 def _goto(conn: sqlite3.Connection, shop_id: str, step: int) -> str:
@@ -236,6 +275,16 @@ POLISH_TIMEOUT_S = 60
 LOGO_READY = "🖼️ Your logo is ready"
 LOGO_FAILED = ("⚠️ I couldn't clean up your logo. Send a clearer photo"
                " with the caption logo any time.")
+
+
+def _logo_ready() -> str:
+    from app.i18n import t
+    return t("logo_ready")
+
+
+def _logo_failed() -> str:
+    from app.i18n import t
+    return t("logo_failed")
 
 
 def _sniff_ext(image: bytes) -> str:
@@ -270,8 +319,10 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes) -> str | 
         request_polish(conn, shop_id)
     except Exception:
         log.warning("setup logo save failed", exc_info=True)
-        return f"⚠️ Skipped the logo — let's keep going.\n\n{_advance(conn, shop_id, 4, None)}"
-    ack = "✅ Logo received, I'll polish it in the background."
+        from app.i18n import t
+        return t("setup_logo_skipped", next=_advance(conn, shop_id, 4, None))
+    from app.i18n import t
+    ack = t("logo_received")
     return f"{ack}\n\n{_advance(conn, shop_id, 4, None)}"
 
 
@@ -386,12 +437,10 @@ def _finish(conn: sqlite3.Connection, shop_id: str) -> str:
         conn.commit()
     brand = _reports.shop_brand(conn, shop_id)
     _reports.ensure_dirs()
-    out = (f"✅ *You're all set, {brand['name']}!*\n\nTry these:\n"
-           "• 'sold 2 bread' — record a sale\n"
-           "• 'Sipho took 1 coke' — credit sale\n"
-           "• 'cash up' — today's totals")
-    if _queue_header_card(conn, shop_id, "Your branded header"):
-        out += "\n\n📎 Your header preview below."
+    from app.i18n import t
+    out = t("setup_done", name=brand["name"])
+    if _queue_header_card(conn, shop_id, t("cap_header")):
+        out += t("setup_card_below")
     note = flush_logo(conn, shop_id)
     if note:
         out += f"\n\n{note}"
@@ -403,6 +452,7 @@ def _queue_header_card(conn: sqlite3.Connection, shop_id: str,
     """Queue the branded header preview. False when no public URL is set."""
     from app import reports as _reports
     from app.agent import queue_media as _queue
+    from app.i18n import doc_lang, owner_lang
     base = os.environ.get("SISI_PUBLIC_URL", "").rstrip("/")
     if not base:
         return False
@@ -410,7 +460,8 @@ def _queue_header_card(conn: sqlite3.Connection, shop_id: str,
     _reports.ensure_dirs()
     safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
     card = str(_reports.REPORTS_DIR / f"{safe}-profile.png")
-    _reports.render_shop_card(brand, card)
+    with doc_lang(owner_lang(conn, shop_id)):
+        _reports.render_shop_card(brand, card)
     token = _reports.store_card(conn, shop_id, "profile", card)
     _queue(shop_id, [{"kind": "image", "url": f"{base}/media/{token}?f=png",
                       "caption": caption, "filename": ""}])
@@ -435,14 +486,15 @@ def logo_result(conn: sqlite3.Connection,
                  (shop_id,))
     conn.commit()
     if state != "done":
-        return (LOGO_FAILED, []) if state == "failed" else None
+        return (_logo_failed(), []) if state == "failed" else None
     from app.agent import MEDIA_OUTBOX
+    from app.i18n import t
     before = len(MEDIA_OUTBOX.get(shop_id, []))
-    if _queue_header_card(conn, shop_id, "Your polished logo"):
+    if _queue_header_card(conn, shop_id, t("cap_logo")):
         media = MEDIA_OUTBOX.get(shop_id, [])[before:]
         del MEDIA_OUTBOX[shop_id][before:]
-        return f"{LOGO_READY} — preview below.", media
-    return LOGO_READY, []
+        return _logo_ready() + t("logo_ready_below"), media
+    return _logo_ready(), []
 
 
 def flush_logo(conn: sqlite3.Connection, shop_id: str) -> str | None:

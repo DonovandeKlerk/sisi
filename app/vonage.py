@@ -19,6 +19,7 @@ import re
 import httpx
 
 from app.net import call_with_retries
+from app.sendqueue import RateLimited
 from app.voice import VoiceError
 from app.whatsapp import IncomingMessage, WhatsAppSender, split_message
 
@@ -30,6 +31,13 @@ DEFAULT_WHATSAPP_FROM = "14157386102"
 
 def _digits(number: str) -> str:
     return re.sub(r"\D", "", number or "")
+
+
+def _retry_after(response) -> float | None:
+    try:
+        return max(0.0, float(response.headers.get("retry-after", "")))
+    except (ValueError, TypeError, AttributeError):
+        return None
 
 
 class VonageSender(WhatsAppSender):
@@ -61,6 +69,11 @@ class VonageSender(WhatsAppSender):
             call_with_retries(send)
         except httpx.HTTPStatusError as e:
             status = e.response.status_code if e.response is not None else "?"
+            if status == 429:
+                retry_after = _retry_after(e.response)
+                log.warning("vonage 429 to=%s retry-after=%s", data["to"],
+                            retry_after)
+                raise RateLimited(retry_after) from e
             text = e.response.text[:300] if e.response is not None else ""
             log.error("vonage reply failed to=%s status=%s body=%s", data["to"], status, text)
             raise
@@ -86,11 +99,19 @@ class VonageSender(WhatsAppSender):
             resp = httpx.post(VONAGE_MESSAGES_URL, auth=(self.api_key, self.api_secret),
                               json=data, timeout=20)
             resp.raise_for_status()
-            log.info("vonage %s sent to=%s status=%s", message_type,
-                     data["to"], resp.status_code)
+            log.info("vonage %s sent to=%s status=%s url=%s", message_type,
+                     data["to"], resp.status_code, payload.get("url", ""))
             return resp.json()
 
-        call_with_retries(send)
+        try:
+            call_with_retries(send)
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code if e.response is not None else "?"
+            if status == 429:
+                log.warning("vonage 429 to=%s url=%s", data["to"],
+                            payload.get("url", ""))
+                raise RateLimited(_retry_after(e.response)) from e
+            raise
 
     def send_image(self, to: str, url: str, caption: str = "") -> None:
         self._post_media(to, "image", {"url": url, "caption": caption[:1000]})

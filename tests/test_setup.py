@@ -44,7 +44,7 @@ def _run(conn, shop, answers):
 def test_new_number_starts_setup(conn):
     msg, buttons = handle_text(conn, SHOP, "hello")
     assert buttons is None
-    assert "Step 1 of 6" in msg and "business name" in msg
+    assert "Step 1 of 7" in msg and "business name" in msg
     assert setup_step(conn, SHOP) == 1
 
 
@@ -52,15 +52,17 @@ def test_full_flow_with_skips(conn):
     _run(conn, SHOP, ["hi", "Kwamama Spaza"])
     assert setup_step(conn, SHOP) == 2
     out = _run(conn, SHOP, ["skip", "yes"])
-    assert "Step 4 of 6" in out[1]
+    assert "Step 4 of 7" in out[1]
     out = _run(conn, SHOP, ["skip"])
-    assert "Step 5 of 6" in out[0]
+    assert "Step 5 of 7" in out[0]
     out = _run(conn, SHOP, ["1500 cash, 300 petty"])
-    assert "Step 6 of 6" in out[0]
+    assert "Step 6 of 7" in out[0]
     assert account_balance(conn, SHOP, "cash") == 150000
     assert account_balance(conn, SHOP, "petty") == 30000
     out = _run(conn, SHOP, ["isiZulu"])
-    assert out[0].startswith("✅ *You're all set, Kwamama Spaza!*")
+    assert "Isinyathelo 7 kwezi-7" in out[0] and "Icebo" in out[0]
+    out = _run(conn, SHOP, ["yes"])
+    assert out[0].startswith("✅ *Sewuhleliwe, Kwamama Spaza!*")
     assert "sold 2 bread" in out[0]
     assert setup_step(conn, SHOP) is None
     shop = ensure_shop(conn, SHOP)
@@ -75,7 +77,7 @@ def test_logo_photo_step(conn, monkeypatch):
     _run(conn, SHOP, ["hi", "Shop", "12 Main Rd", "0820000001"])
     assert setup_step(conn, SHOP) == 4
     _, reply, _ = handle_photo(conn, SHOP, _photo())
-    assert "Logo received" in reply and "Step 5 of 6" in reply
+    assert "Logo received" in reply and "Step 5 of 7" in reply
     shop = ensure_shop(conn, SHOP)
     assert shop["logo_orig_path"] != ""  # original saved immediately
     assert shop["logo_path"] == ""  # cut-out still polishing
@@ -84,19 +86,19 @@ def test_logo_photo_step(conn, monkeypatch):
 def test_photo_before_logo_step_redirects(conn):
     handle_text(conn, SHOP, "hi")
     _, reply, _ = handle_photo(conn, SHOP, _photo())
-    assert "finish setting up" in reply and "Step 1 of 6" in reply
+    assert "finish setting up" in reply and "Step 1 of 7" in reply
 
 
 def test_back_and_change(conn):
     _run(conn, SHOP, ["hi", "First Name", "Somewhere"])
     assert setup_step(conn, SHOP) == 3
     out = _run(conn, SHOP, ["back"])
-    assert "Step 2 of 6" in out[0]
+    assert "Step 2 of 7" in out[0]
     _run(conn, SHOP, ["Elsewhere"])
     out = _run(conn, SHOP, ["change name"])
-    assert "Step 1 of 6" in out[0]
+    assert "Step 1 of 7" in out[0]
     out = _run(conn, SHOP, ["Better Name"])
-    assert "Step 3 of 6" in out[0]  # returned to where we were
+    assert "Step 3 of 7" in out[0]  # returned to where we were
     assert ensure_shop(conn, SHOP)["name"] == "Better Name"
 
 
@@ -105,14 +107,15 @@ def test_resume_after_help(conn):
     msg, _ = handle_text(conn, SHOP, "help")
     assert "Demo help" in msg
     msg, _ = handle_text(conn, SHOP, "yes")
-    assert msg.startswith("Let's finish setting up, step 4 of 6")
+    assert msg.startswith("Let's finish setting up, step 4 of 7")
 
 
 def test_setup_command_restarts(conn):
-    _run(conn, SHOP, ["hi", "Shop", "Addr", "yes", "skip", "100 cash", "english"])
+    _run(conn, SHOP, ["hi", "Shop", "Addr", "yes", "skip", "100 cash", "english",
+                       "yes"])
     assert setup_step(conn, SHOP) is None
     msg, _ = handle_text(conn, SHOP, "setup")
-    assert "Step 1 of 6" in msg
+    assert "Step 1 of 7" in msg
 
 
 def test_shops_with_books_skip_setup(conn, monkeypatch):
@@ -129,9 +132,9 @@ def test_shops_with_books_skip_setup(conn, monkeypatch):
 def test_reset_demo_runs_setup_then_reseeds(conn):
     from seed.seed_random import DEMO_NUMBER
     msg, _ = handle_text(conn, DEMO_NUMBER, "reset demo")
-    assert "Step 1 of 6" in msg
+    assert "Step 1 of 7" in msg
     _run(conn, DEMO_NUMBER, ["Fresh Spaza", "skip", "yes", "skip",
-                             "100 cash", "english"])
+                             "100 cash", "english", "yes"])
     n = conn.execute("SELECT COUNT(*) n FROM products WHERE shop_id = ?",
                      (DEMO_NUMBER,)).fetchone()["n"]
     assert 25 <= n <= 30
@@ -149,7 +152,7 @@ def test_reset_shop_needs_confirmation(conn):
                      (SHOP,)).fetchone()["n"]
     assert n == 1  # nothing wiped yet
     msg, _ = handle_text(conn, SHOP, "yes erase everything")
-    assert "Step 1 of 6" in msg
+    assert "Step 1 of 7" in msg
     n = conn.execute("SELECT COUNT(*) n FROM products WHERE shop_id = ?",
                      (SHOP,)).fetchone()["n"]
     assert n == 0
@@ -168,5 +171,5 @@ def test_setup_prompts_follow_style(conn):
     from app.setup import start_setup, step_prompt
     ensure_shop(conn, SHOP)
     assert_format(start_setup(conn, SHOP))
-    for step in range(1, 7):
+    for step in range(1, 8):
         assert_format(step_prompt(conn, SHOP, step))

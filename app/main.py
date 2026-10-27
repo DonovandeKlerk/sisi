@@ -20,6 +20,8 @@ from fastapi.responses import FileResponse, PlainTextResponse
 
 from app.agent import handle_photo, handle_text, handle_voice, take_media
 from app.db import connect, init_db, now_iso
+from app.i18n import CURRENT_LANG, STRINGS, detect, owner_lang
+from app.i18n import t as _t
 from app.vision import VisionError
 from app.voice import VoiceError
 from app.vonage import VonageSender, download_vonage_media, parse_vonage_webhook
@@ -37,10 +39,8 @@ log = logging.getLogger("sisi")
 
 app = FastAPI(title="Sisi")
 
-UNSUPPORTED_REPLY = "I can't read that kind of message yet. Send text, a voice note, or a photo of the dates."
-CONSENT_LINE = ("PS: I keep your shop records on this number so I can help."
-                " Reply 'delete my data' any time to erase them.\n"
-                "Tell me your till float once, e.g. 'float R500'.")
+UNSUPPORTED_REPLY = STRINGS["en"]["unsupported"]
+CONSENT_LINE = STRINGS["en"]["consent_ps"]
 MAX_WEBHOOK_BYTES = 256 * 1024
 
 # Per-shop inbound rate limit (sliding window). In-memory: correct for a single
@@ -182,7 +182,7 @@ def _with_consent(conn, shop_id: str, reply: str) -> str:
     conn.execute("UPDATE shops SET consent_given_at = ? WHERE shop_id = ?",
                  (now_iso(), shop_id))
     conn.commit()
-    return reply + "\n\n" + CONSENT_LINE
+    return reply + "\n\n" + _t("consent_ps")
 
 
 def _download_msg_media(msg: IncomingMessage, label: str) -> bytes | None:
@@ -194,23 +194,23 @@ def _download_msg_media(msg: IncomingMessage, label: str) -> bytes | None:
     return None
 
 
-FRIENDLY_ERROR = "😅 Something went wrong, please try again."
+FRIENDLY_ERROR = STRINGS["en"]["friendly_error"]
 
 
 def _slow_line(conn, msg: IncomingMessage) -> str | None:
     """Busy indicator for slow work. None when the reply will be instant."""
     from app.agent import slow_status
     if msg.kind == "media:audio":
-        return "⏳ Listening to your voice note…"
+        return _t("busy_voice")
     if msg.kind == "media:image":
         if (msg.caption or "").strip().lower() == "logo":
-            return "⏳ Working on your logo…"
+            return _t("busy_logo")
         from app.setup import setup_step
         from app.tools import resolve_sender
         owner, staff = resolve_sender(conn, msg.shop_id)
         if staff is None and setup_step(conn, owner) == 4:
-            return "⏳ Working on your logo…"
-        return "⏳ Reading your photo…"
+            return _t("busy_logo")
+        return _t("busy_photo")
     if msg.kind == "text" and msg.text:
         return slow_status(msg.text)
     return None
@@ -218,6 +218,7 @@ def _slow_line(conn, msg: IncomingMessage) -> str | None:
 
 def process_message(msg: IncomingMessage) -> None:
     """Background worker: one message, own connection, never raises."""
+    CURRENT_LANG.set("en")
     try:
         log.info("handling id=%s channel=%s kind=%s shop=%s", msg.message_id,
                  msg.channel, msg.kind, msg.shop_id)
@@ -230,7 +231,9 @@ def process_message(msg: IncomingMessage) -> None:
         except Exception:
             log.error("process_message failed:\n%s", traceback.format_exc())
             try:
-                sender.send_text(msg.shop_id, FRIENDLY_ERROR)
+                from app.sendqueue import send_immediate
+                send_immediate(msg.channel or "meta", msg.shop_id, "text",
+                               {"body": _t("friendly_error")})
             except Exception:
                 log.error("friendly fallback failed:\n%s", traceback.format_exc())
     except Exception:
@@ -240,65 +243,68 @@ def process_message(msg: IncomingMessage) -> None:
 def _handle_message(sender, msg: IncomingMessage) -> None:
     """Handle one message; raises to process_message for the friendly fallback."""
     from app.reports import ensure_dirs
+    from app.sendqueue import QueuedSender
     ensure_dirs()
     conn = connect()
     try:
         init_db(conn)
         from app.tools import ensure_shop
         ensure_shop(conn, msg.shop_id)
+        channel = msg.channel or "meta"
         conn.execute("UPDATE shops SET channel = ? WHERE shop_id = ?",
-                     (msg.channel or "meta", msg.shop_id))
+                     (channel, msg.shop_id))
         conn.commit()
+        CURRENT_LANG.set(detect(msg.text, default=owner_lang(conn, msg.shop_id)))
+        out = QueuedSender.wrap(sender, conn, channel)
         try:
             line = _slow_line(conn, msg)
             if line:
-                sender.send_text(msg.shop_id, line)
+                out.send_text(msg.shop_id, line)
+                out.flush()
         except Exception:
             log.warning("status line failed", exc_info=True)
         if msg.kind == "media:audio":
             try:
                 audio = _download_msg_media(msg, "voice note")
                 if audio is None:
-                    sender.send_text(msg.shop_id, "That voice note came out empty."
-                                                  " Send it again?")
+                    out.send_text(msg.shop_id, _t("empty_voice"))
+                    out.flush()
                     return
                 _, reply, buttons = handle_voice(conn, msg.shop_id, audio, ".ogg")
             except VoiceError as e:
-                sender.send_text(msg.shop_id, str(e))
+                out.send_text(msg.shop_id, str(e))
+                out.flush()
                 return
         elif msg.kind == "media:image":
             try:
                 image = _download_msg_media(msg, "photo")
                 if image is None:
-                    sender.send_text(msg.shop_id, "That photo came out empty. Send it again?")
+                    out.send_text(msg.shop_id, _t("empty_photo"))
+                    out.flush()
                     return
                 _, reply, buttons = handle_photo(conn, msg.shop_id, image,
                                                  msg.caption or "")
             except (VisionError, VoiceError) as e:
-                sender.send_text(msg.shop_id, str(e))
+                out.send_text(msg.shop_id, str(e))
+                out.flush()
                 return
         elif msg.text is None:
-            reply, buttons = UNSUPPORTED_REPLY, None
+            reply, buttons = _t("unsupported"), None
         else:
             reply, buttons = handle_text(conn, msg.shop_id, msg.text)
         reply = _with_consent(conn, msg.shop_id, reply)
+        items = take_media(msg.shop_id)
+        for item in [i for i in items if i.get("first")]:
+            out.send_media_item(msg.shop_id, item)
+        if buttons:
+            out.send_buttons(msg.shop_id, reply, buttons)
+        else:
+            out.send_text(msg.shop_id, reply)
+        for item in [i for i in items if not i.get("first")]:
+            out.send_media_item(msg.shop_id, item)
+        out.flush()
     finally:
         conn.close()
-    if buttons:
-        sender.send_buttons(msg.shop_id, reply, buttons)
-    else:
-        sender.send_text(msg.shop_id, reply)
-    for item in take_media(msg.shop_id):
-        try:
-            if item.get("kind") == "file":
-                sender.send_file(msg.shop_id, item["url"],
-                                 item.get("filename") or "sisi-report.pdf",
-                                 item.get("caption") or "")
-            else:
-                sender.send_image(msg.shop_id, item["url"],
-                                  item.get("caption") or "")
-        except Exception:
-            log.error("media send failed:\n%s", traceback.format_exc())
     log.info("%s -> %s (%s)", msg.shop_id, msg.message_id,
              "buttons" if buttons else "text")
 

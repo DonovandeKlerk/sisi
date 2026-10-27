@@ -84,6 +84,8 @@ def test_book_confirm_applies_everything(conn):
 
 def test_undo_book_reverses_page(conn):
     seed_demo(SHOP, conn)
+    conn.execute("UPDATE shops SET language = 'en' WHERE shop_id = ?", (SHOP,))
+    conn.commit()
     propose_book_page(conn, SHOP, _book())
     confirm_pending(conn, SHOP)
     msg, _ = handle_text(conn, SHOP, "undo book")
@@ -100,6 +102,8 @@ def test_undo_book_skips_newer_actions(conn):
     from app.tools import record_sale
 
     seed_demo(SHOP, conn)
+    conn.execute("UPDATE shops SET language = 'en' WHERE shop_id = ?", (SHOP,))
+    conn.commit()
     propose_book_page(conn, SHOP, _book())
     confirm_pending(conn, SHOP)
     record_sale(conn, SHOP, "Simba Chips 120g", 1)
