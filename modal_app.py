@@ -20,7 +20,7 @@ import modal
 
 image = (
     modal.Image.debian_slim()
-    .apt_install("ffmpeg")
+    .apt_install("ffmpeg", "fonts-dejavu-core")
     .pip_install_from_requirements("requirements.txt")
     # Bake the app package into the image (deploy uploads only modal_app.py).
     .add_local_dir("app", remote_path="/root/app",
@@ -46,4 +46,5 @@ def web():
     # Force the volume path: a local SISI_DB value from the secret would
     # silently write to the container's ephemeral disk and lose shop data.
     os.environ["SISI_DB"] = "/data/sisi.db"
+    os.environ.setdefault("SISI_REPORTS", "/data/reports")
     return fastapi_app

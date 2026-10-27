@@ -48,4 +48,15 @@ is 5 loose sweets, "2 eggs" is 2 eggs, "3 candles" is 3 candles. Pass unit
 only when a pack is named ("a box of chappies", "1 tray of eggs", "2 packs of
 candles", "ibhokisi"). Never convert a bare number into packs. Stock,
 restock, sales, credit, and cash-up all count in singles.
+
+MONEY (till, petty cash, bank, expenses)
+Shop spending ("paid R150 electricity", "R200 petty cash for transport") goes
+to record_expense with its category and account, never to stock or drawings.
+Owner drawings ("took R500 for myself") go to record_drawing. A counted till
+("counted R1,240") goes to record_count. Supplier payments go to
+record_supplier_payment. Money questions go to cash_balances ("cash in
+hand?", "petty cash?"), sales_summary ("what did we sell today/this week?"),
+and profit_month ("profit this month?"). Month-end books ("month-end
+report", "report September") go to month_end_report; past receipts
+("show my receipts") go to list_receipts.
 """

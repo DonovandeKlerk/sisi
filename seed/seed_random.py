@@ -154,22 +154,126 @@ def seed_random_shop(shop_id: str = DEMO_NUMBER,
                 (aid, shop_id, f"seed credit {name}",
                  json.dumps({"customer": name, "amount_cents": amount}), ts),
             )
+        # A trailing month of books: float, daily sales (cash + credit),
+        # wholesaler receipts, expenses, drawings and credit collected.
         names = list(prod_ids)
-        sale_no = 0
-        for back in (1, 2, 3):
-            day = (today - timedelta(days=back)).isoformat()
+        prices = {n: conn.execute("SELECT price_cents FROM products WHERE id = ?",
+                                  (prod_ids[n],)).fetchone()["price_cents"]
+                  for n in names}
+        first_day = today - timedelta(days=29)
+        move_no = sale_no = 0
+
+        def _move(account, amount, kind, day_ts, category="", note=""):
+            nonlocal move_no
+            conn.execute(
+                """INSERT INTO cash_moves (shop_id, account, amount_cents, kind,
+                   category, note, action_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (shop_id, account, amount, kind, category, note,
+                 f"seed-{shop_id}-move-{move_no}", day_ts),
+            )
+            move_no += 1
+
+        _move("cash", 150000, "float", f"{first_day}T08:00:00.000Z",
+              note="opening float")
+        _move("petty", 30000, "float", f"{first_day}T08:00:00.000Z",
+              note="opening float")
+        day_no = 0
+        for back in range(29, -1, -1):
+            day = today - timedelta(days=back)
+            day_ts = f"{day}T10:00:00.000Z"
             for _ in range(rng.randint(3, 6)):
                 name = rng.choice(names)
                 qty = rng.randint(1, 3)
-                price = conn.execute("SELECT price_cents FROM products WHERE id = ?",
-                                     (prod_ids[name],)).fetchone()["price_cents"]
-                conn.execute(
-                    """INSERT INTO sales (shop_id, product_id, product_name, qty,
-                       total_cents, action_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (shop_id, prod_ids[name], name, qty, price * qty,
-                     f"seed-{shop_id}-sale-{sale_no}", f"{day}T10:00:00.000Z"),
-                )
+                total = prices[name] * qty
+                if rng.random() < 0.25:
+                    cust = rng.choice(CREDIT_CUSTOMERS)
+                    cid = cust_ids[cust]
+                    aid = f"seed-{shop_id}-sale-{sale_no}"
+                    conn.execute(
+                        """INSERT INTO sales (shop_id, product_id, product_name,
+                           qty, total_cents, customer_id, action_id, created_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (shop_id, prod_ids[name], name, qty, total, cid, aid,
+                         day_ts),
+                    )
+                    conn.execute(
+                        """INSERT INTO credit_entries (shop_id, customer_id,
+                           amount_cents, items_text, action_id, created_at)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
+                        (shop_id, cid, total, name, f"{aid}-ce", day_ts),
+                    )
+                else:
+                    conn.execute(
+                        """INSERT INTO sales (shop_id, product_id, product_name,
+                           qty, total_cents, action_id, created_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (shop_id, prod_ids[name], name, qty, total,
+                         f"seed-{shop_id}-sale-{sale_no}", day_ts),
+                    )
+                    _move("cash", total, "sale", day_ts, note=name)
                 sale_no += 1
+            if day_no % 7 == 3:
+                lines, total = [], 0
+                for ln in range(rng.randint(2, 3)):
+                    name = rng.choice(names)
+                    packs = rng.randint(1, 2)
+                    unit = _cents(rng, 1000, 6000)
+                    line_total = packs * unit
+                    total += line_total
+                    lines.append({"item": name, "qty_text": f"{packs} packs",
+                                  "total": line_total})
+                account = ["cash", "petty", "supplier"][day_no // 7 % 3]
+                conn.execute(
+                    """INSERT INTO receipts (shop_id, supplier, account, total_cents,
+                       data_json, action_id, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (shop_id, WHOLESALER, account, total, json.dumps(lines),
+                     f"seed-{shop_id}-rcpt-{day_no}", day_ts),
+                )
+                if account == "supplier":
+                    conn.execute(
+                        """INSERT INTO supplier_moves (shop_id, supplier,
+                           amount_cents, action_id, created_at)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (shop_id, WHOLESALER, total,
+                         f"seed-{shop_id}-rcpt-{day_no}", day_ts),
+                    )
+                else:
+                    _move(account, -total, "purchase", day_ts, note="Jumbo stock")
+            if day_no % 3 == 1:
+                cat = rng.choice(["electricity", "transport", "airtime", "wages"])
+                amount = rng.randrange(5000, 30000, 500)
+                conn.execute(
+                    """INSERT INTO expenses (shop_id, category, amount_cents,
+                       account, action_id, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (shop_id, cat, amount, "petty",
+                     f"seed-{shop_id}-exp-{day_no}", day_ts),
+                )
+                _move("petty", -amount, "expense", day_ts, category=cat)
+            if day_no in (10, 22):
+                amount = rng.randrange(20000, 50000, 1000)
+                _move("cash", -amount, "drawing", day_ts, note="owner")
+            if day_no in (12, 24):
+                cust = CREDIT_CUSTOMERS[day_no % len(CREDIT_CUSTOMERS)]
+                amount = rng.randrange(2000, 8000, 100)
+                conn.execute(
+                    """INSERT INTO payments (shop_id, customer_id, amount_cents,
+                       action_id, created_at) VALUES (?, ?, ?, ?, ?)""",
+                    (shop_id, cust_ids[cust], amount,
+                     f"seed-{shop_id}-pay-{day_no}", day_ts),
+                )
+                _move("cash", amount, "credit_payment", day_ts, note=cust)
+            if day_no == 20:
+                _move("cash", -15000, "supplier_payment", day_ts, note="Jumbo")
+                conn.execute(
+                    """INSERT INTO supplier_moves (shop_id, supplier, amount_cents,
+                       action_id, created_at) VALUES (?, ?, ?, ?, ?)""",
+                    (shop_id, WHOLESALER, -15000,
+                     f"seed-{shop_id}-suppay", day_ts),
+                )
+            day_no += 1
         fresh = [n for n in names if n in SHORT_LIFE] or names
         for name, ahead in zip(rng.sample(fresh, min(2, len(fresh))), (2, 5)):
             conn.execute(

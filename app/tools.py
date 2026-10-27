@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import json
 import math
+import re
 import sqlite3
 import uuid
 from datetime import date, datetime, timedelta, timezone
@@ -223,7 +224,12 @@ def confirm_pending(conn: sqlite3.Connection, shop_id: str) -> str:
         conn.commit()
         return "That preview expired. Please ask again."
     action_id = _action_id()
-    message, kind, summary, undo = apply(conn, shop_id, json.loads(row["payload_json"]), action_id)
+    payload = json.loads(row["payload_json"])
+    message, kind, summary, undo = apply(conn, shop_id, payload, action_id)
+    if payload.get("photo_hash"):
+        photo_kind = {"expiry_note": "expiry", "book_page": "book_page",
+                      "receipt": "receipt"}.get(row["action_type"], "")
+        record_photo(conn, shop_id, payload["photo_hash"], photo_kind)
     conn.execute(
         "INSERT INTO actions (action_id, shop_id, kind, summary, data_json) VALUES (?, ?, ?, ?, ?)",
         (action_id, shop_id, kind, summary, json.dumps(undo)),
@@ -418,6 +424,8 @@ def _apply_record_payment(conn: sqlite3.Connection, shop_id: str, payload: dict,
         "INSERT INTO payments (shop_id, customer_id, amount_cents, action_id) VALUES (?, ?, ?, ?)",
         (shop_id, payload["customer_id"], payload["amount_cents"], action_id),
     )
+    _post_cash(conn, shop_id, payload.get("account", "cash"), payload["amount_cents"],
+               "credit_payment", action_id, ref_type="payment", ref_id=cur.lastrowid)
     bal = balance_cents(conn, shop_id, payload["customer_id"])
     return (
         f"✅ *Saved*\n• {payload['customer']} paid {cents_to_rand(payload['amount_cents'])}\n"
@@ -428,7 +436,8 @@ def _apply_record_payment(conn: sqlite3.Connection, shop_id: str, payload: dict,
     )
 
 
-def record_payment(conn: sqlite3.Connection, shop_id: str, customer: str, amount_cents: int) -> str:
+def record_payment(conn: sqlite3.Connection, shop_id: str, customer: str, amount_cents: int,
+                   account: str | None = None) -> str:
     ensure_shop(conn, shop_id)
     cust = _get_customer(conn, shop_id, customer or "")
     if cust is None:
@@ -439,14 +448,169 @@ def record_payment(conn: sqlite3.Connection, shop_id: str, customer: str, amount
         return "How much did they pay?"
     if amount <= 0:
         return "How much did they pay?"
-    payload = {"customer_id": cust["id"], "customer": cust["name"], "amount_cents": amount}
+    acct = _clean_account(account)
+    payload = {"customer_id": cust["id"], "customer": cust["name"], "amount_cents": amount,
+               "account": acct}
     with _dry_run(conn):
         _apply_record_payment(conn, shop_id, payload, _action_id())
         new_bal = balance_cents(conn, shop_id, cust["id"])
+    preview = (f"📝 *Save payment?*\n• {cust['name']} paid {cents_to_rand(amount)}\n"
+               f"• New balance {cents_to_rand(new_bal)}")
+    if acct != "cash":
+        preview += f"\n• Into {ACCOUNTS[acct]}"
+    return _propose(conn, shop_id, "record_payment", payload, preview)
+
+
+def _apply_record_expense(conn: sqlite3.Connection, shop_id: str, payload: dict, action_id: str):
+    cur = conn.execute(
+        "INSERT INTO expenses (shop_id, category, amount_cents, account, note, action_id)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (shop_id, payload["category"], payload["amount_cents"], payload["account"],
+         payload.get("note") or "", action_id),
+    )
+    _post_cash(conn, shop_id, payload["account"], -payload["amount_cents"], "expense",
+               action_id, category=payload["category"], ref_type="expense",
+               ref_id=cur.lastrowid)
+    left = account_balance(conn, shop_id, payload["account"])
+    what = payload["category"].capitalize()
+    return (
+        f"✅ *Expense saved*\n• {what} {cents_to_rand(payload['amount_cents'])}"
+        f" from {ACCOUNTS[payload['account']]}\n"
+        f"• {ACCOUNTS[payload['account']]} {cents_to_rand(left)}",
+        "expense", f"expense {what} {cents_to_rand(payload['amount_cents'])}",
+        {"expense_id": cur.lastrowid},
+    )
+
+
+def record_expense(conn: sqlite3.Connection, shop_id: str, amount_cents: int,
+                   category: str | None = None, account: str | None = None,
+                   note: str | None = None) -> str:
+    ensure_shop(conn, shop_id)
+    try:
+        amount = int(amount_cents)
+    except (TypeError, ValueError):
+        return "How much?"
+    if amount <= 0:
+        return "How much?"
+    cat, acct = _clean_category(category), _clean_account(account)
+    payload = {"amount_cents": amount, "category": cat, "account": acct,
+               "note": (note or "").strip()}
+    with _dry_run(conn):
+        _apply_record_expense(conn, shop_id, payload, _action_id())
+        left = account_balance(conn, shop_id, acct)
+    what = cat.capitalize()
     return _propose(
-        conn, shop_id, "record_payment", payload,
-        f"📝 *Save payment?*\n• {cust['name']} paid {cents_to_rand(amount)}\n"
-        f"• New balance {cents_to_rand(new_bal)}",
+        conn, shop_id, "record_expense", payload,
+        f"📝 *Save expense?*\n• {what} {cents_to_rand(amount)} from {ACCOUNTS[acct]}\n"
+        f"• {ACCOUNTS[acct]} {cents_to_rand(left + amount)} → {cents_to_rand(left)}",
+    )
+
+
+def _apply_record_drawing(conn: sqlite3.Connection, shop_id: str, payload: dict, action_id: str):
+    _post_cash(conn, shop_id, payload["account"], -payload["amount_cents"], "drawing",
+               action_id, note=payload.get("note") or "")
+    left = account_balance(conn, shop_id, payload["account"])
+    return (
+        f"✅ *Drawing saved*\n• Drawing {cents_to_rand(payload['amount_cents'])}"
+        f" from {ACCOUNTS[payload['account']]}\n• {ACCOUNTS[payload['account']]}"
+        f" {cents_to_rand(left)}",
+        "drawing", f"drawing {cents_to_rand(payload['amount_cents'])}", {},
+    )
+
+
+def record_drawing(conn: sqlite3.Connection, shop_id: str, amount_cents: int,
+                   account: str | None = None, note: str | None = None) -> str:
+    ensure_shop(conn, shop_id)
+    try:
+        amount = int(amount_cents)
+    except (TypeError, ValueError):
+        return "How much?"
+    if amount <= 0:
+        return "How much?"
+    acct = _clean_account(account)
+    payload = {"amount_cents": amount, "account": acct, "note": (note or "").strip()}
+    with _dry_run(conn):
+        _apply_record_drawing(conn, shop_id, payload, _action_id())
+        left = account_balance(conn, shop_id, acct)
+    return _propose(
+        conn, shop_id, "record_drawing", payload,
+        f"📝 *Save drawing?*\n• Drawing {cents_to_rand(amount)} from {ACCOUNTS[acct]}\n"
+        f"• {ACCOUNTS[acct]} {cents_to_rand(left + amount)} → {cents_to_rand(left)}",
+    )
+
+
+def _count_line(counted: int, expected: int) -> str:
+    if counted == expected:
+        return "• ✅ Matches the book exactly."
+    diff = counted - expected
+    word = "over" if diff > 0 else "short"
+    return (f"• Book says {cents_to_rand(expected)}"
+            f" — {cents_to_rand(abs(diff))} {word}")
+
+
+def _apply_record_count(conn: sqlite3.Connection, shop_id: str, payload: dict, action_id: str):
+    diff = payload["counted_cents"] - payload["expected_cents"]
+    if diff:
+        _post_cash(conn, shop_id, "cash", diff, "count", action_id,
+                   note="over" if diff > 0 else "short")
+    return (
+        f"✅ *Count saved*\n• Counted {cents_to_rand(payload['counted_cents'])}\n"
+        + _count_line(payload["counted_cents"], payload["expected_cents"]),
+        "count", f"count {cents_to_rand(payload['counted_cents'])}", {},
+    )
+
+
+def record_count(conn: sqlite3.Connection, shop_id: str, amount_cents: int) -> str:
+    """Record a physical cash count ("counted R1,240") and show over/short."""
+    ensure_shop(conn, shop_id)
+    try:
+        counted = int(amount_cents)
+    except (TypeError, ValueError):
+        return "How much did you count?"
+    if counted < 0:
+        return "How much did you count?"
+    expected = account_balance(conn, shop_id, "cash")
+    payload = {"counted_cents": counted, "expected_cents": expected}
+    return _propose(
+        conn, shop_id, "record_count", payload,
+        f"📝 *Save cash count?*\n• Counted {cents_to_rand(counted)}\n"
+        + _count_line(counted, expected),
+    )
+
+
+def _apply_supplier_payment(conn: sqlite3.Connection, shop_id: str, payload: dict,
+                            action_id: str):
+    _post_cash(conn, shop_id, payload["account"], -payload["amount_cents"], "purchase",
+               action_id, note=f"paid {payload['supplier']}")
+    _post_supplier(conn, shop_id, payload["supplier"], -payload["amount_cents"],
+                   action_id, note="payment")
+    owed = supplier_balance(conn, shop_id, payload["supplier"])
+    return (
+        f"✅ *Supplier paid*\n• {payload['supplier']} {cents_to_rand(payload['amount_cents'])}"
+        f" from {ACCOUNTS[payload['account']]}\n• Still owed {cents_to_rand(owed)}",
+        "supplier_payment", f"supplier {payload['supplier']}", {},
+    )
+
+
+def record_supplier_payment(conn: sqlite3.Connection, shop_id: str, supplier: str,
+                            amount_cents: int, account: str | None = None) -> str:
+    ensure_shop(conn, shop_id)
+    name = (supplier or "").strip()
+    if not name:
+        return "Which supplier?"
+    try:
+        amount = int(amount_cents)
+    except (TypeError, ValueError):
+        return "How much?"
+    if amount <= 0:
+        return "How much?"
+    acct = _clean_account(account)
+    owed = supplier_balance(conn, shop_id, name)
+    payload = {"supplier": name, "amount_cents": amount, "account": acct}
+    return _propose(
+        conn, shop_id, "record_supplier_payment", payload,
+        f"📝 *Pay supplier?*\n• {name} {cents_to_rand(amount)} from {ACCOUNTS[acct]}\n"
+        f"• Owed {cents_to_rand(owed)} → {cents_to_rand(owed - amount)}",
     )
 
 
@@ -485,6 +649,9 @@ def _apply_record_sale(conn: sqlite3.Connection, shop_id: str, payload: dict, ac
     )
     stock = conn.execute("SELECT stock_qty FROM products WHERE id = ?",
                          (payload["product_id"],)).fetchone()["stock_qty"]
+    if not payload.get("buyer"):
+        _post_cash(conn, shop_id, "cash", payload["total_cents"], "sale", action_id,
+                   ref_type="sale", ref_id=sale_id)
     label = payload.get("label") or f"{_fmt_qty(payload['qty'])} × {payload['product']}"
     first = f"• {label} = {cents_to_rand(payload['total_cents'])}"
     prow = conn.execute("SELECT pack_name, pack_size FROM products WHERE id = ?",
@@ -658,6 +825,15 @@ def _apply_add_stock(conn: sqlite3.Connection, shop_id: str, payload: dict, acti
     )
     stock = conn.execute("SELECT stock_qty FROM products WHERE id = ?",
                          (product_id,)).fetchone()["stock_qty"]
+    if cost is not None:
+        total_cost = int(round(cost * payload["qty"]))
+        acct = payload.get("account", "cash")
+        if acct == "supplier":
+            _post_supplier(conn, shop_id, payload.get("wholesaler") or "Supplier",
+                           total_cost, action_id, note=f"stock {payload['name']}")
+        else:
+            _post_cash(conn, shop_id, acct, -total_cost, "purchase", action_id,
+                       note=f"stock {payload['name']}")
     extras = _fmt_price_extras(cost, price, pack, payload.get("pack_name") or "pack")
     prow = conn.execute("SELECT pack_name, pack_size FROM products WHERE id = ?",
                         (product_id,)).fetchone()
@@ -683,7 +859,7 @@ def _apply_add_stock(conn: sqlite3.Connection, shop_id: str, payload: dict, acti
 def add_stock(conn: sqlite3.Connection, shop_id: str, product: str, qty: float,
               wholesaler: str | None = None, cost_cents: int | None = None,
               price_cents: int | None = None, unit: str | None = None,
-              pack_price_cents: int | None = None) -> str:
+              pack_price_cents: int | None = None, account: str | None = None) -> str:
     """Add stock. qty is singles unless unit names a pack; a pack cost is
     converted to cost per single."""
     ensure_shop(conn, shop_id)
@@ -712,10 +888,12 @@ def add_stock(conn: sqlite3.Connection, shop_id: str, product: str, qty: float,
     cost = quoted_cost / pack_size if (is_pack and quoted_cost) else quoted_cost
     price = _coerce_pos_int(price_cents)
     pack = _coerce_pos_int(pack_price_cents)
+    acct = str(account or "cash").strip().lower()
+    acct = acct if acct in ("cash", "petty", "bank", "supplier") else "cash"
     payload = {"product_id": prod["id"] if prod else None, "name": prod["name"] if prod else name,
                "qty": units, "wholesaler": (wholesaler or "").strip(),
                "cost_cents": cost, "price_cents": price, "pack_price_cents": pack,
-               "pack_name": pack_name}
+               "pack_name": pack_name, "account": acct}
     with _dry_run(conn):
         _apply_add_stock(conn, shop_id, payload, _action_id())
         pid = conn.execute("SELECT id FROM products WHERE shop_id = ? AND name = ?",
@@ -741,6 +919,13 @@ def add_stock(conn: sqlite3.Connection, shop_id: str, product: str, qty: float,
     if no_pack:
         preview += (f"\n• ⚠️ No {_pack_echo(unit)} size for {prod['name']}"
                     " — counted as singles.")
+    if cost is not None:
+        total_cost = int(round(cost * units))
+        if acct == "supplier":
+            preview += (f"\n• On {(payload['wholesaler'] or 'supplier')} account"
+                        f" {cents_to_rand(total_cost)}")
+        else:
+            preview += f"\n• Paid {cents_to_rand(total_cost)} from {ACCOUNTS[acct]}"
     if cost is not None and price is not None and cost > price:
         preview += "\n• ⚠️ Cost is higher than sell price."
     return _propose(conn, shop_id, "add_stock", payload, preview)
@@ -821,7 +1006,8 @@ def _soon_iso() -> str:
     return (date.fromisoformat(today_str()) + timedelta(days=7)).isoformat()
 
 
-def check_expiry_photo(conn: sqlite3.Connection, shop_id: str, findings: list[dict]) -> str:
+def check_expiry_photo(conn: sqlite3.Connection, shop_id: str, findings: list[dict],
+                       photo_hash: str | None = None) -> str:
     """Propose storing expiry findings. findings: [{product, qty, expiry_date YYYY-MM-DD}]."""
     ensure_shop(conn, shop_id)
     if not findings:
@@ -845,7 +1031,7 @@ def check_expiry_photo(conn: sqlite3.Connection, shop_id: str, findings: list[di
     flagged = [i for i in items if i["expiry_date"] <= _soon_iso()]
     if not flagged:
         return "✅ All dates look fine. Nothing expiring soon."
-    payload = {"items": items}
+    payload = {"items": items, "photo_hash": photo_hash}
     with _dry_run(conn):
         _apply_expiry_note(conn, shop_id, payload, _action_id())
     preview = "⚠️ *Expiry check*\n" + "\n".join(_expiry_line(i) for i in flagged)
@@ -1211,6 +1397,15 @@ def delete_my_data(conn: sqlite3.Connection, shop_id: str) -> str:
         "conversation_turns",
         "messages_seen",
         "pending_actions",
+        "await_price",
+        "reports",
+        "flags",
+        "receipts",
+        "cash_moves",
+        "expenses",
+        "supplier_moves",
+        "order_drafts",
+        "photo_hashes",
         "expiry_items",
         "stock_moves",
         "sales",
@@ -1245,14 +1440,1099 @@ def _undo_credit(conn: sqlite3.Connection, shop_id: str, undo: dict) -> str:
             f" Balance back to {cents_to_rand(bal)}.")
 
 
-def _undo_payment(conn: sqlite3.Connection, shop_id: str, undo: dict) -> str:
+def _undo_payment(conn: sqlite3.Connection, shop_id: str, undo: dict, action_id: str) -> str:
     row = conn.execute(
         "SELECT p.*, c.name FROM payments p JOIN customers c ON c.id = p.customer_id"
         " WHERE p.id = ?", (undo["payment_id"],)).fetchone()
     conn.execute("UPDATE payments SET reversed = 1 WHERE id = ?", (undo["payment_id"],))
+    _reverse_moves(conn, shop_id, action_id)
     bal = balance_cents(conn, shop_id, row["customer_id"])
     return (f"Undone: removed {row['name']}'s {cents_to_rand(row['amount_cents'])} payment."
             f" Balance back to {cents_to_rand(bal)}.")
+
+
+def _undo_expense(conn: sqlite3.Connection, shop_id: str, undo: dict, action_id: str) -> str:
+    row = conn.execute("SELECT * FROM expenses WHERE id = ?", (undo["expense_id"],)).fetchone()
+    conn.execute("UPDATE expenses SET reversed = 1 WHERE id = ?", (undo["expense_id"],))
+    _reverse_moves(conn, shop_id, action_id)
+    return (f"Undone: removed the {cents_to_rand(row['amount_cents'])}"
+            f" {row['category']} expense.")
+
+
+def _undo_cash_only(conn: sqlite3.Connection, shop_id: str, undo: dict, action_id: str,
+                    kind: str) -> str:
+    _reverse_moves(conn, shop_id, action_id)
+    return f"Undone: removed the {kind}."
+
+
+ACCOUNTS = {"cash": "Till", "petty": "Petty cash", "bank": "Bank"}
+EXPENSE_CATEGORIES = ["transport", "electricity", "rent", "airtime", "wages", "other"]
+
+
+def _clean_account(account) -> str:
+    a = str(account or "cash").strip().lower()
+    return a if a in ACCOUNTS else "cash"
+
+
+def _clean_category(category) -> str:
+    c = str(category or "other").strip().lower()
+    return c if c in EXPENSE_CATEGORIES else "other"
+
+
+def account_balance(conn: sqlite3.Connection, shop_id: str, account: str) -> int:
+    return conn.execute(
+        "SELECT COALESCE(SUM(amount_cents), 0) s FROM cash_moves"
+        " WHERE shop_id = ? AND account = ? AND reversed = 0",
+        (shop_id, account)).fetchone()["s"]
+
+
+def supplier_balance(conn: sqlite3.Connection, shop_id: str, supplier: str) -> int:
+    return conn.execute(
+        "SELECT COALESCE(SUM(amount_cents), 0) s FROM supplier_moves"
+        " WHERE shop_id = ? AND supplier = ? AND reversed = 0",
+        (shop_id, (supplier or "").strip())).fetchone()["s"]
+
+
+def _post_cash(conn: sqlite3.Connection, shop_id: str, account: str, amount: int,
+               kind: str, action_id: str, category: str = "", note: str = "",
+               ref_type: str = "", ref_id: int | None = None) -> None:
+    conn.execute(
+        "INSERT INTO cash_moves (shop_id, account, amount_cents, kind, category,"
+        " note, ref_type, ref_id, action_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (shop_id, account, int(amount), kind, category, note, ref_type, ref_id, action_id),
+    )
+
+
+def _post_supplier(conn: sqlite3.Connection, shop_id: str, supplier: str, amount: int,
+                   action_id: str, note: str = "") -> None:
+    conn.execute(
+        "INSERT INTO supplier_moves (shop_id, supplier, amount_cents, note, action_id)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (shop_id, supplier.strip(), int(amount), note, action_id),
+    )
+
+
+def _reverse_moves(conn: sqlite3.Connection, shop_id: str, action_id: str) -> None:
+    conn.execute("UPDATE cash_moves SET reversed = 1 WHERE shop_id = ? AND action_id = ?",
+                 (shop_id, action_id))
+    conn.execute("UPDATE supplier_moves SET reversed = 1 WHERE shop_id = ? AND action_id = ?",
+                 (shop_id, action_id))
+
+
+_SAST_DAY = "substr(datetime(created_at, '+2 hours'), 1, 10)"
+_SAST_MONTH = "substr(datetime(created_at, '+2 hours'), 1, 7)"
+
+
+def _period_bounds(period: str) -> tuple[str, str, str]:
+    """Returns (title, start_day, end_day) in SAST calendar days."""
+    today = today_str()
+    p = (period or "today").strip().lower()
+    if p in ("week", "7 days", "last 7 days", "this week"):
+        start = (date.fromisoformat(today) - timedelta(days=6)).isoformat()
+        return "Sales last 7 days", start, today
+    if p in ("month", "this month", "last 30 days"):
+        return "Sales this month", today[:7] + "-01", today
+    return "Sales today", today, today
+
+
+def sales_summary(conn: sqlite3.Connection, shop_id: str, period: str = "today") -> str:
+    ensure_shop(conn, shop_id)
+    title, start, end = _period_bounds(period)
+    rng = f"{_SAST_DAY} >= ? AND {_SAST_DAY} <= ?"
+    cash = conn.execute(
+        "SELECT COALESCE(SUM(total_cents), 0) s, COUNT(*) n FROM sales"
+        f" WHERE shop_id = ? AND customer_id IS NULL AND reversed = 0 AND {rng}",
+        (shop_id, start, end)).fetchone()
+    book = conn.execute(
+        "SELECT COALESCE(SUM(total_cents), 0) s FROM sales"
+        f" WHERE shop_id = ? AND customer_id IS NOT NULL AND reversed = 0 AND {rng}",
+        (shop_id, start, end)).fetchone()["s"]
+    if not cash["s"] and not book:
+        return f"📊 *{title}*\n\nNothing sold yet."
+    n = cash["n"]
+    return (f"📊 *{title}*\n"
+            f"• Cash {cents_to_rand(cash['s'])} ({n} sale{'s' if n != 1 else ''})\n"
+            f"• Credit {cents_to_rand(book)}\n"
+            f"• Total {cents_to_rand(cash['s'] + book)}")
+
+
+def _month_cost_of_sales(conn: sqlite3.Connection, shop_id: str, month: str) -> tuple[int, int]:
+    """Returns (sales_cents, cogs_cents) for a YYYY-MM month at current unit cost."""
+    rows = conn.execute(
+        "SELECT s.qty, p.cost_cents, s.total_cents FROM sales s"
+        " LEFT JOIN products p ON p.id = s.product_id"
+        f" WHERE s.shop_id = ? AND s.reversed = 0 AND {_SAST_MONTH} = ?",
+        (shop_id, month)).fetchall()
+    sales = sum(r["total_cents"] for r in rows)
+    cogs = int(round(sum((r["qty"] or 0) * (r["cost_cents"] or 0) for r in rows)))
+    return sales, cogs
+
+
+def profit_month(conn: sqlite3.Connection, shop_id: str, month: str | None = None) -> str:
+    ensure_shop(conn, shop_id)
+    m = (month or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}", m):
+        m = today_str()[:7]
+    sales, cogs = _month_cost_of_sales(conn, shop_id, m)
+    exp = conn.execute(
+        "SELECT COALESCE(SUM(amount_cents), 0) s FROM expenses"
+        f" WHERE shop_id = ? AND reversed = 0 AND {_SAST_MONTH} = ?",
+        (shop_id, m)).fetchone()["s"]
+    gross = sales - cogs
+    margin = f" ({round(gross * 100 / sales)}%)" if sales else ""
+    label = date(int(m[:4]), int(m[5:7]), 1).strftime("%B %Y")
+    return (f"📈 *Profit for {label}*\n"
+            f"• Sales {cents_to_rand(sales)}\n"
+            f"• Cost of sales {cents_to_rand(cogs)}\n"
+            f"• Gross {cents_to_rand(gross)}{margin}\n"
+            f"• Expenses {cents_to_rand(exp)}\n"
+            f"• Net {cents_to_rand(gross - exp)}")
+
+
+def _avg_daily_sales(conn: sqlite3.Connection, shop_id: str, product_id: int,
+                     start_day: str) -> float:
+    s = conn.execute(
+        "SELECT COALESCE(SUM(qty), 0) s FROM sales WHERE shop_id = ? AND product_id = ?"
+        " AND reversed = 0 AND substr(datetime(created_at, '+2 hours'), 1, 10) >= ?",
+        (shop_id, product_id, start_day)).fetchone()["s"]
+    return s / 7
+
+
+def photo_seen(conn: sqlite3.Connection, shop_id: str, digest: str):
+    return conn.execute("SELECT * FROM photo_hashes WHERE shop_id = ? AND hash = ?",
+                        (shop_id, digest)).fetchone()
+
+
+def record_photo(conn: sqlite3.Connection, shop_id: str, digest: str, kind: str,
+                 note: str = "") -> None:
+    conn.execute("INSERT OR IGNORE INTO photo_hashes (shop_id, hash, kind, note)"
+                 " VALUES (?, ?, ?, ?)", (shop_id, digest, kind, note))
+    conn.commit()
+
+
+BOOK_ALIASES = {
+    "chap": "chappies", "chappie": "chappies", "chappis": "chappies",
+    "brd": "bread", "bred": "bread",
+    "stny": "stoney", "ston": "stoney",
+    "mlk": "milk", "ammasi": "amasi",
+    "egg": "eggs", "mae": "maize", "sug": "sugar",
+    "sim": "simba", "chps": "simba",
+}
+
+
+def _resolve_book_item(conn: sqlite3.Connection, shop_id: str, text: str):
+    """Resolve shorthand/abbreviated book text to a product (never guess)."""
+    q = (text or "").strip().lower()
+    q = BOOK_ALIASES.get(q, q)
+    return _find_products(conn, shop_id, q)
+
+
+def _book_short(units: float, name: str) -> str:
+    return f"{_fmt_qty(units)}x {name}"
+
+
+def _resolve_book_line(conn: sqlite3.Connection, shop_id: str, line_no: int, text: str,
+                       item: str, qty: float, price_cents: int | None, kind: str,
+                       customer: str):
+    """Returns (section, entry) with section in cash|credit|payment|flagged."""
+    cust = (customer or "").strip()
+    if kind == "unreadable":
+        return "flagged", {"line_no": line_no, "text": text, "reason": "unreadable"}
+    if kind == "payment":
+        if not cust:
+            return "flagged", {"line_no": line_no, "text": text,
+                               "reason": "no name — who paid?"}
+        if not price_cents:
+            return "flagged", {"line_no": line_no, "text": text,
+                               "reason": "no amount — how much did they pay?"}
+        row = _get_customer(conn, shop_id, cust)
+        if row is None:
+            return "flagged", {"line_no": line_no, "text": text,
+                               "reason": f"no one named {cust} is on the book"}
+        return "payment", {"line_no": line_no, "customer": row["name"], "amount": price_cents}
+    if not (item or "").strip():
+        return "flagged", {"line_no": line_no, "text": text, "reason": "unreadable"}
+    prod, ambiguous = _resolve_book_item(conn, shop_id, item)
+    if prod is None:
+        if ambiguous:
+            names = ", ".join(p["name"] for p in ambiguous[:2])
+            return "flagged", {"line_no": line_no, "text": text,
+                               "reason": f"which one: {names}?"}
+        return "flagged", {"line_no": line_no, "text": text, "reason": "not on shelf list"}
+    if prod["price_cents"] is None:
+        return "flagged", {"line_no": line_no, "text": text,
+                           "reason": f"{prod['name']} has no price yet"}
+    units = qty if qty > 0 else 1
+    list_total = int(round(prod["price_cents"] * units))
+    total = price_cents if price_cents else list_total
+    entry = {"line_no": line_no, "product_id": prod["id"], "name": prod["name"],
+             "units": units, "total": total, "list_total": list_total,
+             "short": _book_short(units, prod["name"])}
+    if kind == "credit":
+        if not cust:
+            return "flagged", {"line_no": line_no, "text": text,
+                               "reason": "no name — who took it?"}
+        row = _get_customer(conn, shop_id, cust)
+        entry["customer"] = row["name"] if row else cust
+        entry["new_customer"] = row is None
+        return "credit", entry
+    return "cash", entry
+
+
+def _render_book_preview(conn: sqlite3.Connection, shop_id: str, payload: dict) -> str:
+    cash = sorted(payload["cash"], key=lambda e: e["line_no"])
+    credit = sorted(payload["credit"], key=lambda e: e["line_no"])
+    payments = sorted(payload["payments"], key=lambda e: e["line_no"])
+    flagged = sorted(payload["flagged"], key=lambda e: e["line_no"])
+    blocks = [f"📒 *Today's book: {payload['display_date']}*"]
+    if cash:
+        lines = ["💵 *Cash sales*"]
+        for e in cash:
+            line = f"• {e['short']} = {cents_to_rand(e['total'])}"
+            if e["total"] != e["list_total"]:
+                line += f" ⚠️ (list {cents_to_rand(e['list_total'])})"
+            lines.append(line)
+        blocks.append("\n".join(lines))
+    credit_lines = []
+    for e in credit:
+        row = _get_customer(conn, shop_id, e["customer"])
+        bal = balance_cents(conn, shop_id, row["id"]) + e["total"] if row else e["total"]
+        who = f"{e['customer']} (new)" if e["new_customer"] else e["customer"]
+        credit_lines.append(f"• {who}: {e['short']} = {cents_to_rand(e['total'])}"
+                            f" → owes {cents_to_rand(bal)}")
+    for e in payments:
+        row = _get_customer(conn, shop_id, e["customer"])
+        bal = balance_cents(conn, shop_id, row["id"]) - e["amount"] if row else -e["amount"]
+        credit_lines.append(f"• {e['customer']} paid {cents_to_rand(e['amount'])}"
+                            f" → owes {cents_to_rand(bal)}")
+    if credit_lines:
+        blocks.append("📝 *Credit*\n" + "\n".join(credit_lines))
+    if flagged:
+        lines = ["❓ *Couldn't read*"]
+        for e in flagged:
+            lines.append(f"• line {e['line_no']} '{e['text'][:60]}' — {e['reason']}")
+        blocks.append("\n".join(lines))
+    cash_total = sum(e["total"] for e in cash)
+    credit_total = sum(e["total"] for e in credit)
+    pay_total = sum(e["amount"] for e in payments)
+    expected = account_balance(conn, shop_id, "cash") + cash_total + pay_total
+    blocks.append("💰 *Totals*\n"
+                  f"• Cash sales {cents_to_rand(cash_total)}\n"
+                  f"• Credit given {cents_to_rand(credit_total)}\n"
+                  f"• Credit payments {cents_to_rand(pay_total)}\n"
+                  f"• Expected cash in hand {cents_to_rand(expected)}")
+    if payload.get("page_total") is not None:
+        written = cash_total + credit_total
+        if written == payload["page_total"]:
+            blocks.append(f"✅ Matches your page total {cents_to_rand(written)}")
+        else:
+            blocks.append(f"⚠️ Page says {cents_to_rand(payload['page_total'])},"
+                          f" lines add to {cents_to_rand(written)}")
+    if payload.get("crossed_out"):
+        n = payload["crossed_out"]
+        blocks.append(f"Skipped {n} crossed-out line{'s' if n != 1 else ''}.")
+    blocks.append("Reply Yes to save, or correct a line, e.g. 'line 3 is 4 bread'")
+    return "\n\n".join(blocks)
+
+
+def propose_book_page(conn: sqlite3.Connection, shop_id: str, book: dict,
+                      photo_hash: str | None = None) -> str:
+    ensure_shop(conn, shop_id)
+    book = book or {}
+    day = book.get("date") or today_str()
+    payload: dict = {"date": day, "display_date": _fmt_date(day),
+                     "page_total": book.get("page_total_cents"),
+                     "crossed_out": book.get("crossed_out") or 0,
+                     "cash": [], "credit": [], "payments": [], "flagged": [],
+                     "line_count": 0, "photo_hash": photo_hash}
+    for ln in book.get("lines", []) or []:
+        payload["line_count"] = max(payload["line_count"], int(ln.get("line_no") or 0))
+        section, entry = _resolve_book_line(
+            conn, shop_id, int(ln.get("line_no") or 0), str(ln.get("text") or ""),
+            str(ln.get("item") or ""), ln.get("qty") or 1, ln.get("price_cents"),
+            str(ln.get("kind") or "unreadable"), str(ln.get("customer") or ""))
+        entry["kind"] = section
+        payload[{"cash": "cash", "credit": "credit", "payment": "payments"}.get(
+            section, "flagged")].append(entry)
+    if not payload["cash"] and not payload["credit"] and not payload["payments"]:
+        out = "❓ Nothing to save from this page."
+        if payload["flagged"]:
+            out += "\n" + "\n".join(f"• line {e['line_no']} '{e['text'][:60]}'"
+                                    f" — {e['reason']}" for e in payload["flagged"])
+        return out
+    return _propose(conn, shop_id, "book_page", payload,
+                    _render_book_preview(conn, shop_id, payload))
+
+
+def _apply_book_page(conn: sqlite3.Connection, shop_id: str, payload: dict, action_id: str):
+    stamp = f"{payload['date']}T12:00:00.000Z"
+    sale_ids, credit_ids, payment_ids, new_customers, stock_deltas = [], [], [], [], []
+    cash_total = sum(e["total"] for e in payload["cash"])
+    credit_total = sum(e["total"] for e in payload["credit"])
+    pay_total = sum(e["amount"] for e in payload["payments"])
+
+    def _sell(n, product_id, name, units, total, customer_id=None):
+        cur = conn.execute(
+            "INSERT INTO sales (shop_id, product_id, product_name, qty, total_cents,"
+            " customer_id, action_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (shop_id, product_id, name, units, total, customer_id, f"{action_id}-s{n}",
+             stamp))
+        sale_ids.append(cur.lastrowid)
+        conn.execute("UPDATE products SET stock_qty = stock_qty - ? WHERE id = ?",
+                     (units, product_id))
+        conn.execute("INSERT INTO stock_moves (shop_id, product_id, delta_qty, reason,"
+                     " action_id, created_at) VALUES (?, ?, ?, 'book', ?, ?)",
+                     (shop_id, product_id, -units, action_id, stamp))
+        stock_deltas.append({"product_id": product_id, "qty": units})
+
+    for i, e in enumerate(payload["cash"]):
+        _sell(i, e["product_id"], e["name"], e["units"], e["total"])
+    for i, e in enumerate(payload["credit"]):
+        cust = _get_customer(conn, shop_id, e["customer"])
+        if cust is None:
+            cur = conn.execute("INSERT INTO customers (shop_id, name, created_at)"
+                               " VALUES (?, ?, ?)", (shop_id, e["customer"], stamp))
+            cust_id, created = cur.lastrowid, True
+        else:
+            cust_id, created = cust["id"], False
+        _sell(f"c{i}", e["product_id"], e["name"], e["units"], e["total"], cust_id)
+        cur = conn.execute(
+            "INSERT INTO credit_entries (shop_id, customer_id, amount_cents, items_text,"
+            " action_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (shop_id, cust_id, e["total"], e["short"], f"{action_id}-c{i}", stamp))
+        credit_ids.append(cur.lastrowid)
+        if created:
+            new_customers.append(cust_id)
+    for i, e in enumerate(payload["payments"]):
+        cust = _get_customer(conn, shop_id, e["customer"])
+        cur = conn.execute(
+            "INSERT INTO payments (shop_id, customer_id, amount_cents, action_id, created_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (shop_id, cust["id"], e["amount"], f"{action_id}-p{i}", stamp))
+        payment_ids.append(cur.lastrowid)
+    if cash_total:
+        _post_cash(conn, shop_id, "cash", cash_total, "sale", action_id,
+                   note=f"book {payload['date']}")
+        conn.execute("UPDATE cash_moves SET created_at = ? WHERE action_id = ? AND kind = 'sale'",
+                     (stamp, action_id))
+    if pay_total:
+        _post_cash(conn, shop_id, "cash", pay_total, "credit_payment", action_id,
+                   note=f"book {payload['date']}")
+        conn.execute("UPDATE cash_moves SET created_at = ? WHERE action_id = ?"
+                     " AND kind = 'credit_payment'", (stamp, action_id))
+    parts = []
+    if cash_total:
+        parts.append(f"Cash {cents_to_rand(cash_total)}")
+    if credit_total:
+        parts.append(f"credit {cents_to_rand(credit_total)}")
+    if pay_total:
+        parts.append(f"payments {cents_to_rand(pay_total)}")
+    msg = ("✅ *Book saved*\n• " + " · ".join(parts) + "\n\n"
+           + low_stock(conn, shop_id) + "\n\n" + cash_up(conn, shop_id, payload["date"]))
+    return (msg, "book", f"book page {payload['date']}",
+            {"sale_ids": sale_ids, "credit_ids": credit_ids, "payment_ids": payment_ids,
+             "new_customers": new_customers, "stock": stock_deltas,
+             "display_date": payload["display_date"]})
+
+
+def _undo_book(conn: sqlite3.Connection, shop_id: str, undo: dict, action_id: str) -> str:
+    for sid in undo.get("sale_ids", []):
+        conn.execute("UPDATE sales SET reversed = 1 WHERE id = ?", (sid,))
+    for cid in undo.get("credit_ids", []):
+        conn.execute("UPDATE credit_entries SET reversed = 1 WHERE id = ?", (cid,))
+    for pid in undo.get("payment_ids", []):
+        conn.execute("UPDATE payments SET reversed = 1 WHERE id = ?", (pid,))
+    for d in undo.get("stock", []):
+        _restore_stock(conn, shop_id, d["product_id"], d["qty"], action_id)
+    for cust_id in undo.get("new_customers", []):
+        conn.execute("DELETE FROM customers WHERE id = ?", (cust_id,))
+    _reverse_moves(conn, shop_id, action_id)
+    return f"Undone: removed the book page from {undo.get('display_date', 'that day')}."
+
+
+def _parse_correction(rest: str):
+    """'Sipho paid 40' -> payment; '4 bread Sipho credit' -> sale parts."""
+    text = (rest or "").strip()
+    m = re.match(r"(.+?)\s+paid\s+r?(\d+(?:\.\d{1,2})?)\s*$", text, re.IGNORECASE)
+    if m:
+        return {"kind": "payment", "customer": m.group(1).strip(),
+                "amount": int(round(float(m.group(2)) * 100))}
+    toks = text.split()
+    if not toks:
+        return None
+    try:
+        qty = float(toks[0])
+        toks = toks[1:]
+    except ValueError:
+        qty = 1
+    if not toks:
+        return None
+    kind = None
+    if toks[-1].lower() in ("cash", "credit"):
+        kind = toks[-1].lower()
+        toks = toks[:-1]
+    return {"kind": kind, "qty": qty if qty > 0 else 1, "words": toks}
+
+
+def correct_book_line(conn: sqlite3.Connection, shop_id: str, line_no: int, rest: str) -> str:
+    pend = get_pending(conn, shop_id)
+    if pend is None or pend["action_type"] != "book_page":
+        return "No book preview to correct."
+    payload = json.loads(pend["payload_json"])
+    if line_no < 1 or line_no > (payload.get("line_count") or 0):
+        return f"Line {line_no} isn't on this page."
+    parsed = _parse_correction(rest)
+    if parsed is None:
+        return "I couldn't read that correction. Try 'line 3 is 4 bread'."
+    shop = ensure_shop(conn, shop_id)
+    if parsed["kind"] == "payment":
+        section, entry = _resolve_book_line(conn, shop_id, line_no, rest, "",
+                                            1, parsed["amount"], "payment",
+                                            parsed["customer"])
+    else:
+        words = parsed["words"]
+        prod, ambiguous = _resolve_book_item(conn, shop_id, " ".join(words))
+        customer = ""
+        if prod is None and not ambiguous and len(words) > 1:
+            customer = words[-1]
+            prod, ambiguous = _resolve_book_item(conn, shop_id, " ".join(words[:-1]))
+        kind = parsed["kind"] or ("credit" if customer else "cash")
+        if prod is None and not ambiguous:
+            section, entry = "flagged", {"line_no": line_no, "text": rest,
+                                         "reason": "not on shelf list"}
+        elif prod is None:
+            names = ", ".join(p["name"] for p in ambiguous[:2])
+            section, entry = "flagged", {"line_no": line_no, "text": rest,
+                                         "reason": f"which one: {names}?"}
+        elif prod["price_cents"] is None:
+            section, entry = "flagged", {"line_no": line_no, "text": rest,
+                                         "reason": f"{prod['name']} has no price yet"}
+        else:
+            total = int(round(prod["price_cents"] * parsed["qty"]))
+            entry = {"line_no": line_no, "product_id": prod["id"], "name": prod["name"],
+                     "units": parsed["qty"], "total": total, "list_total": total,
+                     "short": _book_short(parsed["qty"], prod["name"])}
+            if kind == "credit":
+                if not customer:
+                    return "Which customer? e.g. 'line 3 is 4 bread Sipho'."
+                row = _get_customer(conn, shop_id, customer)
+                entry["customer"] = row["name"] if row else customer
+                entry["new_customer"] = row is None
+                section = "credit"
+            else:
+                section = "cash"
+    entry["kind"] = section
+    for key in ("cash", "credit", "payments", "flagged"):
+        payload[key] = [e for e in payload[key] if e["line_no"] != line_no]
+    payload[{"cash": "cash", "credit": "credit", "payment": "payments"}.get(
+        section, "flagged")].append(entry)
+    preview = _render_book_preview(conn, shop_id, payload)
+    conn.execute("UPDATE pending_actions SET payload_json = ?, preview_text = ? WHERE id = ?",
+                 (json.dumps(payload), preview, pend["id"]))
+    conn.commit()
+    return preview
+
+
+RECEIPT_EXPENSE_WORDS = {
+    "electricity": "electricity", "elec": "electricity", "prepaid": "electricity",
+    "power": "electricity", "eskom": "electricity",
+    "transport": "transport", "taxi": "transport", "fuel": "transport",
+    "petrol": "transport", "diesel": "transport",
+    "rent": "rent", "wage": "wages", "wages": "wages", "salary": "wages",
+    "staff": "wages",
+}
+
+_MONTH_NAMES = {m: i for i, m in enumerate(
+    ["january", "february", "march", "april", "may", "june", "july",
+     "august", "september", "october", "november", "december"], 1)}
+_MONTH_NAMES.update({m[:3]: i for m, i in list(_MONTH_NAMES.items())})
+
+
+def parse_month_name(text: str) -> str | None:
+    """'September'/'sep' -> most recent YYYY-MM by that name."""
+    m = _MONTH_NAMES.get((text or "").strip().lower())
+    if not m:
+        return None
+    year, cur = int(today_str()[:4]), int(today_str()[5:7])
+    return f"{year if m <= cur else year - 1}-{m:02d}"
+
+
+def _pos_num(val):
+    try:
+        val = float(val)
+    except (TypeError, ValueError):
+        return None
+    return val if val > 0 else None
+
+
+def _receipt_payment_account(payment: str) -> tuple[str, bool]:
+    p = (payment or "").lower()
+    if "cash" in p:
+        return "cash", False
+    if "card" in p or "bank" in p or "eft" in p:
+        return "bank", False
+    if "account" in p or "credit" in p:
+        return "supplier", False
+    return "cash", True
+
+
+def _resolve_receipt_line(conn: sqlite3.Connection, shop_id: str, ln: dict):
+    """Returns (section, entry): stock|expense|flagged. Unknown stock becomes [new]."""
+    line_no, text = int(ln.get("line_no") or 0), str(ln.get("text") or "")
+    item = str(ln.get("item") or "").strip()
+    if not item:
+        return "flagged", {"line_no": line_no, "text": text, "reason": "unreadable"}
+    prod, ambiguous = _resolve_book_item(conn, shop_id, item)
+    if prod is None and not ambiguous:
+        for word, cat in RECEIPT_EXPENSE_WORDS.items():
+            if word in item.lower():
+                total = ln.get("line_total_cents")
+                if total is None:
+                    return "flagged", {"line_no": line_no, "text": text,
+                                       "reason": "no amount I can use"}
+                return "expense", {"line_no": line_no, "category": cat, "total": total}
+        return "stock", _receipt_stock_entry(None, item, ln, line_no, text)
+    if prod is None:
+        names = ", ".join(p["name"] for p in ambiguous[:2])
+        return "flagged", {"line_no": line_no, "text": text,
+                           "reason": f"which one: {names}?"}
+    return "stock", _receipt_stock_entry(prod, prod["name"], ln, line_no, text)
+
+
+def _receipt_stock_entry(prod, name: str, ln: dict, line_no: int, text: str) -> dict:
+    units = _pos_num(ln.get("qty_units"))
+    packs = _pos_num(ln.get("packs"))
+    size = _pos_num(ln.get("pack_size")) or (prod["pack_size"] if prod else None)
+    pack_word = None
+    if units is None and packs and size:
+        units = packs * size
+        word = (prod["pack_name"] if prod and prod["pack_name"] else "pack")
+        pack_word = f"{_fmt_qty(packs)} {word if packs == 1 else _plural_pack(word)}"
+    if units is None and packs and not size:
+        return {"line_no": line_no, "text": text, "reason": "pack size unknown",
+                "unresolved": True}
+    if units is None:
+        lt = ln.get("line_total_cents")
+        uc = ln.get("unit_cost_cents")
+        if lt and uc:
+            units = round(lt / uc, 2)
+    if units is None:
+        return {"line_no": line_no, "text": text, "reason": "no quantity I can use",
+                "unresolved": True}
+    uc = ln.get("unit_cost_cents")
+    if uc is None and ln.get("line_total_cents"):
+        uc = round(ln["line_total_cents"] / units, 2)
+    return {"line_no": line_no, "product_id": prod["id"] if prod else None,
+            "name": name, "units": units, "unit_cost": uc, "pack_word": pack_word,
+            "new": prod is None,
+            "total": int(round((uc or 0) * units)) if uc is not None else None}
+
+
+def _receipt_avg_cost(conn: sqlite3.Connection, shop_id: str, entry: dict):
+    """Weighted-average unit cost after this receipt line (None when unknown)."""
+    if entry.get("unresolved") or entry.get("unit_cost") is None:
+        return None
+    if entry.get("new"):
+        return entry["unit_cost"]
+    row = conn.execute("SELECT stock_qty, cost_cents FROM products WHERE id = ?",
+                       (entry["product_id"],)).fetchone()
+    if row is None or row["cost_cents"] is None or row["stock_qty"] <= 0:
+        return entry["unit_cost"]
+    return ((row["stock_qty"] * row["cost_cents"] + entry["units"] * entry["unit_cost"])
+            / (row["stock_qty"] + entry["units"]))
+
+
+def _render_receipt_preview(conn: sqlite3.Connection, shop_id: str, payload: dict) -> str:
+    stock = sorted(payload["stock"], key=lambda e: e["line_no"])
+    expenses = sorted(payload["expenses"], key=lambda e: e["line_no"])
+    flagged = sorted(payload["flagged"], key=lambda e: e["line_no"])
+    blocks = [f"🧾 *Purchase: {payload['supplier']}*"]
+    lines = []
+    for e in stock:
+        if e.get("unresolved"):
+            flagged.append({"line_no": e["line_no"], "text": e.get("text", ""),
+                            "reason": e.get("reason", "")})
+            continue
+        bit = f"• +{_fmt_qty(e['units'])} {e['name']}"
+        if e.get("pack_word"):
+            bit += f" ({e['pack_word']})"
+        if e.get("new"):
+            bit += " [new]"
+        avg = _receipt_avg_cost(conn, shop_id, e)
+        if avg is None:
+            bit += " @ ?"
+        else:
+            bit += f" @ {cents_to_rand(int(round(avg)))}"
+            if not e.get("new"):
+                old = conn.execute("SELECT cost_cents FROM products WHERE id = ?",
+                                   (e["product_id"],)).fetchone()["cost_cents"]
+                if old is not None and int(round(avg)) != int(round(old)):
+                    bit += f" (was {cents_to_rand(int(round(old)))})"
+        have = 0 if e.get("new") else conn.execute(
+            "SELECT stock_qty FROM products WHERE id = ?", (e["product_id"],)).fetchone()["stock_qty"]
+        bit += f" → stock {_fmt_qty(have)} → {_fmt_qty(have + e['units'])}"
+        lines.append(bit)
+    for e in expenses:
+        lines.append(f"• {e['category'].capitalize()} {cents_to_rand(e['total'])} → expenses")
+    if lines:
+        blocks.append("\n".join(lines))
+    if flagged:
+        blocks.append("❓ *Couldn't read*\n" + "\n".join(
+            f"• line {e['line_no']} '{e.get('text', '')[:60]}' — {e['reason']}"
+            for e in sorted(flagged, key=lambda e: e["line_no"])))
+    computed = sum(e["total"] for e in stock if not e.get("unresolved")
+                   and e["total"] is not None)
+    computed += sum(e["total"] for e in expenses)
+    tail = []
+    if payload.get("total") is not None:
+        if computed == payload["total"]:
+            tail.append(f"• Total {cents_to_rand(computed)} ✅")
+        else:
+            tail.append(f"• ⚠️ Lines add to {cents_to_rand(computed)},"
+                        f" slip says {cents_to_rand(payload['total'])}")
+    if payload.get("vat") is not None:
+        tail.append(f"• Incl. VAT {cents_to_rand(payload['vat'])}")
+    acct = payload["account"]
+    label = payload["supplier"] + " account" if acct == "supplier" else ACCOUNTS[acct]
+    tail.append(f"• Paid from: {label}")
+    if payload.get("account_guessed"):
+        tail[-1] += " (say 'from …' to change)"
+    blocks.append("\n".join(tail))
+    blocks.append("Reply Yes to save, or 'line 2 is ...' / 'from petty cash' to correct.")
+    return "\n\n".join(blocks)
+
+
+def propose_receipt(conn: sqlite3.Connection, shop_id: str, receipt: dict,
+                    photo_hash: str | None = None) -> str:
+    ensure_shop(conn, shop_id)
+    receipt = receipt or {}
+    supplier = str(receipt.get("supplier") or "").strip() or "Wholesaler"
+    receipt_no = str(receipt.get("receipt_no") or "").strip()
+    total = receipt.get("total_cents")
+    if receipt_no:
+        dup = conn.execute(
+            "SELECT * FROM receipts WHERE shop_id = ? AND supplier = ? AND receipt_no = ?"
+            " AND reversed = 0", (shop_id, supplier, receipt_no)).fetchone()
+        if dup is not None:
+            return (f"🧾 Already filed {supplier} {receipt_no}"
+                    f" ({cents_to_rand(total or 0)}). Send a different slip.")
+    account, guessed = _receipt_payment_account(str(receipt.get("payment") or ""))
+    payload: dict = {"supplier": supplier, "date": receipt.get("date") or "",
+                     "receipt_no": receipt_no, "total": total,
+                     "vat": receipt.get("vat_cents"), "account": account,
+                     "account_guessed": guessed, "stock": [], "expenses": [],
+                     "flagged": [], "line_count": 0, "photo_hash": photo_hash}
+    for ln in receipt.get("lines", []) or []:
+        payload["line_count"] = max(payload["line_count"], int(ln.get("line_no") or 0))
+        section, entry = _resolve_receipt_line(conn, shop_id, ln)
+        payload[{"stock": "stock", "expense": "expenses"}.get(section, "flagged")].append(entry)
+    usable = [e for e in payload["stock"] if not e.get("unresolved")] + payload["expenses"]
+    if not usable:
+        out = "❓ Nothing to save from this slip."
+        if payload["flagged"]:
+            out += "\n" + "\n".join(f"• line {e['line_no']} '{e.get('text', '')[:60]}'"
+                                    f" — {e['reason']}" for e in payload["flagged"])
+        return out
+    return _propose(conn, shop_id, "receipt", payload,
+                    _render_receipt_preview(conn, shop_id, payload))
+
+
+def _apply_receipt(conn: sqlite3.Connection, shop_id: str, payload: dict, action_id: str):
+    moves, expense_ids = [], []
+    for e in payload["stock"]:
+        if e.get("unresolved"):
+            continue
+        avg = _receipt_avg_cost(conn, shop_id, e) if e.get("unit_cost") is not None else None
+        if e.get("new"):
+            cur = conn.execute(
+                "INSERT INTO products (shop_id, name, cost_cents, stock_qty)"
+                " VALUES (?, ?, ?, ?)",
+                (shop_id, e["name"], avg, e["units"]))
+            pid, created, old_cost = cur.lastrowid, True, None
+        else:
+            pid, created = e["product_id"], False
+            old_cost = conn.execute("SELECT cost_cents FROM products WHERE id = ?",
+                                    (pid,)).fetchone()["cost_cents"]
+            if avg is not None:
+                conn.execute("UPDATE products SET cost_cents = ? WHERE id = ?",
+                             (avg, pid))
+        conn.execute("UPDATE products SET stock_qty = stock_qty + ? WHERE id = ?",
+                     (e["units"], pid))
+        conn.execute("INSERT INTO stock_moves (shop_id, product_id, delta_qty, reason,"
+                     " action_id, created_at) VALUES (?, ?, ?, 'receipt', ?, ?)",
+                     (shop_id, pid, e["units"], action_id, now_iso()))
+        moves.append({"product_id": pid, "qty": e["units"], "created": created,
+                      "old_cost": old_cost})
+    for e in payload["expenses"]:
+        cur = conn.execute(
+            "INSERT INTO expenses (shop_id, category, amount_cents, account, note, action_id)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (shop_id, e["category"], e["total"], payload["account"],
+             f"receipt {payload['supplier']}", f"{action_id}-e{e['line_no']}"))
+        expense_ids.append(cur.lastrowid)
+    total = sum(e["total"] for e in payload["stock"]
+                if not e.get("unresolved") and e["total"] is not None)
+    total += sum(e["total"] for e in payload["expenses"])
+    acct = payload["account"]
+    if acct == "supplier":
+        _post_supplier(conn, shop_id, payload["supplier"], total, action_id,
+                       note=f"receipt {payload['receipt_no']}")
+        money_line = f"• Owed {payload['supplier']} {cents_to_rand(total)}"
+    else:
+        _post_cash(conn, shop_id, acct, -total, "purchase", action_id,
+                   note=f"receipt {payload['supplier']}")
+        money_line = f"• {ACCOUNTS[acct]} {cents_to_rand(account_balance(conn, shop_id, acct))}"
+    cur = conn.execute(
+        "INSERT INTO receipts (shop_id, supplier, date, receipt_no, total_cents, vat_cents,"
+        " account, image_hash, data_json, action_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (shop_id, payload["supplier"], payload.get("date") or "", payload["receipt_no"],
+         total, payload.get("vat"), acct, payload.get("photo_hash") or "",
+         json.dumps({"lines": payload["stock"] + payload["expenses"]}), action_id))
+    n_stock = len([e for e in payload["stock"] if not e.get("unresolved")])
+    n_exp = len(payload["expenses"])
+    bits = []
+    if n_stock:
+        bits.append(f"{n_stock} stock")
+    if n_exp:
+        bits.append(f"{n_exp} expense")
+    msg = (f"✅ *Receipt saved*\n• {payload['supplier']} {cents_to_rand(total)}"
+           f" — {', '.join(bits)}\n{money_line}")
+    return (msg, "receipt", f"receipt {payload['supplier']} {cents_to_rand(total)}",
+            {"moves": moves, "expense_ids": expense_ids, "receipt_id": cur.lastrowid,
+             "supplier": payload["supplier"]})
+
+
+def _undo_receipt(conn: sqlite3.Connection, shop_id: str, undo: dict, action_id: str) -> str:
+    for m in undo.get("moves", []):
+        if m.get("created"):
+            conn.execute("DELETE FROM products WHERE id = ?", (m["product_id"],))
+        else:
+            _restore_stock(conn, shop_id, m["product_id"], -m["qty"], action_id)
+            conn.execute("UPDATE products SET cost_cents = ? WHERE id = ?",
+                         (m.get("old_cost"), m["product_id"]))
+    for eid in undo.get("expense_ids", []):
+        conn.execute("UPDATE expenses SET reversed = 1 WHERE id = ?", (eid,))
+    conn.execute("UPDATE receipts SET reversed = 1 WHERE id = ?", (undo["receipt_id"],))
+    _reverse_moves(conn, shop_id, action_id)
+    return f"Undone: removed the {undo.get('supplier', 'supplier')} receipt."
+
+
+def correct_receipt_line(conn: sqlite3.Connection, shop_id: str, line_no: int, rest: str) -> str:
+    pend = get_pending(conn, shop_id)
+    if pend is None or pend["action_type"] != "receipt":
+        return "No receipt preview to correct."
+    payload = json.loads(pend["payload_json"])
+    if line_no < 1 or line_no > (payload.get("line_count") or 0):
+        return f"Line {line_no} isn't on this slip."
+    toks = (rest or "").split()
+    try:
+        qty = float(toks[0])
+        toks = toks[1:]
+    except (ValueError, IndexError):
+        return "Say the units too, e.g. 'line 2 is 12 coke'."
+    if qty <= 0 or not toks:
+        return "Say the units too, e.g. 'line 2 is 12 coke'."
+    cost = None
+    if len(toks) >= 2:
+        m = re.fullmatch(r"@?r?(\d+(?:\.\d{1,2})?)", toks[-1])
+        if m:
+            cost = int(round(float(m.group(1)) * 100))
+            toks = toks[:-1]
+    if not toks:
+        return "Say the units too, e.g. 'line 2 is 12 coke'."
+    shop = ensure_shop(conn, shop_id)
+    prod, ambiguous = _resolve_book_item(conn, shop_id, " ".join(toks))
+    if prod is None and ambiguous:
+        names = ", ".join(p["name"] for p in ambiguous[:2])
+        entry: dict = {"line_no": line_no, "text": rest, "reason": f"which one: {names}?",
+                       "unresolved": True}
+    else:
+        entry = {"line_no": line_no, "product_id": prod["id"] if prod else None,
+                 "name": prod["name"] if prod else " ".join(toks).strip().title(),
+                 "units": qty, "unit_cost": cost, "pack_word": None,
+                 "new": prod is None,
+                 "total": int(round(cost * qty)) if cost is not None else None}
+    for key in ("stock", "expenses", "flagged"):
+        payload[key] = [e for e in payload[key] if e["line_no"] != line_no]
+    if entry.get("unresolved"):
+        payload["flagged"].append({k: entry[k] for k in ("line_no", "text", "reason")})
+    else:
+        payload["stock"].append(entry)
+    preview = _render_receipt_preview(conn, shop_id, payload)
+    conn.execute("UPDATE pending_actions SET payload_json = ?, preview_text = ? WHERE id = ?",
+                 (json.dumps(payload), preview, pend["id"]))
+    conn.commit()
+    return preview
+
+
+def correct_receipt_account(conn: sqlite3.Connection, shop_id: str, account: str) -> str:
+    pend = get_pending(conn, shop_id)
+    if pend is None or pend["action_type"] != "receipt":
+        return "No receipt preview to correct."
+    shop = ensure_shop(conn, shop_id)
+    payload = json.loads(pend["payload_json"])
+    payload["account"] = account
+    payload["account_guessed"] = False
+    preview = _render_receipt_preview(conn, shop_id, payload)
+    conn.execute("UPDATE pending_actions SET payload_json = ?, preview_text = ? WHERE id = ?",
+                 (json.dumps(payload), preview, pend["id"]))
+    conn.commit()
+    return preview
+
+
+def list_receipts(conn: sqlite3.Connection, shop_id: str, month: str | None = None) -> str:
+    ensure_shop(conn, shop_id)
+    m = (month or "").strip()
+    if re.fullmatch(r"\d{4}-\d{2}", m):
+        pass
+    elif m:
+        m = parse_month_name(m) or today_str()[:7]
+    else:
+        m = today_str()[:7]
+    rows = conn.execute(
+        "SELECT * FROM receipts WHERE shop_id = ? AND reversed = 0"
+        f" AND {_SAST_MONTH} = ? ORDER BY created_at", (shop_id, m)).fetchall()
+    label = date(int(m[:4]), int(m[5:7]), 1).strftime("%B %Y")
+    if not rows:
+        return f"No receipts filed for {label}."
+    short = {"cash": "till", "petty": "petty", "bank": "bank", "supplier": "supplier"}
+    lines = [f"🧾 *Receipts: {label}*"]
+    for r in rows:
+        no = f" {r['receipt_no']}" if r["receipt_no"] else ""
+        lines.append(f"• {_fmt_date(r['created_at'][:10])} {r['supplier']}{no}"
+                     f" {cents_to_rand(r['total_cents'] or 0)}"
+                     f" ({short.get(r['account'], r['account'])})")
+    lines.append(f"\nTotal {cents_to_rand(sum(r['total_cents'] or 0 for r in rows))}")
+    return "\n".join(lines)
+
+
+def month_end_report(conn: sqlite3.Connection, shop_id: str,
+                    month: str | None = None) -> str:
+    """Generate the month-end PDF + PNG card and queue them as WhatsApp media."""
+    import os as _os
+
+    from app import reports as _reports
+
+    from app.agent import queue_media as _queue
+    ensure_shop(conn, shop_id)
+    m = (month or "").strip()
+    if m and not re.fullmatch(r"\d{4}-\d{2}", m):
+        m = parse_month_name(m) or ""
+    text, media = _reports.build_month_end(
+        conn, shop_id, m or None, _os.environ.get("SISI_PUBLIC_URL", ""))
+    _queue(shop_id, media)
+    return text
+
+
+def get_order_draft(conn: sqlite3.Connection, shop_id: str) -> dict | None:
+    row = conn.execute("SELECT payload_json FROM order_drafts WHERE shop_id = ?",
+                       (shop_id,)).fetchone()
+    return json.loads(row["payload_json"]) if row else None
+
+
+def _save_order_draft(conn: sqlite3.Connection, shop_id: str, payload: dict) -> None:
+    conn.execute("INSERT INTO order_drafts (shop_id, payload_json, updated_at)"
+                 " VALUES (?, ?, ?) ON CONFLICT (shop_id) DO UPDATE SET"
+                 " payload_json = excluded.payload_json, updated_at = excluded.updated_at",
+                 (shop_id, json.dumps(payload), now_iso()))
+    conn.commit()
+
+
+def _render_order(shop_name: str, payload: dict) -> str:
+    groups: dict[str, list] = {}
+    for ln in payload["lines"]:
+        groups.setdefault(ln["wholesaler"] or "No wholesaler", []).append(ln)
+    blocks = ["📋 *Order draft*"]
+    for w, items in groups.items():
+        bl = [f"*{w}*"]
+        for ln in items:
+            if ln["packs"]:
+                word = ln["pack_name"] if ln["packs"] == 1 else _plural_pack(ln["pack_name"])
+                qty = f"{_fmt_qty(ln['packs'])} {word} ({_fmt_qty(ln['units'])} units)"
+            else:
+                qty = f"{_fmt_qty(ln['units'])} units"
+            line = f"• {ln['name']} — {qty}"
+            line += (f" ≈ {cents_to_rand(ln['est_cents'])}"
+                     if ln["est_cents"] is not None else " (no cost yet)")
+            bl.append(line)
+        blocks.append("\n".join(bl))
+    known = [ln["est_cents"] for ln in payload["lines"] if ln["est_cents"] is not None]
+    unknown = len(payload["lines"]) - len(known)
+    total = f"🛒 *Order total* ≈ {cents_to_rand(sum(known))}"
+    if unknown:
+        total += f" (excl. {unknown} without cost)"
+    blocks.append(total)
+    blocks.append("Say 'send it' to forward, or 'add …' / 'remove …' to edit.")
+    return "\n\n".join(blocks)
+
+
+def build_order(conn: sqlite3.Connection, shop_id: str) -> str:
+    """Draft a restock order from low items, sales rate and pack sizes."""
+    shop = ensure_shop(conn, shop_id)
+    rows = conn.execute(
+        "SELECT * FROM products WHERE shop_id = ? AND stock_qty <= reorder_level"
+        " ORDER BY wholesaler, name", (shop_id,)).fetchall()
+    if not rows:
+        conn.execute("DELETE FROM order_drafts WHERE shop_id = ?", (shop_id,))
+        conn.commit()
+        return "✅ Nothing to order. Stock is fine."
+    start = (date.fromisoformat(today_str()) - timedelta(days=6)).isoformat()
+    lines = []
+    for r in rows:
+        target = max(r["reorder_level"] * 2,
+                     math.ceil(_avg_daily_sales(conn, shop_id, r["id"], start) * 7))
+        need = max(0.0, target - r["stock_qty"])
+        if not need:
+            continue
+        if r["pack_size"]:
+            packs = math.ceil(need / r["pack_size"])
+            units = packs * r["pack_size"]
+        else:
+            packs, units = None, need
+        est = int(round(units * r["cost_cents"])) if r["cost_cents"] is not None else None
+        lines.append({"product_id": r["id"], "name": r["name"],
+                      "wholesaler": r["wholesaler"] or "", "units": units, "packs": packs,
+                      "pack_name": r["pack_name"] or "", "est_cents": est})
+    if not lines:
+        return "✅ Nothing to order. Stock is fine."
+    payload = {"lines": lines, "sent": []}
+    _save_order_draft(conn, shop_id, payload)
+    return _render_order(shop["name"], payload)
+
+
+def send_order(conn: sqlite3.Connection, shop_id: str, wholesaler: str | None = None) -> str:
+    """Format one wholesaler's order lines as a forwardable message. Never sends it."""
+    shop = ensure_shop(conn, shop_id)
+    draft = get_order_draft(conn, shop_id)
+    if not draft or not draft.get("lines"):
+        return "No order draft. Say 'order stock' first."
+    groups: dict[str, list] = {}
+    for ln in draft["lines"]:
+        groups.setdefault(ln["wholesaler"] or "No wholesaler", []).append(ln)
+    if wholesaler:
+        want = (wholesaler or "").strip().lower()
+        match = next((g for g in groups if want in g.lower() or g.lower() in want), None)
+        if match is None:
+            return f"❓ Nothing for {wholesaler.strip()} on this order."
+        groups = {match: groups[match]}
+    if len(groups) > 1:
+        return "Which wholesaler? Say 'send it Jumbo'."
+    w, items = next(iter(groups.items()))
+    if w in (draft.get("sent") or []):
+        return "That order was already sent. Say 'order stock' to build a new one."
+    draft["sent"] = sorted(set(draft.get("sent") or []) | {w})
+    _save_order_draft(conn, shop_id, draft)
+    lines = []
+    for ln in items:
+        if ln["packs"]:
+            word = ln["pack_name"] if ln["packs"] == 1 else _plural_pack(ln["pack_name"])
+            lines.append(f"• {ln['name']} x {_fmt_qty(ln['packs'])} {word}")
+        else:
+            lines.append(f"• {ln['name']} x {_fmt_qty(ln['units'])}")
+    out = f"Hello {w}! Order from {shop['name']}:\n\n" + "\n".join(lines)
+    known = [ln["est_cents"] for ln in items if ln["est_cents"] is not None]
+    if known:
+        out += f"\n\nTotal ± {cents_to_rand(sum(known))}"
+    return out + "\nThank you!"
+
+
+def edit_order_add(conn: sqlite3.Connection, shop_id: str, product: str,
+                   qty: float, unit: str | None = None):
+    shop = ensure_shop(conn, shop_id)
+    draft = get_order_draft(conn, shop_id)
+    if not draft:
+        return "No order draft. Say 'order stock' first."
+    try:
+        qty = float(qty)
+    except (TypeError, ValueError):
+        return "How many?"
+    if qty <= 0:
+        return "How many?"
+    prod, ambiguous = _find_products(conn, shop_id, product or "")
+    if prod is None:
+        if ambiguous:
+            return _which_one(ambiguous)
+        return (f"❓ *{(product or '').strip()} isn't on the shelf list.*\n"
+                "Add it to stock first?")
+    units, is_pack, no_pack = _resolve_units(prod["pack_name"], prod["pack_size"], qty, unit)
+    if no_pack:
+        first = prod["name"].split()[0].lower()
+        return (f"❓ {prod['name']} has no {_pack_echo(unit)} size."
+                f" Add singles? e.g. 'add {first} 12'.")
+    packs = qty if is_pack else None
+    est = int(round(units * prod["cost_cents"])) if prod["cost_cents"] is not None else None
+    line = {"product_id": prod["id"], "name": prod["name"],
+            "wholesaler": prod["wholesaler"] or "", "units": units, "packs": packs,
+            "pack_name": prod["pack_name"] or "", "est_cents": est}
+    kept = [ln for ln in draft["lines"] if ln["product_id"] != prod["id"]]
+    kept.append(line)
+    kept.sort(key=lambda ln: (ln["wholesaler"], ln["name"]))
+    draft["lines"] = kept
+    _save_order_draft(conn, shop_id, draft)
+    return _render_order(shop["name"], draft)
+
+
+def edit_order_remove(conn: sqlite3.Connection, shop_id: str, product: str):
+    shop = ensure_shop(conn, shop_id)
+    draft = get_order_draft(conn, shop_id)
+    if not draft:
+        return "No order draft. Say 'order stock' first."
+    prod, _ = _find_products(conn, shop_id, product or "")
+    pid = prod["id"] if prod else None
+    kept = [ln for ln in draft["lines"] if ln["product_id"] != pid]
+    if len(kept) == len(draft["lines"]):
+        return f"❓ {(product or '').strip()} isn't on the order. Say 'order stock' to see it."
+    if not kept:
+        conn.execute("DELETE FROM order_drafts WHERE shop_id = ?", (shop_id,))
+        conn.commit()
+        return "Order cleared. Say 'order stock' to rebuild."
+    draft["lines"] = kept
+    _save_order_draft(conn, shop_id, draft)
+    return _render_order(shop["name"], draft)
+
+
+def cash_balances(conn: sqlite3.Connection, shop_id: str) -> str:
+    ensure_shop(conn, shop_id)
+    bals = {a: account_balance(conn, shop_id, a) for a in ("cash", "petty", "bank")}
+    return ("💰 *Cash*\n"
+            f"• Till {cents_to_rand(bals['cash'])}\n"
+            f"• Petty cash {cents_to_rand(bals['petty'])}\n"
+            f"• Bank {cents_to_rand(bals['bank'])}\n\n"
+            f"Total {cents_to_rand(sum(bals.values()))}")
+
+
+def set_float(conn: sqlite3.Connection, shop_id: str, amounts: dict) -> str:
+    """Set opening floats once per account. Later corrections go via count."""
+    ensure_shop(conn, shop_id)
+    lines, skipped = [], []
+    for acct in ("cash", "petty", "bank"):
+        if acct not in (amounts or {}):
+            continue
+        try:
+            amount = int(amounts[acct])
+        except (TypeError, ValueError):
+            continue
+        if amount < 0:
+            continue
+        has = conn.execute("SELECT COUNT(*) c FROM cash_moves WHERE shop_id = ? AND account = ?",
+                           (shop_id, acct)).fetchone()["c"]
+        if has:
+            skipped.append(f"{ACCOUNTS[acct]} already has"
+                           f" {cents_to_rand(account_balance(conn, shop_id, acct))}")
+            continue
+        _post_cash(conn, shop_id, acct, amount, "opening", f"float-{shop_id}-{acct}",
+                   note="opening float")
+        lines.append(f"• {ACCOUNTS[acct]} {cents_to_rand(amount)}")
+    conn.commit()
+    if not lines and not skipped:
+        return "❓ How much is the float? e.g. 'float R500'."
+    out = ""
+    if lines:
+        out = "✅ *Opening float set*\n" + "\n".join(lines)
+    if skipped:
+        tail = "; ".join(skipped) + ". Say 'counted R…' to correct it."
+        out = (out + "\n" + tail) if out else tail
+    return out
 
 
 def _restore_stock(conn: sqlite3.Connection, shop_id: str, product_id: int, qty: float,
@@ -1270,6 +2550,7 @@ def _restore_stock(conn: sqlite3.Connection, shop_id: str, product_id: int, qty:
 def _undo_sale(conn: sqlite3.Connection, shop_id: str, undo: dict, action_id: str) -> str:
     sale = conn.execute("SELECT * FROM sales WHERE id = ?", (undo["sale_id"],)).fetchone()
     conn.execute("UPDATE sales SET reversed = 1 WHERE id = ?", (undo["sale_id"],))
+    _reverse_moves(conn, shop_id, action_id)
     stock = _restore_stock(conn, shop_id, undo["product_id"], undo["qty"], action_id)
     if undo.get("credit_id"):
         conn.execute("UPDATE credit_entries SET reversed = 1 WHERE id = ?", (undo["credit_id"],))
@@ -1285,6 +2566,7 @@ def _undo_sale(conn: sqlite3.Connection, shop_id: str, undo: dict, action_id: st
 def _undo_stock(conn: sqlite3.Connection, shop_id: str, undo: dict, action_id: str) -> str:
     pid = undo["product_id"]
     name = conn.execute("SELECT name FROM products WHERE id = ?", (pid,)).fetchone()["name"]
+    _reverse_moves(conn, shop_id, action_id)
     stock = _restore_stock(conn, shop_id, pid, -undo["qty"], action_id)
     if not undo.get("created"):
         sets, params = ["wholesaler = ?"], [undo.get("old_wholesaler", "")]
@@ -1346,12 +2628,36 @@ def undo_last(conn: sqlite3.Connection, shop_id: str) -> str:
         (shop_id,)).fetchone()
     if row is None:
         return "There is nothing to undo."
+    return _undo_row(conn, shop_id, row)
+
+
+def undo_last_kind(conn: sqlite3.Connection, shop_id: str, kind: str, nothing_msg: str) -> str:
+    """Undo the most recent action of one kind, even when it is not the last."""
+    ensure_shop(conn, shop_id)
+    row = conn.execute(
+        "SELECT * FROM actions WHERE shop_id = ? AND undone = 0 AND kind = ?"
+        " ORDER BY rowid DESC LIMIT 1",
+        (shop_id, kind)).fetchone()
+    if row is None:
+        return nothing_msg
+    return _undo_row(conn, shop_id, row)
+
+
+def _undo_row(conn: sqlite3.Connection, shop_id: str, row) -> str:
     undo = json.loads(row["data_json"])
     kind = row["kind"]
     if kind == "credit":
         msg = _undo_credit(conn, shop_id, undo)
     elif kind == "payment":
-        msg = _undo_payment(conn, shop_id, undo)
+        msg = _undo_payment(conn, shop_id, undo, row["action_id"])
+    elif kind == "expense":
+        msg = _undo_expense(conn, shop_id, undo, row["action_id"])
+    elif kind == "drawing":
+        msg = _undo_cash_only(conn, shop_id, undo, row["action_id"], "drawing")
+    elif kind == "count":
+        msg = _undo_cash_only(conn, shop_id, undo, row["action_id"], "cash count")
+    elif kind == "supplier_payment":
+        msg = _undo_cash_only(conn, shop_id, undo, row["action_id"], "supplier payment")
     elif kind in ("sale_cash", "sale_credit"):
         msg = _undo_sale(conn, shop_id, undo, row["action_id"])
     elif kind == "stock":
@@ -1362,6 +2668,10 @@ def undo_last(conn: sqlite3.Connection, shop_id: str) -> str:
         msg = _undo_expiry(conn, shop_id, undo)
     elif kind == "slip":
         msg = _undo_slip(conn, shop_id, undo, row["action_id"])
+    elif kind == "book":
+        msg = _undo_book(conn, shop_id, undo, row["action_id"])
+    elif kind == "receipt":
+        msg = _undo_receipt(conn, shop_id, undo, row["action_id"])
     else:
         return "I cannot undo that one."
     conn.execute("UPDATE actions SET undone = 1, undone_at = ? WHERE action_id = ?",
@@ -1372,7 +2682,13 @@ def undo_last(conn: sqlite3.Connection, shop_id: str) -> str:
 
 _APPLIERS = {
     "add_credit": _apply_add_credit,
+    "book_page": _apply_book_page,
+    "receipt": _apply_receipt,
     "record_payment": _apply_record_payment,
+    "record_expense": _apply_record_expense,
+    "record_drawing": _apply_record_drawing,
+    "record_count": _apply_record_count,
+    "record_supplier_payment": _apply_supplier_payment,
     "record_sale": _apply_record_sale,
     "add_stock": _apply_add_stock,
     "set_price": _apply_set_price,
@@ -1401,8 +2717,46 @@ TOOL_DEFS = [
                                     "unit": {"type": "string"}},
                      "required": ["product", "qty"]}}}, ["customer", "items"]),
     _tool("record_payment", "Record a customer paying into the credit book.",
-          {"customer": {"type": "string"}, "amount_cents": {"type": "integer"}},
+          {"customer": {"type": "string"}, "amount_cents": {"type": "integer"},
+           "account": {"type": "string",
+                       "description": "cash, petty or bank (default cash)"}},
           ["customer", "amount_cents"]),
+    _tool("record_expense", "Record shop spending with a category: transport,"
+          " electricity, rent, airtime, wages, other. Use for 'took R200 petty"
+          " cash for transport', 'paid R150 electricity'.",
+          {"amount_cents": {"type": "integer"}, "category": {"type": "string"},
+           "account": {"type": "string",
+                       "description": "cash, petty or bank (default cash)"},
+           "note": {"type": "string"}}, ["amount_cents"]),
+    _tool("record_drawing", "Owner takes cash for personal use ('took R500 for myself').",
+          {"amount_cents": {"type": "integer"}, "account": {"type": "string"},
+           "note": {"type": "string"}}, ["amount_cents"]),
+    _tool("record_count", "Physical cash count. Use for 'counted R1,240': compares"
+          " with the book and shows over/short.",
+          {"amount_cents": {"type": "integer"}}, ["amount_cents"]),
+    _tool("record_supplier_payment", "Pay a wholesaler/supplier account.",
+          {"supplier": {"type": "string"}, "amount_cents": {"type": "integer"},
+           "account": {"type": "string"}}, ["supplier", "amount_cents"]),
+    _tool("cash_balances", "Till, petty cash and bank balances with the total."
+          " Use for 'cash in hand?', 'how much petty cash?'.", {}, []),
+    _tool("sales_summary", "Cash, credit and total sales for a period.",
+          {"period": {"type": "string",
+                      "description": "today, week or month"}}, []),
+    _tool("profit_month", "Month profit: sales, cost of sales, gross and margin,"
+          " expenses, net. Use for 'what is our profit this month?'.",
+          {"month": {"type": "string", "description": "YYYY-MM, default this month"}},
+          []),
+    _tool("list_receipts", "Filed purchase receipts for a month with the total."
+          " Use for 'show my receipts this month'.",
+          {"month": {"type": "string",
+                     "description": "YYYY-MM or month name, default this month"}},
+          []),
+    _tool("month_end_report", "Month-end management accounts: renders the branded"
+          " PDF + PNG summary card and queues them as WhatsApp media. Use for"
+          " 'month-end report' or 'report September'.",
+          {"month": {"type": "string",
+                     "description": "YYYY-MM or month name; omit for the books due"}},
+          []),
     _tool("get_balance", "How much ONE named customer owes on the credit book. Needs a name.",
           {"customer": {"type": "string"}}, ["customer"]),
     _tool("list_debtors", "Everyone who owes on the credit book, with the total.", {}, []),
@@ -1424,7 +2778,10 @@ TOOL_DEFS = [
           {"product": {"type": "string"}, "qty": {"type": "number"},
            "wholesaler": {"type": "string"}, "cost_cents": {"type": "integer"},
            "price_cents": {"type": "integer"}, "unit": {"type": "string"},
-           "pack_price_cents": {"type": "integer"}}, ["product", "qty"]),
+           "pack_price_cents": {"type": "integer"},
+           "account": {"type": "string", "description": "cash, petty, bank or"
+                       " supplier when bought on the supplier's account"}},
+          ["product", "qty"]),
     _tool("set_price", "Set a product's selling price in cents. Single price by"
           " default; for_pack=true sets the pack sell price ('chappies box R95').",
           {"product": {"type": "string"}, "price_cents": {"type": "integer"},
@@ -1458,6 +2815,15 @@ TOOL_DEFS = [
 TOOL_FUNCS = {
     "add_credit": add_credit,
     "record_payment": record_payment,
+    "record_expense": record_expense,
+    "record_drawing": record_drawing,
+    "record_count": record_count,
+    "record_supplier_payment": record_supplier_payment,
+    "cash_balances": cash_balances,
+    "sales_summary": sales_summary,
+    "profit_month": profit_month,
+    "list_receipts": list_receipts,
+    "month_end_report": month_end_report,
     "get_balance": get_balance,
     "list_debtors": list_debtors,
     "draft_reminder": draft_reminder,

@@ -153,6 +153,12 @@ class WhatsAppSender:
     def send_buttons(self, to: str, body: str, buttons: list[str]) -> None:
         raise NotImplementedError
 
+    def send_image(self, to: str, url: str, caption: str = "") -> None:
+        raise NotImplementedError
+
+    def send_file(self, to: str, url: str, filename: str, caption: str = "") -> None:
+        raise NotImplementedError
+
 
 class FakeSender(WhatsAppSender):
     """In-memory sender for local dev and tests. Thread-safe."""
@@ -171,6 +177,17 @@ class FakeSender(WhatsAppSender):
             self.sent.append({"to": to, "type": "buttons", "body": body,
                               "buttons": list(buttons)})
         log.info("fake -> %s: %.80s %s", to, body, buttons)
+
+    def send_image(self, to: str, url: str, caption: str = "") -> None:
+        with self._lock:
+            self.sent.append({"to": to, "type": "image", "url": url, "body": caption})
+        log.info("fake -> %s: image %s", to, url)
+
+    def send_file(self, to: str, url: str, filename: str, caption: str = "") -> None:
+        with self._lock:
+            self.sent.append({"to": to, "type": "file", "url": url,
+                              "filename": filename, "body": caption})
+        log.info("fake -> %s: file %s", to, url)
 
     def pop_shop(self, shop_id: str) -> list[dict]:
         """Take and clear queued messages for one shop (simulator polling)."""
@@ -223,6 +240,15 @@ class CloudApiSender(WhatsAppSender):
         self._post({"messaging_product": "whatsapp", "to": to, "type": "interactive",
                     "interactive": {"type": "button", "body": {"text": body[:1024]},
                                     "action": {"buttons": action}}})
+
+    def send_image(self, to: str, url: str, caption: str = "") -> None:
+        self._post({"messaging_product": "whatsapp", "to": to, "type": "image",
+                    "image": {"link": url, "caption": caption[:1024]}})
+
+    def send_file(self, to: str, url: str, filename: str, caption: str = "") -> None:
+        self._post({"messaging_product": "whatsapp", "to": to, "type": "document",
+                    "document": {"link": url, "filename": filename[:255],
+                                 "caption": caption[:1024]}})
 
 
 _fake = FakeSender()

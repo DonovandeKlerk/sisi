@@ -242,8 +242,11 @@ def test_vonage_voice_note_end_to_end(vg_env, monkeypatch):
 def test_vonage_image_end_to_end(vg_env, monkeypatch):
     monkeypatch.setenv("SISI_TODAY", "2026-11-01")
     monkeypatch.setattr(main, "download_vonage_media", lambda _url: b"jpg-bytes")
-    monkeypatch.setattr(agent, "read_expiry_photo", lambda *a, **k: [
-        {"product": "Fresh Milk 1L", "qty": 2, "expiry_date": "2026-10-30"}])
+    monkeypatch.setattr(agent, "read_shop_photo", lambda *a, **k: {
+        "doc_type": "expiry", "book": {}, "receipt": {},
+        "expiry": {"stamp_count": 1, "items": [
+            {"product": "Fresh Milk 1L", "qty": 2,
+             "expiry_date": "2026-10-30"}]}})
     fake = _FakePost()
     monkeypatch.setattr(vonage.httpx, "post", fake)
     client = TestClient(app)

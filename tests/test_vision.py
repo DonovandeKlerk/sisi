@@ -61,6 +61,12 @@ def _tiny_jpg() -> bytes:
         "AAAAAP/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AK//Z")
 
 
+def _expiry_doc(items):
+    return {"doc_type": "expiry",
+            "expiry": {"stamp_count": len(items), "items": items},
+            "book": {}, "receipt": {}}
+
+
 # --- vision request shape (stubbed API) ------------------------------------
 
 
@@ -150,14 +156,14 @@ def test_handle_photo_proposes_preview(photo_env, monkeypatch):
     import app.db as db
 
     monkeypatch.setenv("SISI_TODAY", "2026-11-01")
-    monkeypatch.setattr(agent, "read_expiry_photo", lambda *a, **k: [
-        {"product": "Fresh Milk 1L", "qty": 2, "expiry_date": "2026-10-30"}])
+    monkeypatch.setattr(agent, "read_shop_photo", lambda *a, **k: _expiry_doc([
+        {"product": "Fresh Milk 1L", "qty": 2, "expiry_date": "2026-10-30"}]))
     conn = db.connect(str(photo_env / "photo.db"))
     try:
         findings, reply, buttons = agent.handle_photo(conn, SHOP, b"jpg")
     finally:
         conn.close()
-    assert findings[0]["product"] == "Fresh Milk 1L"
+    assert findings["expiry"]["items"][0]["product"] == "Fresh Milk 1L"
     assert "• 2 × Fresh Milk 1L 30 Oct — expired" in reply
     assert buttons == ["Yes", "No"]
 
@@ -165,19 +171,19 @@ def test_handle_photo_proposes_preview(photo_env, monkeypatch):
 def test_handle_photo_nothing_readable(photo_env, monkeypatch):
     import app.db as db
 
-    monkeypatch.setattr(agent, "read_expiry_photo", lambda *a, **k: [])
+    monkeypatch.setattr(agent, "read_shop_photo", lambda *a, **k: _expiry_doc([]))
     conn = db.connect(str(photo_env / "photo.db"))
     try:
         findings, reply, buttons = agent.handle_photo(conn, SHOP, b"jpg")
     finally:
         conn.close()
-    assert (findings, buttons) == ([], None)
+    assert findings["doc_type"] == "expiry" and buttons is None
     assert "could not read any dates" in reply
 
     def boom(*a, **k):
         raise VisionError(CANT_READ)
 
-    monkeypatch.setattr(agent, "read_expiry_photo", boom)
+    monkeypatch.setattr(agent, "read_shop_photo", boom)
     conn = db.connect(str(photo_env / "photo.db"))
     try:
         findings, reply, buttons = agent.handle_photo(conn, SHOP, b"jpg")
@@ -188,14 +194,14 @@ def test_handle_photo_nothing_readable(photo_env, monkeypatch):
 
 def test_sim_photo_endpoint(photo_env, monkeypatch):
     monkeypatch.setenv("SISI_TODAY", "2026-11-01")
-    monkeypatch.setattr(agent, "read_expiry_photo", lambda *a, **k: [
-        {"product": "Fresh Milk 1L", "qty": 2, "expiry_date": "2026-10-30"}])
+    monkeypatch.setattr(agent, "read_shop_photo", lambda *a, **k: _expiry_doc([
+        {"product": "Fresh Milk 1L", "qty": 2, "expiry_date": "2026-10-30"}]))
     client = TestClient(app)
     r = client.post("/_sim/photo", params={"shop": SHOP}, content=b"jpg-bytes",
                     headers={"Content-Type": "image/jpeg"})
     assert r.status_code == 200
     data = r.json()
-    assert data["findings"][0]["qty"] == 2
+    assert data["findings"]["expiry"]["items"][0]["qty"] == 2
     assert "expired" in data["reply"]
     assert data["buttons"] == ["Yes", "No"]
 
@@ -213,8 +219,8 @@ def test_webhook_image_message_end_to_end(photo_env, monkeypatch):
 
     monkeypatch.setenv("SISI_TODAY", "2026-11-01")
     monkeypatch.setattr(main, "download_media", lambda _mid, _label="voice note": b"jpg")
-    monkeypatch.setattr(agent, "read_expiry_photo", lambda *a, **k: [
-        {"product": "Fresh Milk 1L", "qty": 2, "expiry_date": "2026-10-30"}])
+    monkeypatch.setattr(agent, "read_shop_photo", lambda *a, **k: _expiry_doc([
+        {"product": "Fresh Milk 1L", "qty": 2, "expiry_date": "2026-10-30"}]))
     payload = {"object": "whatsapp_business_account", "entry": [{"changes": [{
         "value": {"messages": [{"id": "wamid.p1", "from": SHOP, "type": "image",
                                 "image": {"id": "media-1", "mime_type": "image/jpeg"}}]}}]}]}

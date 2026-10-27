@@ -65,6 +65,128 @@ EXPIRY_PROMPT = (
 
 CANT_READ = "I couldn't read that photo. Try a closer shot of the date stamp."
 
+SHOP_PHOTO_SCHEMA = {
+    "name": "shop_photo",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "doc_type": {"type": "string",
+                         "enum": ["expiry", "book_page", "receipt", "other"]},
+            "expiry": {
+                "type": "object",
+                "properties": {
+                    "stamp_count": {"type": "number"},
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "product": {"type": "string"},
+                                "qty": {"type": "number"},
+                                "expiry_date": {"type": "string"},
+                            },
+                            "required": ["product", "qty", "expiry_date"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["stamp_count", "items"],
+                "additionalProperties": False,
+            },
+            "book": {
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string"},
+                    "page_total_cents": {"type": ["integer", "null"]},
+                    "crossed_out": {"type": "integer"},
+                    "lines": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "line_no": {"type": "integer"},
+                                "text": {"type": "string"},
+                                "item": {"type": "string"},
+                                "qty": {"type": "number"},
+                                "price_cents": {"type": ["integer", "null"]},
+                                "kind": {"type": "string", "enum": ["cash", "credit",
+                                                                    "payment", "unreadable"]},
+                                "customer": {"type": "string"},
+                            },
+                            "required": ["line_no", "text", "item", "qty",
+                                         "price_cents", "kind", "customer"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["date", "page_total_cents", "crossed_out", "lines"],
+                "additionalProperties": False,
+            },
+            "receipt": {
+                "type": "object",
+                "properties": {
+                    "supplier": {"type": "string"},
+                    "date": {"type": "string"},
+                    "receipt_no": {"type": "string"},
+                    "lines": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "line_no": {"type": "integer"},
+                                "text": {"type": "string"},
+                                "item": {"type": "string"},
+                                "packs": {"type": ["number", "null"]},
+                                "pack_size": {"type": ["number", "null"]},
+                                "qty_units": {"type": ["number", "null"]},
+                                "unit_cost_cents": {"type": ["integer", "null"]},
+                                "line_total_cents": {"type": ["integer", "null"]},
+                            },
+                            "required": ["line_no", "text", "item", "packs",
+                                         "pack_size", "qty_units", "unit_cost_cents",
+                                         "line_total_cents"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "vat_cents": {"type": ["integer", "null"]},
+                    "total_cents": {"type": ["integer", "null"]},
+                    "payment": {"type": "string"},
+                },
+                "required": ["supplier", "date", "receipt_no", "lines",
+                             "vat_cents", "total_cents", "payment"],
+                "additionalProperties": False,
+            },
+        },
+        "required": ["doc_type", "expiry", "book", "receipt"],
+        "additionalProperties": False,
+    },
+}
+
+SHOP_PHOTO_PROMPT = (
+    "This photo is from a small South African shop. First decide what it is: "
+    "'expiry' (shelf/fridge/counter with date stamps), 'book_page' (a handwritten "
+    "sales or credit page from the shop book), 'receipt' (a printed till slip or "
+    "invoice from a wholesaler), or 'other'. Fill only that section; leave the "
+    "others empty. "
+    "EXPIRY: count every readable best-before/use-by/expiry stamp, one entry per "
+    "stamp (product as printed, identical-item count, date as YYYY-MM-DD; SA packs "
+    "print DD/MM/YYYY so convert carefully). Never use PD/MAN dates. "
+    "BOOK PAGE: transcribe every written line with its line number and the raw "
+    "text. Skip crossed-out lines (count them in crossed_out) and skip the page's "
+    "own total line (put it in page_total_cents). For each kept line: the item as "
+    "written (keep abbreviations like chap, brd, stny and isiZulu spellings as-is), "
+    "qty as written (default 1; quantities are loose singles), the written price in "
+    "cents or null, kind (cash sale, credit sale with the customer's name, a credit "
+    "payment with the customer, or unreadable), and the customer first name or ''. "
+    "RECEIPT: supplier name, receipt date as YYYY-MM-DD, receipt/invoice number, "
+    "every line (item as printed, packs and pack size when shown, total single "
+    "units when you can tell, unit cost and line total in cents, null when not "
+    "shown), VAT in cents or null, receipt total in cents or null, and the payment "
+    "word as printed (cash, card, account, or ''). Use only values you can actually "
+    "read; never invent a number."
+)
+
 
 class VisionError(Exception):
     """User-facing vision failure; message is safe to send to the owner."""
@@ -141,3 +263,97 @@ def read_expiry_photo(image: bytes, shop_id: str = "") -> list[dict]:
         if name and qty > 0:
             findings.append({"product": name, "qty": qty, "expiry_date": exp})
     return findings
+
+
+def _sane_cents(val) -> int | None:
+    try:
+        val = int(val)
+    except (TypeError, ValueError):
+        return None
+    return val if val >= 0 else None
+
+
+def _sane_date(val) -> str:
+    exp = str(val or "").strip()
+    try:
+        date.fromisoformat(exp)
+    except ValueError:
+        return ""
+    return exp
+
+
+def read_shop_photo(image: bytes, shop_id: str = "") -> dict:
+    """Classify a shop photo and extract its lines (one strict-schema call)."""
+    if not os.environ.get("MODEL_API_KEY", ""):
+        raise VisionError("I can't read photos right now. Tell me the dates in words?")
+    if not image or len(image) > MAX_IMAGE_BYTES:
+        raise VisionError(CANT_READ)
+    prepared, mime = _prepare_image(image)
+    data_url = f"data:{mime};base64," + base64.b64encode(prepared).decode("ascii")
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": SHOP_PHOTO_PROMPT},
+        {"type": "image_url", "image_url": {"url": data_url}},
+    ]}]
+    try:
+        resp = _complete_vision(
+            messages, {"type": "json_schema", "json_schema": SHOP_PHOTO_SCHEMA})
+    except Exception as e:  # noqa: BLE001 - API outage must not crash the chat
+        print_api_error(e)
+        raise VisionError(CANT_READ) from e
+    log_usage(shop_id, config.model_name(), getattr(resp, "usage", None))
+    try:
+        doc = json.loads(resp.choices[0].message.content or "{}")
+    except (ValueError, AttributeError, IndexError):
+        raise VisionError(CANT_READ) from None
+    try:
+        kinds = {"cash", "credit", "payment", "unreadable"}
+        book = doc.get("book") or {}
+        book_lines = []
+        for ln in book.get("lines", []) or []:
+            if not isinstance(ln, dict):
+                continue
+            try:
+                qty = float(ln.get("qty", 0))
+            except (TypeError, ValueError):
+                qty = 0
+            book_lines.append({
+                "line_no": int(ln.get("line_no") or 0),
+                "text": str(ln.get("text") or "").strip(),
+                "item": str(ln.get("item") or "").strip(),
+                "qty": qty if qty > 0 else 1,
+                "price_cents": _sane_cents(ln.get("price_cents")),
+                "kind": ln.get("kind") if ln.get("kind") in kinds else "unreadable",
+                "customer": str(ln.get("customer") or "").strip(),
+            })
+        doc["book"] = {"date": _sane_date(book.get("date")),
+                       "page_total_cents": _sane_cents(book.get("page_total_cents")),
+                       "crossed_out": int(book.get("crossed_out") or 0),
+                       "lines": book_lines}
+        receipt = doc.get("receipt") or {}
+        receipt_lines = []
+        for ln in receipt.get("lines", []) or []:
+            if not isinstance(ln, dict):
+                continue
+            receipt_lines.append({
+                "line_no": int(ln.get("line_no") or 0),
+                "text": str(ln.get("text") or "").strip(),
+                "item": str(ln.get("item") or "").strip(),
+                "packs": ln.get("packs"), "pack_size": ln.get("pack_size"),
+                "qty_units": ln.get("qty_units"),
+                "unit_cost_cents": _sane_cents(ln.get("unit_cost_cents")),
+                "line_total_cents": _sane_cents(ln.get("line_total_cents")),
+            })
+        doc["receipt"] = {
+            "supplier": str(receipt.get("supplier") or "").strip(),
+            "date": _sane_date(receipt.get("date")),
+            "receipt_no": str(receipt.get("receipt_no") or "").strip(),
+            "lines": receipt_lines,
+            "vat_cents": _sane_cents(receipt.get("vat_cents")),
+            "total_cents": _sane_cents(receipt.get("total_cents")),
+            "payment": str(receipt.get("payment") or "").strip().lower(),
+        }
+        if doc.get("doc_type") not in ("expiry", "book_page", "receipt", "other"):
+            doc["doc_type"] = "other"
+        return doc
+    except (ValueError, AttributeError) as e:
+        raise VisionError(f"{CANT_READ} (bad vision JSON: {e})") from e

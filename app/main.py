@@ -16,9 +16,9 @@ import time
 import traceback
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 
-from app.agent import handle_photo, handle_text, handle_voice
+from app.agent import handle_photo, handle_text, handle_voice, take_media
 from app.db import connect, init_db, now_iso
 from app.vision import VisionError
 from app.voice import VoiceError
@@ -39,7 +39,8 @@ app = FastAPI(title="Sisi")
 
 UNSUPPORTED_REPLY = "I can't read that kind of message yet. Send text, a voice note, or a photo of the dates."
 CONSENT_LINE = ("PS: I keep your shop records on this number so I can help."
-                " Reply 'delete my data' any time to erase them.")
+                " Reply 'delete my data' any time to erase them.\n"
+                "Tell me your till float once, e.g. 'float R500'.")
 MAX_WEBHOOK_BYTES = 256 * 1024
 
 # Per-shop inbound rate limit (sliding window). In-memory: correct for a single
@@ -213,10 +214,44 @@ def process_message(msg: IncomingMessage) -> None:
             sender.send_buttons(msg.shop_id, reply, buttons)
         else:
             sender.send_text(msg.shop_id, reply)
+        for item in take_media(msg.shop_id):
+            try:
+                if item.get("kind") == "file":
+                    sender.send_file(msg.shop_id, item["url"],
+                                     item.get("filename") or "sisi-report.pdf",
+                                     item.get("caption") or "")
+                else:
+                    sender.send_image(msg.shop_id, item["url"],
+                                      item.get("caption") or "")
+            except Exception:
+                log.error("media send failed:\n%s", traceback.format_exc())
         log.info("%s -> %s (%s)", msg.shop_id, msg.message_id,
                  "buttons" if buttons else "text")
     except Exception:
         log.error("process_message failed:\n%s", traceback.format_exc())
+
+
+@app.get("/media/{token}")
+def serve_media(token: str, f: str = "png"):
+    """Serve a month-end PDF/PNG by its unguessable per-report token (?f=pdf|png)."""
+    from app.reports import get_report_by_token
+
+    if f not in ("png", "pdf"):
+        raise HTTPException(status_code=404, detail="not found")
+    conn = connect()
+    try:
+        init_db(conn)
+        row = get_report_by_token(conn, token)
+    finally:
+        conn.close()
+    if row is None:
+        raise HTTPException(status_code=404, detail="not found")
+    path = row["pdf_path"] if f == "pdf" else row["png_path"]
+    if not path:
+        raise HTTPException(status_code=404, detail="not found")
+    media = "application/pdf" if f == "pdf" else "image/png"
+    return FileResponse(path, media_type=media,
+                        filename=path.rsplit("/", 1)[-1])
 
 
 @app.get("/_sim/outbox")

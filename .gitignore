@@ -26,3 +26,7 @@ htmlcov/
 
 # Modal
 .modal.toml
+
+# Video build
+video/node_modules/
+video/out/

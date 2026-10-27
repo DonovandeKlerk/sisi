@@ -361,7 +361,10 @@ def test_tool_registry_complete():
                      "draft_reminder", "record_sale", "add_stock", "set_price", "low_stock",
                      "list_stock", "best_sellers",
                      "restock_list", "cash_up", "check_expiry_photo", "read_slip_photo",
-                     "compliance_guide", "undo_last"]:
+                     "compliance_guide", "undo_last", "record_expense", "record_drawing",
+                     "record_count", "record_supplier_payment", "cash_balances",
+                     "sales_summary", "profit_month", "list_receipts",
+                     "month_end_report"]:
         assert expected in names
 
 

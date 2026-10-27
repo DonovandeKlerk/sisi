@@ -127,6 +127,75 @@ CREATE TABLE IF NOT EXISTS actions (
   undone_at  TEXT
 );
 
+CREATE TABLE IF NOT EXISTS cash_moves (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  shop_id      TEXT NOT NULL REFERENCES shops(shop_id),
+  account      TEXT NOT NULL,
+  amount_cents INTEGER NOT NULL,
+  kind         TEXT NOT NULL,
+  category     TEXT NOT NULL DEFAULT '',
+  note         TEXT NOT NULL DEFAULT '',
+  ref_type     TEXT NOT NULL DEFAULT '',
+  ref_id       INTEGER,
+  action_id    TEXT,
+  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  reversed     INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS expenses (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  shop_id      TEXT NOT NULL REFERENCES shops(shop_id),
+  category     TEXT NOT NULL,
+  amount_cents INTEGER NOT NULL,
+  account      TEXT NOT NULL,
+  note         TEXT NOT NULL DEFAULT '',
+  action_id    TEXT NOT NULL UNIQUE,
+  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  reversed     INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS supplier_moves (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  shop_id      TEXT NOT NULL REFERENCES shops(shop_id),
+  supplier     TEXT NOT NULL COLLATE NOCASE,
+  amount_cents INTEGER NOT NULL,
+  note         TEXT NOT NULL DEFAULT '',
+  action_id    TEXT,
+  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  reversed     INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS receipts (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  shop_id      TEXT NOT NULL REFERENCES shops(shop_id),
+  supplier     TEXT NOT NULL,
+  date         TEXT NOT NULL DEFAULT '',
+  receipt_no   TEXT NOT NULL DEFAULT '',
+  total_cents  INTEGER,
+  vat_cents    INTEGER,
+  account      TEXT NOT NULL DEFAULT 'cash',
+  image_hash   TEXT NOT NULL DEFAULT '',
+  data_json    TEXT NOT NULL DEFAULT '{}',
+  action_id    TEXT NOT NULL UNIQUE,
+  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  reversed     INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS photo_hashes (
+  shop_id    TEXT NOT NULL REFERENCES shops(shop_id),
+  hash       TEXT NOT NULL,
+  kind       TEXT NOT NULL DEFAULT '',
+  note       TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  PRIMARY KEY (shop_id, hash)
+);
+
+CREATE TABLE IF NOT EXISTS order_drafts (
+  shop_id      TEXT PRIMARY KEY REFERENCES shops(shop_id),
+  payload_json TEXT NOT NULL,
+  updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
 CREATE TABLE IF NOT EXISTS messages_seen (
   message_id TEXT PRIMARY KEY,
   shop_id    TEXT NOT NULL,
@@ -141,6 +210,23 @@ CREATE TABLE IF NOT EXISTS conversation_turns (
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
+CREATE TABLE IF NOT EXISTS reports (
+  shop_id    TEXT NOT NULL REFERENCES shops(shop_id),
+  month      TEXT NOT NULL,
+  pdf_path   TEXT NOT NULL DEFAULT '',
+  png_path   TEXT NOT NULL DEFAULT '',
+  token      TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  PRIMARY KEY (shop_id, month)
+);
+
+CREATE TABLE IF NOT EXISTS flags (
+  shop_id TEXT NOT NULL REFERENCES shops(shop_id),
+  key     TEXT NOT NULL,
+  value   TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (shop_id, key)
+);
+
 CREATE INDEX IF NOT EXISTS idx_customers_shop ON customers(shop_id);
 CREATE INDEX IF NOT EXISTS idx_products_shop ON products(shop_id);
 CREATE INDEX IF NOT EXISTS idx_credit_shop ON credit_entries(shop_id);
@@ -150,8 +236,14 @@ CREATE INDEX IF NOT EXISTS idx_stock_shop ON stock_moves(shop_id);
 CREATE INDEX IF NOT EXISTS idx_expiry_shop ON expiry_items(shop_id);
 CREATE INDEX IF NOT EXISTS idx_pending_shop ON pending_actions(shop_id);
 CREATE INDEX IF NOT EXISTS idx_await_shop ON await_price(shop_id);
+CREATE INDEX IF NOT EXISTS idx_cash_shop ON cash_moves(shop_id);
+CREATE INDEX IF NOT EXISTS idx_expense_shop ON expenses(shop_id);
+CREATE INDEX IF NOT EXISTS idx_supplier_shop ON supplier_moves(shop_id);
+CREATE INDEX IF NOT EXISTS idx_receipt_shop ON receipts(shop_id);
 CREATE INDEX IF NOT EXISTS idx_actions_shop ON actions(shop_id);
 CREATE INDEX IF NOT EXISTS idx_turns_shop ON conversation_turns(shop_id);
+CREATE INDEX IF NOT EXISTS idx_reports_shop ON reports(shop_id);
+CREATE INDEX IF NOT EXISTS idx_flags_shop ON flags(shop_id);
 """
 
 

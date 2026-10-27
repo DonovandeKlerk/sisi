@@ -76,6 +76,29 @@ class VonageSender(WhatsAppSender):
         options = " / ".join(buttons[:3])
         self.send_text(to, f"{body}\n\nReply: {options}")
 
+    def _post_media(self, to: str, message_type: str, payload: dict) -> None:
+        if not self.api_key or not self.api_secret:
+            raise RuntimeError("VONAGE_API_KEY/VONAGE_API_SECRET are not set")
+        data = {"from": self.whatsapp_from, "to": _digits(to), "channel": "whatsapp",
+                "message_type": message_type, message_type: payload}
+
+        def send():
+            resp = httpx.post(VONAGE_MESSAGES_URL, auth=(self.api_key, self.api_secret),
+                              json=data, timeout=20)
+            resp.raise_for_status()
+            log.info("vonage %s sent to=%s status=%s", message_type,
+                     data["to"], resp.status_code)
+            return resp.json()
+
+        call_with_retries(send)
+
+    def send_image(self, to: str, url: str, caption: str = "") -> None:
+        self._post_media(to, "image", {"url": url, "caption": caption[:1000]})
+
+    def send_file(self, to: str, url: str, filename: str, caption: str = "") -> None:
+        self._post_media(to, "file", {"url": url, "name": filename[:255],
+                                      "caption": caption[:1000]})
+
 
 def download_vonage_media(url: str) -> bytes:
     """Fetch Vonage-hosted media bytes with basic auth. Raises VoiceError."""
