@@ -18,8 +18,15 @@ import os
 
 import modal
 
-image = modal.Image.debian_slim().apt_install("ffmpeg").pip_install_from_requirements(
-    "requirements.txt"
+image = (
+    modal.Image.debian_slim()
+    .apt_install("ffmpeg")
+    .pip_install_from_requirements("requirements.txt")
+    # Bake the app package into the image (deploy uploads only modal_app.py).
+    .add_local_dir("app", remote_path="/root/app",
+                   ignore=["__pycache__", "*.pyc", "*.pyo"])
+    .add_local_dir("seed", remote_path="/root/seed",
+                   ignore=["__pycache__", "*.pyc", "*.pyo"])
 )
 
 app = modal.App(
