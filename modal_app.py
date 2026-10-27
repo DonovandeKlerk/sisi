@@ -82,3 +82,11 @@ def worker(msg: dict):
     from app.main import process_message
     from app.whatsapp import IncomingMessage
     process_message(IncomingMessage(**msg))
+
+
+@app.function(timeout=120)
+def polish_logo(shop_id: str) -> str:
+    """Background logo cut-out after setup step 4; result queued for later."""
+    _use_volume()
+    from app.setup import finish_polish
+    return finish_polish(shop_id)

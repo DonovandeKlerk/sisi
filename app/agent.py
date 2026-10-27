@@ -14,6 +14,7 @@ from app import reports
 from app.db import today_str
 from app.setup import (
     answer as setup_answer,
+    flush_logo,
     mark_paused,
     needs_setup,
     setup_step,
@@ -599,6 +600,9 @@ def handle_text(conn: sqlite3.Connection, shop_id: str, text: str):
             else:
                 message = route_to_llm(conn, shop_id, text)  # saves turns itself
     message = _maybe_first_offer(conn, shop_id, message)
+    logo_note = flush_logo(conn, shop_id)
+    if logo_note:
+        message = f"{message}\n\n{logo_note}"
     after = get_pending(conn, shop_id)
     buttons = ["Yes", "No"] if after is not None and after["id"] != before_id else None
     return message, buttons
