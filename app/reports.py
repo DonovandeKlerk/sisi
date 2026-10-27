@@ -480,7 +480,7 @@ def _statement_page(data: dict, brand: dict, path: str, items: list,
                         font=f_small, fill=_hex(SISI["good"]))
                 y += 50
             y += 10
-        dr.text((60, y), "\U0001f4b0 Total outstanding", font=f_mid,
+        dr.text((60, y), "Total outstanding", font=f_mid,
                 fill=_hex(SISI["ink"]))
         y += 62
         dr.text((60, y), cents_to_rand(data["total"]), font=f_big,
@@ -488,6 +488,7 @@ def _statement_page(data: dict, brand: dict, path: str, items: list,
         y += 110
         ask = STATEMENT_ASK.get(brand.get("language") or "en",
                                 STATEMENT_ASK["default"])
+        ask = ask.replace(" \U0001f64f", "")  # PNG fonts have no emoji
         dr.text((60, y), ask, font=f_small, fill=_hex(SISI["ink"]))
     if pages > 1:
         dr.text((W - 200, H - 90), f"{page_no}/{pages}", font=f_small,
@@ -501,6 +502,8 @@ def render_statement_pngs(data: dict, brand: dict, prefix: str,
                           per_page: int = 10) -> list[str]:
     chunks = [data["items"][i:i + per_page]
               for i in range(0, max(len(data["items"]), 1), per_page)]
+    if len(chunks[-1]) > 5:
+        chunks.append([])  # totals get their own page
     pages = len(chunks)
     return [_statement_page(data, brand, f"{prefix}-p{n + 1}.png", chunk,
                             n + 1, pages)
@@ -771,13 +774,13 @@ def render_snapshot_png(data: dict, brand: dict, path: str, day: str) -> str:
     y += 10
     dr.line([60, y, W - 60, y], fill=_hex(SISI["line"]), width=3)
     y += 30
-    dr.text((60, y), f"⭐ Best: {data['best']}"[:52], font=f_small,
+    dr.text((60, y), f"Best: {data['best']}"[:52], font=f_small,
             fill=_hex(SISI["ink"]))
     y += 60
-    dr.text((60, y), f"🐌 Slowest: {data['slowest']}"[:52], font=f_small,
+    dr.text((60, y), f"Slowest: {data['slowest']}"[:52], font=f_small,
             fill=_hex(SISI["ink"]))
     y += 90
-    dr.text((60, y), "💡 Tip", font=f_mid, fill=_hex(SISI["primary"]))
+    dr.text((60, y), "Tip", font=f_mid, fill=_hex(SISI["primary"]))
     y += 70
     words, line = data["tip"].split(), ""
     for w in words:
