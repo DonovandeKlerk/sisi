@@ -540,9 +540,13 @@ def render_card(d: dict, path: str) -> str:
                 line = test
         lines.append(line)
         for ln in lines[:3]:
+            if y > H - 160:
+                break
             dr.text((60, y), ln, font=f_small, fill=_hex(SISI["ink"]))
             y += 52
         y += 12
+        if y > H - 160:
+            break
     dr.text((60, H - 90), "Prepared by Sisi", font=f_small, fill=_hex(SISI["muted"]))
     img.save(path, "PNG")
     return path
