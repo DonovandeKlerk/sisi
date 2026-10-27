@@ -35,20 +35,23 @@ DELETE_WORDS = {"delete my data", "erase my data", "forget me"}
 HELP_WORDS = {"demo help", "help", "what can you do", "commands"}
 
 DEMO_HELP = (
-    "Try me:\n"
-    "• stock list — 'what do we have in stock?'\n"
-    "• add stock — 'add 20 bread at R18'\n"
-    "• sale — 'sold 2 coke'\n"
-    "• credit sale — 'Sipho took 2 bread'\n"
-    "• who owes — 'who owes?' / 'how much does Sipho owe?'\n"
-    "• cash-up — 'cash up'\n"
-    "• low stock — 'what is low?'\n"
-    "• restock — 'what must I buy tomorrow?'\n"
-    "• expiry photo — send a photo of a date stamp\n"
-    "• compliance — 'can I get the spaza fund?'\n"
-    "• scam check — 'is this fund agent a scam?'\n"
-    "• undo — 'undo'\n"
-    "• delete my data — wipes this number"
+    "❓ *Demo help — try me*\n"
+    "\n"
+    "• *stock list* — 'what do we have in stock?'\n"
+    "• *add stock* — 'add 20 bread at R18'\n"
+    "• *sale* — 'sold 2 coke'\n"
+    "• *credit sale* — 'Sipho took 2 bread'\n"
+    "• *who owes* — 'who owes?'\n"
+    "• *cash-up* — 'cash up'\n"
+    "• *low stock* — 'what is low?'\n"
+    "• *restock* — 'what must I buy tomorrow?'\n"
+    "• *expiry photo* — send a photo of a date stamp\n"
+    "• *compliance* — 'can I get the spaza fund?'\n"
+    "• *scam check* — 'is this fund agent a scam?'\n"
+    "• *undo* — 'undo'\n"
+    "• *delete my data* — wipes this number\n"
+    "\n"
+    "🔒 *Privacy:* your records stay on this number. Reply 'delete my data' to erase them."
 )
 _FILLER = ("thank you", "thanks", "please", "sisi", "ta")
 
@@ -186,7 +189,8 @@ def handle_voice(conn: sqlite3.Connection, shop_id: str, audio: bytes,
     if not transcript:
         return None, "I couldn't hear anything in that voice note. Send it again?", None
     reply, buttons = handle_text(conn, shop_id, transcript)
-    return transcript, f"Heard: “{transcript}”\n{reply}", buttons
+    shown = transcript if len(transcript) <= 100 else transcript[:97] + "…"
+    return transcript, f"Heard: “{shown}”\n{reply}", buttons
 
 
 def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes):

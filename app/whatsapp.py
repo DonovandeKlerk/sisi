@@ -27,6 +27,37 @@ GRAPH_BASE = "https://graph.facebook.com"
 MAX_BUTTONS = 3
 MAX_BUTTON_TITLE = 20
 MAX_TEXT_LEN = 4096
+SPLIT_AT = 1500
+
+
+def split_message(body: str, limit: int = SPLIT_AT) -> list[str]:
+    """Split a long reply at blank-line section boundaries (style guide: ~1500 chars).
+
+    Sections that alone top the limit fall back to word splits; pathological
+    words are hard-split so no chunk ever tops the limit.
+    """
+    body = body or ""
+    if not body:
+        return []
+    if len(body) <= limit:
+        return [body]
+    chunks, current = [], ""
+    for section in body.split("\n\n"):
+        piece = section if not current else current + "\n\n" + section
+        if len(piece) <= limit:
+            current = piece
+            continue
+        if current:
+            chunks.append(current)
+        current = section
+        while len(current) > limit:
+            cut = current.rfind(" ", 0, limit)
+            cut = cut if cut > 0 else limit
+            chunks.append(current[:cut])
+            current = current[cut:].lstrip()
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 @dataclass
@@ -181,8 +212,9 @@ class CloudApiSender(WhatsAppSender):
         return call_with_retries(send)
 
     def send_text(self, to: str, body: str) -> None:
-        self._post({"messaging_product": "whatsapp", "to": to, "type": "text",
-                    "text": {"preview_url": False, "body": body[:MAX_TEXT_LEN]}})
+        for chunk in split_message(body):
+            self._post({"messaging_product": "whatsapp", "to": to, "type": "text",
+                        "text": {"preview_url": False, "body": chunk[:MAX_TEXT_LEN]}})
 
     def send_buttons(self, to: str, body: str, buttons: list[str]) -> None:
         action = [{"type": "reply",

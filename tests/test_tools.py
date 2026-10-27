@@ -73,7 +73,7 @@ def test_preview_numbers_match_reality(conn):
     assert "R73.00" in msg  # 2x18.50 + 36.00, computed never guessed
     assert "New balance R73.00" in msg
     confirm_pending(conn, SHOP)
-    assert get_balance(conn, SHOP, "Lerato") == "Lerato owes R73.00."
+    assert get_balance(conn, SHOP, "Lerato") == "💳 *Lerato* owes R73.00."
 
 
 def test_decline_discards(conn):
@@ -93,7 +93,7 @@ def test_new_proposal_supersedes_old(conn):
         (SHOP,)).fetchone()["c"]
     assert pendings == 1
     confirm_pending(conn, SHOP)
-    assert "Thandi owes R81.50" in get_balance(conn, SHOP, "Thandi")  # 45.50 + 36.00
+    assert "💳 *Thandi* owes R81.50" in get_balance(conn, SHOP, "Thandi")  # 45.50 + 36.00
 
 
 def test_missing_price_is_a_question(conn):
@@ -101,7 +101,7 @@ def test_missing_price_is_a_question(conn):
     add_stock(conn, SHOP, "Amagwinya", 10)
     confirm_pending(conn, SHOP)
     out = add_credit(conn, SHOP, "Sipho", [{"product": "Amagwinya", "qty": 2}])
-    assert out == "What is the price of Amagwinya?"
+    assert out == "❓ What is the price of Amagwinya?"
     assert get_pending(conn, SHOP) is None
 
 
@@ -109,7 +109,7 @@ def test_unknown_and_ambiguous_products(conn):
     _seeded(conn)
     assert "isn't on your list yet" in add_credit(conn, SHOP, "Sipho", [{"product": "Unicorn Flakes", "qty": 1}])
     out = add_credit(conn, SHOP, "Sipho", [{"product": "bread", "qty": 1}])
-    assert out.startswith("Which one:")
+    assert out.startswith("❓ *Which one?*")
     assert "Sasko" in out and "Albany" in out
     assert get_pending(conn, SHOP) is None
 
@@ -119,9 +119,9 @@ def test_payment_flow_and_undo(conn):
     msg = record_payment(conn, SHOP, "Thandi", 5000)
     assert "paid R50.00" in msg and "New balance -R4.50" in msg
     confirm_pending(conn, SHOP)
-    assert get_balance(conn, SHOP, "Thandi") == "Thandi is paid up with R4.50 credit."
+    assert get_balance(conn, SHOP, "Thandi") == "✅ *Thandi* is paid up with R4.50 credit."
     undo_last(conn, SHOP)
-    assert get_balance(conn, SHOP, "Thandi") == "Thandi owes R45.50."
+    assert get_balance(conn, SHOP, "Thandi") == "💳 *Thandi* owes R45.50."
 
 
 def test_payment_unknown_customer(conn):
@@ -132,8 +132,8 @@ def test_payment_unknown_customer(conn):
 
 def test_balances_and_debtors(conn):
     _seeded(conn)
-    assert get_balance(conn, SHOP, "Sipho") == "Sipho owes R73.00."
-    assert get_balance(conn, SHOP, "Lerato") == "Lerato owes nothing. The book is clean."
+    assert get_balance(conn, SHOP, "Sipho") == "💳 *Sipho* owes R73.00."
+    assert get_balance(conn, SHOP, "Lerato") == "✅ *Lerato* owes nothing. The book is clean."
     out = list_debtors(conn, SHOP)
     assert "Jabu — R120.00" in out and "Total: R238.50." in out
 
@@ -145,9 +145,9 @@ def test_undo_is_lifo(conn):
     record_payment(conn, SHOP, "Lerato", 1000)
     confirm_pending(conn, SHOP)
     undo_last(conn, SHOP)  # removes the payment first
-    assert get_balance(conn, SHOP, "Lerato") == "Lerato owes R36.00."
+    assert get_balance(conn, SHOP, "Lerato") == "💳 *Lerato* owes R36.00."
     undo_last(conn, SHOP)
-    assert get_balance(conn, SHOP, "Lerato") == "Lerato owes nothing. The book is clean."
+    assert get_balance(conn, SHOP, "Lerato") == "✅ *Lerato* owes nothing. The book is clean."
 
 
 def test_undo_nothing(conn):
@@ -167,15 +167,15 @@ def test_cash_sale_and_undo(conn):
     assert _count(conn, "sales") == 1
     undo_last(conn, SHOP)
     assert _stock(conn, "Coke 2L") == 5
-    assert cash_up(conn, SHOP).endswith("nothing recorded yet.")
+    assert cash_up(conn, SHOP).endswith("Nothing recorded yet.")
 
 
 def test_credit_sale_links_book_and_stock(conn):
     _seeded(conn)
     msg = record_sale(conn, SHOP, "Simba Chips 120g", 1, buyer="Bongani")
-    assert "on the book" in msg
+    assert "to Bongani" in msg
     confirm_pending(conn, SHOP)
-    assert get_balance(conn, SHOP, "Bongani") == "Bongani owes R24.00."
+    assert get_balance(conn, SHOP, "Bongani") == "💳 *Bongani* owes R24.00."
     assert _stock(conn, "Simba Chips 120g") == 2
     sale = conn.execute("SELECT * FROM sales WHERE shop_id = ?", (SHOP,)).fetchone()
     cred = conn.execute(
@@ -183,7 +183,7 @@ def test_credit_sale_links_book_and_stock(conn):
         (SHOP, _customer_id(conn, "Bongani"))).fetchone()
     assert sale["action_id"] == cred["action_id"]  # one action, reversed together
     undo_last(conn, SHOP)
-    assert get_balance(conn, SHOP, "Bongani") == "Bongani owes nothing. The book is clean."
+    assert get_balance(conn, SHOP, "Bongani") == "✅ *Bongani* owes nothing. The book is clean."
     assert _stock(conn, "Simba Chips 120g") == 3
 
 
@@ -198,13 +198,13 @@ def test_short_stock_warns_but_saves(conn):
 def test_add_stock_and_set_price(conn):
     _seeded(conn)
     msg = add_stock(conn, SHOP, "Airtime R10", 20, wholesaler="Flash")
-    assert "new product" in msg and "Price still needed" in msg
+    assert "New: Airtime R10" in msg and "Price still needed" in msg
     confirm_pending(conn, SHOP)
-    assert "Set Airtime R10 price to R10.00?" in set_price(conn, SHOP, "Airtime R10", 1000)
+    assert "Airtime R10 → R10.00" in set_price(conn, SHOP, "Airtime R10", 1000)
     confirm_pending(conn, SHOP)
     add_credit(conn, SHOP, "Jabu", [{"product": "Airtime", "qty": 1}])
     confirm_pending(conn, SHOP)
-    assert get_balance(conn, SHOP, "Jabu") == "Jabu owes R130.00."
+    assert get_balance(conn, SHOP, "Jabu") == "💳 *Jabu* owes R130.00."
     undo_last(conn, SHOP)
     undo_last(conn, SHOP)  # price removed
     row = conn.execute("SELECT price_cents FROM products WHERE shop_id = ? AND name = ?",
@@ -232,10 +232,10 @@ def test_low_stock_and_restock(conn):
     for name in ("Tastic Rice 2kg", "Coke 2L", "Simba Chips 120g", "Fresh Milk 1L"):
         assert name in low
     restock = restock_list(conn, SHOP)
-    assert restock.startswith("Buy tomorrow:")
+    assert restock.startswith("🛒 *Buy tomorrow*")
     for wholesaler in ("Devland", "Jumbo", "Coke Depot"):
         assert wholesaler in restock
-    assert "Tastic Rice 2kg (have 2, order 6)" in restock
+    assert "• Tastic Rice 2kg — have 2, order 6" in restock
 
 
 def test_cash_up(conn):
@@ -250,10 +250,10 @@ def test_cash_up(conn):
         "SELECT substr(datetime(created_at, '+2 hours'), 1, 10) d FROM sales LIMIT 1"
     ).fetchone()["d"]
     out = cash_up(conn, SHOP, day)
-    assert "Cash sales: R72.00 (1 sales)" in out
-    assert "Book sales: R33.00" in out
-    assert "Payments in: R45.50" in out
-    assert "In the drawer: R117.50." in out
+    assert "• Cash sales R72.00 (1 sales)" in out
+    assert "• Book sales R33.00" in out
+    assert "• Payments in R45.50" in out
+    assert "💵 *In the drawer:* R117.50" in out
 
 
 def test_cash_up_uses_sast_day(conn):
@@ -264,7 +264,7 @@ def test_cash_up_uses_sast_day(conn):
                  (SHOP,))
     conn.commit()
     assert "R36.00" in cash_up(conn, SHOP, "2026-10-27")  # 01:30 SAST next day
-    assert cash_up(conn, SHOP, "2026-10-26").endswith("nothing recorded yet.")
+    assert cash_up(conn, SHOP, "2026-10-26").endswith("Nothing recorded yet.")
 
 
 # --- photo findings --------------------------------------------------------
@@ -277,7 +277,7 @@ def test_expiry_flow_and_undo(conn, monkeypatch):
         {"product": "Fresh Milk 1L", "qty": 2, "expiry_date": "2026-10-30"},
         {"product": "Tastic Rice 2kg", "qty": 1, "expiry_date": "2027-06-01"},
     ])
-    assert "2 x Fresh Milk 1L 30 Oct has expired. Please take them off the shelf." in msg
+    assert "• 2 × Fresh Milk 1L 30 Oct — expired. Take them off the shelf." in msg
     before = _count(conn, "expiry_items")
     confirm_pending(conn, SHOP)
     assert _count(conn, "expiry_items") == before + 2
@@ -290,7 +290,7 @@ def test_expiry_all_fine(conn, monkeypatch):
     monkeypatch.setenv("SISI_TODAY", "2026-11-01")
     out = check_expiry_photo(conn, SHOP, [
         {"product": "Tastic Rice 2kg", "qty": 1, "expiry_date": "2027-06-01"}])
-    assert out == "All dates look fine. Nothing expiring soon."
+    assert out == "✅ All dates look fine. Nothing expiring soon."
     assert get_pending(conn, SHOP) is None
 
 
@@ -318,7 +318,7 @@ def test_slip_flow_and_undo(conn):
 def test_draft_reminder(conn):
     _seeded(conn)
     out = draft_reminder(conn, SHOP, "Sipho")
-    assert "Sipho" in out and "R73.00" in out and "forward it yourself" in out
+    assert "Sipho" in out and "R73.00" in out and "Forward this yourself" in out
     assert draft_reminder(conn, SHOP, "Lerato") == "Lerato owes nothing, no reminder needed."
 
 
@@ -334,9 +334,9 @@ def test_demo_reset(conn):
     _seeded(conn)
     add_credit(conn, SHOP, "Stranger", [{"product": "Coke 2L", "qty": 1}])
     confirm_pending(conn, SHOP)
-    assert demo_reset(conn, SHOP).startswith("Fresh start.")
+    assert demo_reset(conn, SHOP).startswith("🎉 Fresh start.")
     assert _count(conn, "customers") == 6
-    assert get_balance(conn, SHOP, "Sipho") == "Sipho owes R73.00."
+    assert get_balance(conn, SHOP, "Sipho") == "💳 *Sipho* owes R73.00."
 
 
 def test_delete_my_data_erases_shop(conn):
@@ -345,7 +345,7 @@ def test_delete_my_data_erases_shop(conn):
     _seeded(conn)
     add_credit(conn, SHOP, "Sipho", [{"product": "Coke 2L", "qty": 1}])
     confirm_pending(conn, SHOP)
-    assert delete_my_data(conn, SHOP).startswith("Done.")
+    assert delete_my_data(conn, SHOP).startswith("✅ *Done.*")
     for table in ("customers", "products", "credit_entries", "payments", "sales",
                   "stock_moves", "expiry_items", "pending_actions", "actions"):
         assert _count(conn, table) == 0, table

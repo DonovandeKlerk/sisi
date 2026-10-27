@@ -14,7 +14,6 @@ from app.main import app
 from app.voice import VoiceError
 from app.vonage import (
     VonageSender,
-    _split_text,
     download_vonage_media,
     parse_vonage_webhook,
 )
@@ -116,10 +115,9 @@ def test_sender_splits_long_replies(vg_env, monkeypatch):
     monkeypatch.setattr(vonage.httpx, "post", fake)
     body = "word " * 1200  # 6000 chars
     VonageSender().send_text(SHOP, body.strip())
-    assert len(fake.calls) == 2
-    assert all(len(c["json"]["text"]) <= 4096 for c in fake.calls)
+    assert len(fake.calls) >= 4
+    assert all(len(c["json"]["text"]) <= 1500 for c in fake.calls)
     assert " ".join(c["json"]["text"] for c in fake.calls) == body.strip()
-    assert _split_text("") == []
 
 
 def test_sender_buttons_as_text(vg_env, monkeypatch):
@@ -254,7 +252,7 @@ def test_vonage_image_end_to_end(vg_env, monkeypatch):
     assert r.status_code == 200
     assert len(fake.calls) == 1
     body = fake.calls[0]["json"]["text"]
-    assert "2 x Fresh Milk 1L 30 Oct has expired" in body
+    assert "• 2 × Fresh Milk 1L 30 Oct — expired" in body
     assert "Reply: Yes / No" in body  # preview buttons rendered for vonage
 
 

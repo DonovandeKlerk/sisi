@@ -129,6 +129,15 @@ def _items_text(lines: list[dict]) -> str:
     return ", ".join(f"{_fmt_qty(ln['qty'])}x {ln['name']}" for ln in lines)
 
 
+def _which_one(ambiguous) -> str:
+    lines = ["❓ *Which one?*"] + [f"• {p['name']}" for p in ambiguous[:3]]
+    return "\n".join(lines)
+
+
+def _ask_price(name: str) -> str:
+    return f"❓ What is the price of {name}?"
+
+
 # ---------------------------------------------------------------------------
 # Pending actions: propose / confirm / cancel
 # ---------------------------------------------------------------------------
@@ -207,8 +216,7 @@ def _resolve_priced_line(conn: sqlite3.Connection, shop_id: str, product: str, q
     prod, ambiguous = _find_products(conn, shop_id, product)
     if prod is None:
         if ambiguous:
-            names = ", ".join(p["name"] for p in ambiguous[:3])
-            return None, "ambiguous", f"Which one: {names}?"
+            return None, "ambiguous", _which_one(ambiguous)
         return None, "unknown", product
     if prod["price_cents"] is None:
         return None, "unpriced", prod["name"]
@@ -262,7 +270,7 @@ def _apply_add_credit(conn: sqlite3.Connection, shop_id: str, payload: dict, act
     )
     bal = balance_cents(conn, shop_id, cust["id"])
     return (
-        f"Saved. {cust['name']} now owes {cents_to_rand(bal)}.",
+        f"✅ *Saved*\n• {cust['name']} now owes {cents_to_rand(bal)}.",
         "credit",
         f"credit {cust['name']} {cents_to_rand(payload['total_cents'])}",
         {"credit_id": cur.lastrowid},
@@ -293,10 +301,10 @@ def add_credit(conn: sqlite3.Connection, shop_id: str, customer: str, items: lis
                                {"tool": "credit", "customer": customer.strip(), "items": items})
             if status == "unknown":
                 cap = detail[:1].upper() + detail[1:]
-                return (f"{cap} isn't on your list yet. Reply with the price, e.g."
+                return (f"📝 *{cap} isn't on your list yet.*\nReply with the price, e.g."
                         f" '{detail.lower()} R18', and I'll add it and record"
                         f" {customer.strip()}'s credit.")
-            return f"What is the price of {detail}?"
+            return _ask_price(detail)
         lines.append(line)
     total = sum(ln["line_total"] for ln in lines)
     payload = {"customer": customer.strip(), "lines": lines, "total_cents": total}
@@ -306,11 +314,12 @@ def add_credit(conn: sqlite3.Connection, shop_id: str, customer: str, items: lis
         cust = _get_customer(conn, shop_id, customer)
         new_bal = balance_cents(conn, shop_id, cust["id"])
     preview = (
-        f"Save: {customer.strip()} +{cents_to_rand(total)} on the book"
-        f" ({_items_text(lines)}). New balance {cents_to_rand(new_bal)}."
+        f"📝 *Save to the book?*\n"
+        f"• {customer.strip()} +{cents_to_rand(total)} ({_items_text(lines)})\n"
+        f"• New balance {cents_to_rand(new_bal)}"
     )
     if is_new:
-        preview += " New customer."
+        preview += "\n• New customer."
     return _propose(conn, shop_id, "add_credit", payload, preview)
 
 
@@ -321,8 +330,8 @@ def _apply_record_payment(conn: sqlite3.Connection, shop_id: str, payload: dict,
     )
     bal = balance_cents(conn, shop_id, payload["customer_id"])
     return (
-        f"Saved. {payload['customer']} paid {cents_to_rand(payload['amount_cents'])}."
-        f" Balance {cents_to_rand(bal)}.",
+        f"✅ *Saved*\n• {payload['customer']} paid {cents_to_rand(payload['amount_cents'])}\n"
+        f"• Balance {cents_to_rand(bal)}",
         "payment",
         f"payment {payload['customer']} {cents_to_rand(payload['amount_cents'])}",
         {"payment_id": cur.lastrowid},
@@ -346,7 +355,8 @@ def record_payment(conn: sqlite3.Connection, shop_id: str, customer: str, amount
         new_bal = balance_cents(conn, shop_id, cust["id"])
     return _propose(
         conn, shop_id, "record_payment", payload,
-        f"Save: {cust['name']} paid {cents_to_rand(amount)}. New balance {cents_to_rand(new_bal)}.",
+        f"📝 *Save payment?*\n• {cust['name']} paid {cents_to_rand(amount)}\n"
+        f"• New balance {cents_to_rand(new_bal)}",
     )
 
 
@@ -387,15 +397,16 @@ def _apply_record_sale(conn: sqlite3.Connection, shop_id: str, payload: dict, ac
     if payload.get("buyer"):
         bal = balance_cents(conn, shop_id, customer_id)
         return (
-            f"Saved. {payload['buyer']} owes {cents_to_rand(payload['total_cents'])} more."
-            f" Balance {cents_to_rand(bal)}.",
+            f"✅ *Sale saved*\n• {payload['buyer']} owes"
+            f" {cents_to_rand(payload['total_cents'])} more\n• Balance {cents_to_rand(bal)}",
             "sale_credit",
             f"sale {payload['product']} to {payload['buyer']}",
             {"sale_id": sale_id, "credit_id": credit_id,
              "product_id": payload["product_id"], "qty": payload["qty"]},
         )
     return (
-        f"Saved sale: {cents_to_rand(payload['total_cents'])} cash. Stock left {_fmt_qty(stock)}.",
+        f"✅ *Sale saved*\n• {_fmt_qty(payload['qty'])} × {payload['product']}"
+        f" = {cents_to_rand(payload['total_cents'])}\n• Stock left {_fmt_qty(stock)}",
         "sale_cash",
         f"sale {payload['product']} cash",
         {"sale_id": sale_id, "product_id": payload["product_id"], "qty": payload["qty"]},
@@ -423,9 +434,9 @@ def record_sale(conn: sqlite3.Connection, shop_id: str, product: str, qty: float
             cap = detail[:1].upper() + detail[1:]
             tail = (f" and I'll add it and record {buyer_name}'s credit." if buyer_name else
                     " and I'll add it and record the sale.")
-            return (f"{cap} isn't on your list yet. Reply with the price, e.g."
+            return (f"📝 *{cap} isn't on your list yet.*\nReply with the price, e.g."
                     f" '{detail.lower()} R18',{tail}")
-        return f"What is the price of {detail}?"
+        return _ask_price(detail)
     payload = {"product_id": line["product_id"], "product": line["name"], "qty": qty,
                "total_cents": line["line_total"], "buyer": buyer_name}
     buyer_new = bool(buyer_name) and _get_customer(conn, shop_id, buyer_name) is None
@@ -438,16 +449,16 @@ def record_sale(conn: sqlite3.Connection, shop_id: str, product: str, qty: float
             cust = _get_customer(conn, shop_id, buyer_name)
             buyer_bal = balance_cents(conn, shop_id, cust["id"])
     if buyer_name:
-        preview = (f"Save sale: {_fmt_qty(qty)} x {line['name']} ="
-                   f" {cents_to_rand(line['line_total'])} to {buyer_name} on the book?"
-                   f" Their balance {cents_to_rand(buyer_bal)}. Stock left {_fmt_qty(stock)}.")
+        preview = (f"📝 *Save sale?*\n• {_fmt_qty(qty)} × {line['name']}"
+                   f" = {cents_to_rand(line['line_total'])} to {buyer_name}\n"
+                   f"• Balance {cents_to_rand(buyer_bal)}\n• Stock left {_fmt_qty(stock)}")
         if buyer_new:
-            preview += " New customer."
+            preview += "\n• New customer."
     else:
-        preview = (f"Save sale: {_fmt_qty(qty)} x {line['name']} ="
-                   f" {cents_to_rand(line['line_total'])} cash? Stock left {_fmt_qty(stock)}.")
+        preview = (f"📝 *Save sale?*\n• {_fmt_qty(qty)} × {line['name']}"
+                   f" = {cents_to_rand(line['line_total'])} cash\n• Stock left {_fmt_qty(stock)}")
     if stock < 0:
-        preview += " (Count says stock is short.)"
+        preview += "\n• ⚠️ Count says stock is short."
     return _propose(conn, shop_id, "record_sale", payload, preview)
 
 
@@ -501,13 +512,16 @@ def _apply_add_stock(conn: sqlite3.Connection, shop_id: str, payload: dict, acti
                          (product_id,)).fetchone()["stock_qty"]
     extras = _fmt_price_extras(cost, price)
     if created:
-        msg = (f"Saved. {payload['name']} added with stock {_fmt_qty(stock)}{extras}."
-               if extras else
-               f"Saved. {payload['name']} added with stock {_fmt_qty(stock)}. What is the price?")
+        if extras:
+            msg = (f"✅ *Stock saved*\n• {payload['name']} added:"
+                   f" {_fmt_qty(stock)} on hand{extras}")
+        else:
+            msg = (f"✅ *Stock saved*\n• {payload['name']} added:"
+                   f" {_fmt_qty(stock)} on hand\n• ❓ What is the price?")
         return (msg, "stock", f"stock new {payload['name']}",
                 {"product_id": product_id, "qty": payload["qty"], "created": True})
     return (
-        f"Saved. {payload['name']} stock is now {_fmt_qty(stock)}{extras}.",
+        f"✅ *Stock saved*\n• {payload['name']}: {_fmt_qty(stock)} on hand{extras}",
         "stock", f"stock {payload['name']} +{_fmt_qty(payload['qty'])}",
         {"product_id": product_id, "qty": payload["qty"], "created": False,
          "old_wholesaler": old_wholesaler, "old_cost": old_cost, "old_price": old_price},
@@ -529,8 +543,7 @@ def add_stock(conn: sqlite3.Connection, shop_id: str, product: str, qty: float,
         return "How many?"
     prod, ambiguous = _find_products(conn, shop_id, name)
     if prod is None and ambiguous:
-        names = ", ".join(p["name"] for p in ambiguous[:3])
-        return f"Which one: {names}?"
+        return _which_one(ambiguous)
     cost, price = _coerce_pos_int(cost_cents), _coerce_pos_int(price_cents)
     payload = {"product_id": prod["id"] if prod else None, "name": prod["name"] if prod else name,
                "qty": qty, "wholesaler": (wholesaler or "").strip(),
@@ -543,12 +556,16 @@ def add_stock(conn: sqlite3.Connection, shop_id: str, product: str, qty: float,
                              (pid,)).fetchone()["stock_qty"]
     extras = _fmt_price_extras(cost, price)
     if prod is None:
-        preview = (f"Save: new product {name}, stock {_fmt_qty(qty)}{extras}." if extras else
-                   f"Save: new product {name}, stock {_fmt_qty(qty)}. Price still needed.")
+        if extras:
+            preview = f"📝 *Add stock?*\n• New: {name} × {_fmt_qty(qty)}{extras}"
+        else:
+            preview = (f"📝 *Add stock?*\n• New: {name} × {_fmt_qty(qty)}\n"
+                       "• Price still needed.")
     else:
-        preview = f"Save: +{_fmt_qty(qty)} {prod['name']} stock. New stock {_fmt_qty(stock)}{extras}."
+        preview = (f"📝 *Add stock?*\n• +{_fmt_qty(qty)} {prod['name']}\n"
+                   f"• Stock {_fmt_qty(prod['stock_qty'])} → {_fmt_qty(stock)}{extras}")
     if cost is not None and price is not None and cost > price:
-        preview += " Note: cost is higher than sell price."
+        preview += "\n• ⚠️ Cost is higher than sell price."
     return _propose(conn, shop_id, "add_stock", payload, preview)
 
 
@@ -557,8 +574,8 @@ def _apply_set_price(conn: sqlite3.Connection, shop_id: str, payload: dict, acti
                  (payload["price_cents"], payload["product_id"]))
     old = payload["old_price"]
     new = cents_to_rand(payload["price_cents"])
-    msg = f"Saved. {payload['name']} price is now {new}." if old is None else \
-        f"Saved. {payload['name']} price {cents_to_rand(old)} → {new}."
+    msg = f"✅ *Price saved*\n• {payload['name']} is now {new}." if old is None else \
+        f"✅ *Price saved*\n• {payload['name']} {cents_to_rand(old)} → {new}."
     return msg, "price", f"price {payload['name']} {new}", \
         {"product_id": payload["product_id"], "old_price": old}
 
@@ -568,26 +585,33 @@ def set_price(conn: sqlite3.Connection, shop_id: str, product: str, price_cents:
     prod, ambiguous = _find_products(conn, shop_id, product or "")
     if prod is None:
         if ambiguous:
-            names = ", ".join(p["name"] for p in ambiguous[:3])
-            return f"Which one: {names}?"
-        return f"I don't have {product} on the shelf list. Add it to stock first?"
+            return _which_one(ambiguous)
+        return (f"❓ *{(product or '').strip()} isn't on the shelf list.*\n"
+                "Add it to stock first?")
     try:
         price = int(price_cents)
     except (TypeError, ValueError):
-        return f"What is the price of {prod['name']}?"
+        return _ask_price(prod["name"])
     if price <= 0:
-        return f"What is the price of {prod['name']}?"
+        return _ask_price(prod["name"])
     payload = {"product_id": prod["id"], "name": prod["name"],
                "price_cents": price, "old_price": prod["price_cents"]}
     old = prod["price_cents"]
-    preview = f"Set {prod['name']} price to {cents_to_rand(price)}?" if old is None else \
-        f"Change {prod['name']} price {cents_to_rand(old)} → {cents_to_rand(price)}?"
+    preview = f"📝 *Set price?*\n• {prod['name']} → {cents_to_rand(price)}" if old is None else \
+        f"📝 *Set price?*\n• {prod['name']} {cents_to_rand(old)} → {cents_to_rand(price)}"
     return _propose(conn, shop_id, "set_price", payload, preview)
 
 
 # ---------------------------------------------------------------------------
 # Write tools: photo findings (structured data comes from vision in Step 7)
 # ---------------------------------------------------------------------------
+
+
+def _expiry_line(item: dict) -> str:
+    detail = f"• {_fmt_qty(item['qty'])} × {item['product']} {_fmt_date(item['expiry_date'])}"
+    if item["expiry_date"] < today_str():
+        return detail + " — expired. Take them off the shelf."
+    return detail + " — expires soon. Sell first."
 
 
 def _apply_expiry_note(conn: sqlite3.Connection, shop_id: str, payload: dict, action_id: str):
@@ -599,7 +623,13 @@ def _apply_expiry_note(conn: sqlite3.Connection, shop_id: str, payload: dict, ac
             (shop_id, item["product"], item["qty"], item["expiry_date"], action_id),
         )
         ids.append(cur.lastrowid)
-    return payload["warnings"], "expiry", "expiry note", {"item_ids": ids}
+    flagged = [i for i in payload["items"] if i["expiry_date"] <= _soon_iso()]
+    saved = "✅ *Expiry note saved*\n" + "\n".join(_expiry_line(i) for i in flagged)
+    return saved, "expiry", "expiry note", {"item_ids": ids}
+
+
+def _soon_iso() -> str:
+    return (date.fromisoformat(today_str()) + timedelta(days=7)).isoformat()
 
 
 def check_expiry_photo(conn: sqlite3.Connection, shop_id: str, findings: list[dict]) -> str:
@@ -618,26 +648,19 @@ def check_expiry_photo(conn: sqlite3.Connection, shop_id: str, findings: list[di
         try:
             date.fromisoformat(exp)
         except ValueError:
-            return f"I could not read the date for {name or 'that item'}. What is it (YYYY-MM-DD)?"
+            return (f"❓ I could not read the date for {name or 'that item'}.\n"
+                    "What is it (YYYY-MM-DD)?")
         if not name or qty <= 0:
             return "Tell me each item, how many, and the date on it."
         items.append({"product": name, "qty": qty, "expiry_date": exp})
-    today = today_str()
-    soon = (date.fromisoformat(today) + timedelta(days=7)).isoformat()
-    warnings = []
-    for item in items:
-        detail = f"{_fmt_qty(item['qty'])} x {item['product']} {_fmt_date(item['expiry_date'])}"
-        if item["expiry_date"] < today:
-            warnings.append(f"{detail} has expired. Please take them off the shelf.")
-        elif item["expiry_date"] <= soon:
-            warnings.append(f"{detail} expires soon. Sell first.")
-    if not warnings:
-        return "All dates look fine. Nothing expiring soon."
-    payload = {"items": items, "warnings": " ".join(warnings) + " Noted."}
+    flagged = [i for i in items if i["expiry_date"] <= _soon_iso()]
+    if not flagged:
+        return "✅ All dates look fine. Nothing expiring soon."
+    payload = {"items": items}
     with _dry_run(conn):
         _apply_expiry_note(conn, shop_id, payload, _action_id())
-    return _propose(conn, shop_id, "expiry_note",
-                    payload, " ".join(warnings) + " Save this expiry note?")
+    preview = "⚠️ *Expiry check*\n" + "\n".join(_expiry_line(i) for i in flagged)
+    return _propose(conn, shop_id, "expiry_note", payload, preview + "\n\nSave this note?")
 
 
 def _apply_slip(conn: sqlite3.Connection, shop_id: str, payload: dict, action_id: str):
@@ -666,7 +689,7 @@ def _apply_slip(conn: sqlite3.Connection, shop_id: str, payload: dict, action_id
         )
         moves.append({"product_id": pid, "qty": item["qty"], "created": created})
     n = len(moves)
-    return (f"Saved slip: {n} item{'s' if n != 1 else ''} added to stock.", "slip",
+    return (f"✅ *Slip saved*\n• {n} item{'s' if n != 1 else ''} added to stock.", "slip",
             f"slip {n} items", {"moves": moves, "old_costs": old_costs})
 
 
@@ -687,8 +710,7 @@ def read_slip_photo(conn: sqlite3.Connection, shop_id: str, items: list[dict],
             return "Tell me each slip line and how many."
         prod, ambiguous = _find_products(conn, shop_id, name)
         if prod is None and ambiguous:
-            names = ", ".join(p["name"] for p in ambiguous[:3])
-            return f"Which one: {names}?"
+            return _which_one(ambiguous)
         cost = item.get("cost_cents")
         try:
             cost = int(cost) if cost is not None else None
@@ -705,16 +727,15 @@ def read_slip_photo(conn: sqlite3.Connection, shop_id: str, items: list[dict],
                                (shop_id, item["name"])).fetchone()["id"]
             stocks[item["name"]] = conn.execute("SELECT stock_qty FROM products WHERE id = ?",
                                                 (pid,)).fetchone()["stock_qty"]
-    lines = []
+    lines = ["📝 *Save slip to stock?*"]
     for item in resolved:
-        line = f"+{_fmt_qty(item['qty'])} {item['name']} (stock {_fmt_qty(stocks[item['name']])})"
+        line = f"• +{_fmt_qty(item['qty'])} {item['name']} (stock {_fmt_qty(stocks[item['name']])})"
         if item["cost_cents"] is not None:
             line += f" at cost {cents_to_rand(item['cost_cents'])}"
         if item["product_id"] is None:
             line += " [new]"
         lines.append(line)
-    return _propose(conn, shop_id, "read_slip",
-                    payload, "Save slip to stock? " + "; ".join(lines) + ".")
+    return _propose(conn, shop_id, "read_slip", payload, "\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
@@ -729,10 +750,10 @@ def get_balance(conn: sqlite3.Connection, shop_id: str, customer: str) -> str:
         return f"No one named {customer} is on the book."
     bal = balance_cents(conn, shop_id, cust["id"])
     if bal > 0:
-        return f"{cust['name']} owes {cents_to_rand(bal)}."
+        return f"💳 *{cust['name']}* owes {cents_to_rand(bal)}."
     if bal == 0:
-        return f"{cust['name']} owes nothing. The book is clean."
-    return f"{cust['name']} is paid up with {cents_to_rand(-bal)} credit."
+        return f"✅ *{cust['name']}* owes nothing. The book is clean."
+    return f"✅ *{cust['name']}* is paid up with {cents_to_rand(-bal)} credit."
 
 
 def list_debtors(conn: sqlite3.Connection, shop_id: str) -> str:
@@ -741,11 +762,11 @@ def list_debtors(conn: sqlite3.Connection, shop_id: str) -> str:
     debtors = [(r["name"], balance_cents(conn, shop_id, r["id"])) for r in rows]
     debtors = [(n, b) for n, b in debtors if b > 0]
     if not debtors:
-        return "Nobody owes anything. The book is clean."
+        return "✅ Nobody owes anything. The book is clean."
     debtors.sort(key=lambda t: -t[1])
-    lines = [f"{n} — {cents_to_rand(b)}" for n, b in debtors]
+    lines = ["💳 *On the book*"] + [f"• {n} — {cents_to_rand(b)}" for n, b in debtors]
     total = sum(b for _, b in debtors)
-    return "On the book:\n" + "\n".join(lines) + f"\nTotal: {cents_to_rand(total)}."
+    return "\n".join(lines) + f"\n\nTotal: {cents_to_rand(total)}."
 
 
 def draft_reminder(conn: sqlite3.Connection, shop_id: str, customer: str) -> str:
@@ -757,21 +778,32 @@ def draft_reminder(conn: sqlite3.Connection, shop_id: str, customer: str) -> str
     if bal <= 0:
         return f"{cust['name']} owes nothing, no reminder needed."
     shop = ensure_shop(conn, shop_id)["name"]
-    return (f"Here is a draft for {cust['name']} — forward it yourself:\n"
-            f"\"Hi {cust['name']}, I hope you are well. A reminder of"
-            f" {cents_to_rand(bal)} on the book at {shop}."
-            f" Please pay when you can. Thank you!\"")
+    return (f"✉️ *Reminder for {cust['name']}*\n\nForward this yourself:\n\n"
+            f"\"Hi {cust['name']}, a reminder of {cents_to_rand(bal)} on the book"
+            f" at {shop}. Please pay when you can. Thank you!\"")
 
 
 _CATEGORY_ORDER = ["Bread", "Dairy", "Drinks", "Groceries", "Household", "Airtime"]
+_CATEGORY_HEADS = {"Bread": "🍞 *Bread*", "Dairy": "🥛 *Dairy*", "Drinks": "🥤 *Drinks*",
+                   "Groceries": "🛒 *Groceries*", "Household": "🧼 *Household*",
+                   "Airtime": "📱 *Airtime & data*"}
+
+
+def _stock_flag(qty: float, reorder: float) -> str:
+    if qty <= 0:
+        return " ❌"
+    if qty <= reorder:
+        return " ⚠️"
+    return ""
 
 
 def list_stock(conn: sqlite3.Connection, shop_id: str) -> str:
-    ensure_shop(conn, shop_id)
+    shop = ensure_shop(conn, shop_id)
     rows = conn.execute("SELECT * FROM products WHERE shop_id = ? ORDER BY name",
                         (shop_id,)).fetchall()
+    head = f"📦 *{shop['name']}: stock on hand*"
     if not rows:
-        return ("The shelves are empty — nothing in stock yet.\n"
+        return (f"{head}\n\nThe shelves are empty — nothing in stock yet.\n\n"
                 "Add some like this: 'add 20 bread at R18'.")
     groups: dict[str, list] = {}
     for r in rows:
@@ -780,18 +812,44 @@ def list_stock(conn: sqlite3.Connection, shop_id: str) -> str:
     order += sorted(set(groups) - set(_CATEGORY_ORDER) - {"Other"})
     if "Other" in groups:
         order.append("Other")
-    blocks = []
+    value = sum((r["price_cents"] or 0) * max(0, r["stock_qty"]) for r in rows)
+    n = len(rows)
+    blocks = [f"{head}\n{n} item{'s' if n != 1 else ''} · worth {cents_to_rand(int(value))}"]
     for cat in order:
-        lines = [f"*{cat}*"]
+        lines = [_CATEGORY_HEADS.get(cat, f"🏷️ *{cat}*")]
         for r in groups[cat]:
-            line = f"{r['name']} — {_fmt_qty(r['stock_qty'])}"
-            line += (f" @ {cents_to_rand(r['price_cents'])}"
-                     if r["price_cents"] is not None else " (no price)")
-            if r["stock_qty"] <= r["reorder_level"]:
-                line += " · LOW"
-            lines.append(line)
+            if r["price_cents"] is not None:
+                line = (f"• {r['name']}: {_fmt_qty(r['stock_qty'])} ×"
+                        f" {cents_to_rand(r['price_cents'])}")
+            else:
+                line = f"• {r['name']}: {_fmt_qty(r['stock_qty'])} (no price)"
+            lines.append(line + _stock_flag(r["stock_qty"], r["reorder_level"]))
         blocks.append("\n".join(lines))
+    low = [r for r in rows if r["stock_qty"] <= r["reorder_level"]]
+    if low:
+        lines = ["⚠️ *Running low*"]
+        for r in sorted(low, key=lambda r: r["name"]):
+            if r["stock_qty"] <= 0:
+                lines.append(f"• {r['name']} — out of stock ❌")
+            else:
+                lines.append(f"• {r['name']} — {_fmt_qty(r['stock_qty'])} left")
+        blocks.append("\n".join(lines))
+    else:
+        blocks.append("✅ Nothing is running low.")
+    blocks.append("Reply 'restock' for an order list")
     return "\n\n".join(blocks)
+
+
+def _best_seller_lines(conn: sqlite3.Connection, shop_id: str, days: int) -> list[str]:
+    cutoff = ((datetime.now(timezone.utc) - timedelta(days=days))
+              .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z")
+    rows = conn.execute(
+        "SELECT product_name, SUM(qty) q, SUM(total_cents) t FROM sales"
+        " WHERE shop_id = ? AND reversed = 0 AND created_at >= ?"
+        " GROUP BY product_name ORDER BY t DESC LIMIT 5",
+        (shop_id, cutoff)).fetchall()
+    return [f"{i}. {r['product_name']} — {_fmt_qty(r['q'])} sold, {cents_to_rand(r['t'])}"
+            for i, r in enumerate(rows, 1)]
 
 
 def best_sellers(conn: sqlite3.Connection, shop_id: str, days: int = 7) -> str:
@@ -802,17 +860,10 @@ def best_sellers(conn: sqlite3.Connection, shop_id: str, days: int = 7) -> str:
         days = 7
     if days <= 0:
         days = 7
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-    rows = conn.execute(
-        "SELECT product_name, SUM(qty) q, SUM(total_cents) t FROM sales"
-        " WHERE shop_id = ? AND reversed = 0 AND created_at >= ?"
-        " GROUP BY product_name ORDER BY t DESC LIMIT 5",
-        (shop_id, cutoff)).fetchall()
-    if not rows:
+    lines = _best_seller_lines(conn, shop_id, days)
+    if not lines:
         return f"No sales in the last {days} days yet."
-    lines = [f"{i}. {r['product_name']} — {_fmt_qty(r['q'])} sold, {cents_to_rand(r['t'])}"
-             for i, r in enumerate(rows, 1)]
-    return f"Top sellers (last {days} days):\n" + "\n".join(lines)
+    return f"⭐ *Top sellers (last {days} days)*\n" + "\n".join(lines)
 
 
 def low_stock(conn: sqlite3.Connection, shop_id: str) -> str:
@@ -821,9 +872,14 @@ def low_stock(conn: sqlite3.Connection, shop_id: str) -> str:
         "SELECT * FROM products WHERE shop_id = ? AND stock_qty <= reorder_level ORDER BY name",
         (shop_id,)).fetchall()
     if not rows:
-        return "Stock looks fine. Nothing is low."
-    lines = [f"• {r['name']} — {_fmt_qty(r['stock_qty'])} left" for r in rows]
-    return "Low stock:\n" + "\n".join(lines)
+        return "✅ Stock looks fine. Nothing is low."
+    lines = ["⚠️ *Low stock*"]
+    for r in rows:
+        if r["stock_qty"] <= 0:
+            lines.append(f"• {r['name']} — out of stock ❌")
+        else:
+            lines.append(f"• {r['name']} — {_fmt_qty(r['stock_qty'])} left")
+    return "\n".join(lines)
 
 
 def restock_list(conn: sqlite3.Connection, shop_id: str) -> str:
@@ -833,14 +889,16 @@ def restock_list(conn: sqlite3.Connection, shop_id: str) -> str:
         " ORDER BY wholesaler, name",
         (shop_id,)).fetchall()
     if not rows:
-        return "Nothing to buy. Stock is fine."
+        return "✅ Nothing to buy. Stock is fine."
     groups: dict[str, list[str]] = {}
     for r in rows:
         need = max(1, int(r["reorder_level"] * 2 - r["stock_qty"]))
         groups.setdefault(r["wholesaler"] or "No wholesaler", []).append(
-            f"{r['name']} (have {_fmt_qty(r['stock_qty'])}, order {need})")
-    lines = [f"{w}: " + "; ".join(items) for w, items in groups.items()]
-    return "Buy tomorrow:\n" + "\n".join(lines)
+            f"• {r['name']} — have {_fmt_qty(r['stock_qty'])}, order {need}")
+    blocks = ["🛒 *Buy tomorrow*"]
+    for w, items in groups.items():
+        blocks.append(f"*{w}*\n" + "\n".join(items))
+    return "\n\n".join(blocks)
 
 
 def cash_up(conn: sqlite3.Connection, shop_id: str, day: str | None = None) -> str:
@@ -861,49 +919,71 @@ def cash_up(conn: sqlite3.Connection, shop_id: str, day: str | None = None) -> s
         f" WHERE shop_id = ? AND reversed = 0 AND {day_expr} = ?",
         (shop_id, day)).fetchone()["s"]
     if not cash["s"] and not book and not pay:
-        return f"Cash-up {day}: nothing recorded yet."
-    return (f"Cash-up {day}:\n"
-            f"Cash sales: {cents_to_rand(cash['s'])} ({cash['n']} sales)\n"
-            f"Book sales: {cents_to_rand(book)}\n"
-            f"Payments in: {cents_to_rand(pay)}\n"
-            f"In the drawer: {cents_to_rand(cash['s'] + pay)}.")
+        return f"💰 *Cash-up {day}*\n\nNothing recorded yet."
+    out = (f"💰 *Cash-up {day}*\n"
+           f"• Cash sales {cents_to_rand(cash['s'])} ({cash['n']} sales)\n"
+           f"• Book sales {cents_to_rand(book)}\n"
+           f"• Payments in {cents_to_rand(pay)}\n\n"
+           f"💵 *In the drawer:* {cents_to_rand(cash['s'] + pay)}")
+    sellers = _best_seller_lines(conn, shop_id, 7)
+    if sellers:
+        out += "\n\n⭐ *Top sellers (7 days)*\n" + "\n".join(sellers)
+    return out
 
 
 COMPLIANCE_TOPICS = {
     "overview": (
-        "Sisi compliance helper (info only, not legal advice):\n"
-        "1. Municipal business registration at your local municipality\n"
-        "2. Trading permit from the municipality\n"
-        "3. Certificate of Acceptability (food safety) from Environmental Health\n"
-        "4. Spaza Shop Support Fund: up to R100,000 per shop — apply at spazashopfund.co.za\n"
-        "Warning: applications are FREE. Nobody needs to pay an agent.\n"
-        "More: gov.za, thedtic.gov.za, sanews.gov.za."
+        "🏛️ *Spaza compliance*\n"
+        "Info only, not legal advice.\n"
+        "\n"
+        "• Municipal business registration\n"
+        "• Trading permit from the municipality\n"
+        "• Certificate of Acceptability (food safety)\n"
+        "• Spaza Shop Support Fund: up to R100,000 — spazashopfund.co.za\n"
+        "\n"
+        "⚠️ Applications are FREE. Nobody needs to pay an agent.\n"
+        "\n"
+        "More: gov.za, thedtic.gov.za, sanews.gov.za"
     ),
     "register": (
-        "Municipal registration: every spaza must register with its municipality.\n"
+        "🏛️ *Municipal registration*\n"
+        "Every spaza must register at its municipality.\n"
+        "\n"
         "Ask your municipal office how to register now and what papers to bring.\n"
-        "More: gov.za."
+        "\n"
+        "More: gov.za"
     ),
     "permit": (
-        "Trading permit: issued by your municipality after registration checks.\n"
+        "🏛️ *Trading permit*\n"
+        "Issued by your municipality after registration checks.\n"
+        "\n"
         "Only about 15,000 of 44,696 verified shops hold permits, so apply early.\n"
-        "More: gov.za."
+        "\n"
+        "More: gov.za"
     ),
     "coa": (
-        "Certificate of Acceptability: food-safety certificate from municipal"
-        " Environmental Health. You need it before selling food.\n"
-        "Ask your municipality for an Environmental Health inspection.\n"
-        "More: gov.za."
+        "🏛️ *Certificate of Acceptability*\n"
+        "Food-safety certificate from municipal Environmental Health.\n"
+        "\n"
+        "You need it before selling food. Ask your municipality for an inspection.\n"
+        "\n"
+        "More: gov.za"
     ),
     "fund": (
-        "Spaza Shop Support Fund: up to R100,000 per shop, gated by registration paperwork.\n"
+        "💰 *Spaza Shop Support Fund*\n"
+        "Up to R100,000 per shop, gated by registration paperwork.\n"
+        "\n"
         "Apply only at spazashopfund.co.za.\n"
-        "Warning: applications are FREE. Nobody needs to pay an agent."
+        "\n"
+        "⚠️ Applications are FREE. Nobody needs to pay an agent."
         " Report anyone asking for payment to the police."
     ),
     "scam": (
-        "Scam warning: government warns of fake paid application assistants.\n"
+        "⚠️ *Scam warning*\n"
+        "Government warns of fake paid application assistants.\n"
+        "\n"
         "Applications are FREE. Nobody needs to pay an agent.\n"
+        "\n"
         "Deal only with municipal offices and official sites (gov.za, spazashopfund.co.za)."
     ),
 }
@@ -925,9 +1005,9 @@ def demo_reset(conn: sqlite3.Connection, shop_id: str) -> str:
 
     if shop_id == DEMO_NUMBER:
         seed_random_shop(shop_id, conn)
-        return f"Fresh start. {SHOP_NAME} is loaded again."
+        return f"🎉 Fresh start. {SHOP_NAME} is loaded again."
     seed_demo(shop_id, conn)
-    return f"Fresh start. {DEMO_SHOP_NAME} is loaded again."
+    return f"🎉 Fresh start. {DEMO_SHOP_NAME} is loaded again."
 
 
 def delete_my_data(conn: sqlite3.Connection, shop_id: str) -> str:
@@ -952,7 +1032,8 @@ def delete_my_data(conn: sqlite3.Connection, shop_id: str) -> str:
         (shop_id,),
     )
     conn.commit()
-    return "Done. I erased everything I had for this number. Send anything to start fresh."
+    return ("✅ *Done.*\nI erased everything I had for this number."
+            " Send anything to start fresh.")
 
 
 # ---------------------------------------------------------------------------

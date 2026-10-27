@@ -3,6 +3,7 @@
 Sisi is a WhatsApp-first assistant for South African spaza shop owners. The owner sends a voice note in her own words ("Sipho took two bread and a 2L Coke on the book"), a photo of a shelf or wholesaler slip, or a short text, and Sisi keeps the credit book (ibhuku), stock and sales, low-stock alerts, a restock list grouped by wholesaler, expiry checks, the daily cash-up, and a compliance helper for registration and the Spaza Shop Support Fund. Every write is shown as a short preview with Yes/No buttons and nothing is saved until the owner confirms; every saved action can be undone.
 
 **The problem.** After the 2024 foodborne-illness deaths linked to spaza shops, every spaza had to register with its municipality (registration closed 28 Feb 2025); of 44,696 verified shops only about 15,000 hold trading permits. The R500 million Spaza Shop Support Fund offers up to R100,000 per shop but is gated by paperwork, and government warns of fake paid "application assistants" — applications are free. Sources: [gov.za media statement, 29 May 2026](https://www.gov.za), [the dtic, 6 Jun 2025](https://www.thedtic.gov.za), [SAnews, 17 Apr 2025](https://www.sanews.gov.za), [spazashopfund.co.za](https://spazashopfund.co.za).
+Video stats: ±150,000 spaza shops (UCT Case Writing Centre; Accenture Africa 2023 via Daily Investor), 5.2% of GDP and 2.6 million jobs (UCT via supermarket.co.za).
 
 **Built during the hackathon.** Everything in this repo was built during the Meta Global AI Developer Hackathon 2026 (26 Oct – 4 Nov 2026). No earlier code was imported. The git history shows when each feature was built.
 
@@ -66,6 +67,21 @@ Run the API: `.venv/bin/python -m uvicorn app.main:app --port 8000`.
   with the checklist, the official link, and the applications-are-free warning.
 - Live WhatsApp: message the test number (see hackathon submission) — try "Sipho took two bread and a 2L Coke on the book", tap Yes, then Undo.
 - Screenshots: [screenshots/](screenshots/).
+
+## Reply style guide (standing rule)
+
+Every WhatsApp reply must be visually polished:
+
+- Emoji section headings, WhatsApp *bold* labels, one item per line, a blank
+  line between sections. Short sentences, no walls of text.
+- Amounts as R0.00. ⚠️ for warnings, ❌ for out of stock, ✅ for confirmations.
+- No line over 120 characters; anything over 300 characters has line breaks;
+  anything over about 1,500 characters is split at a section boundary
+  (`split_message` in `app/whatsapp.py`, applied by both live senders).
+- The privacy PS appears only on the first message or in "demo help".
+- The model relays tool results exactly as written (see `REPLY STYLE` in
+  `app/prompts.py`). `tests/test_format.py` fails the suite if any
+  deterministic reply breaks these rules.
 
 ## Go live (no code changes)
 

@@ -158,7 +158,7 @@ def test_handle_photo_proposes_preview(photo_env, monkeypatch):
     finally:
         conn.close()
     assert findings[0]["product"] == "Fresh Milk 1L"
-    assert "2 x Fresh Milk 1L 30 Oct has expired" in reply
+    assert "• 2 × Fresh Milk 1L 30 Oct — expired" in reply
     assert buttons == ["Yes", "No"]
 
 
@@ -225,7 +225,7 @@ def test_webhook_image_message_end_to_end(photo_env, monkeypatch):
     assert r.status_code == 200
     out = client.get("/_sim/outbox", params={"shop": SHOP}).json()["messages"]
     assert len(out) == 1 and out[0]["type"] == "buttons"
-    assert "2 x Fresh Milk 1L 30 Oct has expired" in out[0]["body"]
+    assert "• 2 × Fresh Milk 1L 30 Oct — expired" in out[0]["body"]
 
 
 def test_download_media_photo_label(photo_env):

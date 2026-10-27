@@ -13,12 +13,12 @@ def test_yes_confirms_and_no_cancels(conn):
     add_credit(conn, SHOP, "Sipho", [{"product": "Coke 2L", "qty": 1}])
     msg, buttons = try_deterministic(conn, SHOP, "Yes please")
     assert "Saved" in msg and buttons is None
-    assert get_balance(conn, SHOP, "Sipho") == "Sipho owes R109.00."
+    assert get_balance(conn, SHOP, "Sipho") == "💳 *Sipho* owes R109.00."
 
     add_credit(conn, SHOP, "Sipho", [{"product": "Coke 2L", "qty": 1}])
     msg, _ = try_deterministic(conn, SHOP, "no thanks")
     assert msg == "OK, I did not save it."
-    assert get_balance(conn, SHOP, "Sipho") == "Sipho owes R109.00."
+    assert get_balance(conn, SHOP, "Sipho") == "💳 *Sipho* owes R109.00."
 
 
 def test_undo_word_and_case(conn):
@@ -27,7 +27,7 @@ def test_undo_word_and_case(conn):
     try_deterministic(conn, SHOP, "yebo")
     msg, _ = try_deterministic(conn, SHOP, "UNDO")
     assert "Undone" in msg
-    assert get_balance(conn, SHOP, "Sipho") == "Sipho owes R73.00."
+    assert get_balance(conn, SHOP, "Sipho") == "💳 *Sipho* owes R73.00."
 
 
 def test_multilingual_yes_no(conn):
@@ -71,14 +71,14 @@ def test_demo_reset_command(conn):
     add_credit(conn, SHOP, "Sipho", [{"product": "Coke 2L", "qty": 1}])
     try_deterministic(conn, SHOP, "yes")
     msg, _ = try_deterministic(conn, SHOP, "demo reset")
-    assert msg.startswith("Fresh start.")
-    assert get_balance(conn, SHOP, "Sipho") == "Sipho owes R73.00."
+    assert msg.startswith("🎉 Fresh start.")
+    assert get_balance(conn, SHOP, "Sipho") == "💳 *Sipho* owes R73.00."
 
 
 def test_delete_my_data_command(conn):
     seed_demo(SHOP, conn)
     msg, buttons = try_deterministic(conn, SHOP, "Please delete my data")
-    assert msg.startswith("Done.") and buttons is None
+    assert msg.startswith("✅ *Done.*") and buttons is None
     assert get_balance(conn, SHOP, "Sipho") == "No one named Sipho is on the book."
 
 

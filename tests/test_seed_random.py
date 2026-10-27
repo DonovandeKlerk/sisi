@@ -37,7 +37,7 @@ def test_three_to_four_low_or_out(conn):
     flagged = [r for r in _products(conn) if r["stock_qty"] <= r["reorder_level"]]
     assert 3 <= len(flagged) <= 4
     assert any(r["stock_qty"] == 0 for r in flagged)
-    assert "Low stock:" in low_stock(conn, SHOP)
+    assert "⚠️ *Low stock*" in low_stock(conn, SHOP)
 
 
 def test_two_items_near_expiry(conn):
@@ -81,9 +81,9 @@ def test_reseed_is_random_but_repeatable(conn):
 
 def test_demo_reset_dispatches_per_number(conn):
     seed_demo(DEMO_SHOP_ID, conn)
-    assert demo_reset(conn, DEMO_NUMBER) == "Fresh start. Sisi Spaza is loaded again."
+    assert demo_reset(conn, DEMO_NUMBER) == "🎉 Fresh start. Sisi Spaza is loaded again."
     assert 25 <= len(_products(conn)) <= 30
-    assert demo_reset(conn, DEMO_SHOP_ID).startswith("Fresh start. MaZulu's Spaza")
+    assert demo_reset(conn, DEMO_SHOP_ID).startswith("🎉 Fresh start. MaZulu's Spaza")
     assert len(_products(conn, DEMO_SHOP_ID)) == 10
 
 

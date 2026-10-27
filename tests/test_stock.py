@@ -35,11 +35,11 @@ def test_list_stock_grouped_by_category_with_low_flags(conn):
 
     _shop_with_products(conn)
     out = ls(conn, SHOP)
-    assert out.index("*Bread*") < out.index("*Drinks*") < out.index("*Groceries*")
-    assert "White Bread — 12 @ R19.50" in out
-    assert "Brown Bread — 1 @ R20.00 · LOW" in out
-    assert "Coke 2L — 5 @ R36.00 · LOW" in out
-    assert "Mystery Tin — 7 (no price)" in out
+    assert out.index("🍞 *Bread*") < out.index("🥤 *Drinks*") < out.index("🛒 *Groceries*")
+    assert "• White Bread: 12 × R19.50" in out
+    assert "• Brown Bread: 1 × R20.00 ⚠️" in out
+    assert "• Coke 2L: 5 × R36.00 ⚠️" in out
+    assert "• Mystery Tin: 7 (no price)" in out
 
 
 def test_list_stock_empty_shop_shows_how_to_add(conn):
@@ -67,7 +67,7 @@ def test_best_sellers_empty(conn):
 def test_add_stock_with_cost_and_sell_price(conn):
     _shop_with_products(conn)
     msg = add_stock(conn, SHOP, "White Bread", 20, cost_cents=1500, price_cents=1950)
-    assert "New stock 32 (cost R15.00, sell R19.50)." in msg
+    assert "• Stock 12 → 32 (cost R15.00, sell R19.50)" in msg
     confirm_pending(conn, SHOP)
     row = conn.execute("SELECT stock_qty, cost_cents, price_cents FROM products"
                        " WHERE shop_id = ? AND name = ?", (SHOP, "White Bread")).fetchone()
@@ -77,7 +77,7 @@ def test_add_stock_with_cost_and_sell_price(conn):
 def test_add_stock_new_item_with_prices(conn):
     _shop_with_products(conn)
     msg = add_stock(conn, SHOP, "Simba", 10, cost_cents=1900, price_cents=2400)
-    assert "new product Simba, stock 10 (cost R19.00, sell R24.00)." in msg
+    assert "• New: Simba × 10 (cost R19.00, sell R24.00)" in msg
     confirm_pending(conn, SHOP)
     assert undo_last(conn, SHOP) == "Undone: removed Simba again."
 
@@ -85,7 +85,7 @@ def test_add_stock_new_item_with_prices(conn):
 def test_add_stock_cost_above_sell_warns(conn):
     _shop_with_products(conn)
     msg = add_stock(conn, SHOP, "White Bread", 5, cost_cents=2000, price_cents=1950)
-    assert "cost is higher than sell price" in msg
+    assert "• ⚠️ Cost is higher than sell price." in msg
 
 
 def test_add_stock_undo_restores_old_cost_and_price(conn):

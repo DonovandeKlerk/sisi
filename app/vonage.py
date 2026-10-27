@@ -20,7 +20,7 @@ import httpx
 
 from app.net import call_with_retries
 from app.voice import VoiceError
-from app.whatsapp import MAX_TEXT_LEN, IncomingMessage, WhatsAppSender
+from app.whatsapp import IncomingMessage, WhatsAppSender, split_message
 
 log = logging.getLogger("sisi.vonage")
 
@@ -30,25 +30,6 @@ DEFAULT_WHATSAPP_FROM = "14157386102"
 
 def _digits(number: str) -> str:
     return re.sub(r"\D", "", number or "")
-
-
-def _split_text(body: str, limit: int = MAX_TEXT_LEN) -> list[str]:
-    """Split a long reply on word boundaries; hard-split pathological words."""
-    chunks, current = [], ""
-    for word in (body or "").split():
-        if len(word) > limit:
-            if current:
-                chunks.append(current)
-                current = ""
-            chunks += [word[i:i + limit] for i in range(0, len(word), limit)]
-        elif len(current) + len(word) + 1 > limit:
-            chunks.append(current)
-            current = word
-        else:
-            current = f"{current} {word}".strip()
-    if current:
-        chunks.append(current)
-    return chunks
 
 
 class VonageSender(WhatsAppSender):
@@ -88,7 +69,7 @@ class VonageSender(WhatsAppSender):
             raise
 
     def send_text(self, to: str, body: str) -> None:
-        for chunk in _split_text(body):
+        for chunk in split_message(body):
             self._post_text(to, chunk)
 
     def send_buttons(self, to: str, body: str, buttons: list[str]) -> None:
