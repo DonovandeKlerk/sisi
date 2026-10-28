@@ -26,6 +26,8 @@ log = logging.getLogger("sisi.whatsapp")
 GRAPH_BASE = "https://graph.facebook.com"
 MAX_BUTTONS = 3
 MAX_BUTTON_TITLE = 20
+MAX_ROWS = 10
+MAX_ROW_TITLE = 24
 MAX_TEXT_LEN = 4096
 SPLIT_AT = 1500
 
@@ -157,6 +159,10 @@ class WhatsAppSender:
     def send_buttons(self, to: str, body: str, buttons: list[str]) -> None:
         raise NotImplementedError
 
+    def send_list(self, to: str, body: str, button_text: str,
+                  rows: list[str]) -> None:
+        raise NotImplementedError
+
     def send_image(self, to: str, url: str, caption: str = "") -> None:
         raise NotImplementedError
 
@@ -185,6 +191,14 @@ class FakeSender(WhatsAppSender):
             self.sent.append({"to": to, "type": "buttons", "body": body,
                               "buttons": list(buttons)})
         log.info("fake -> %s: %.80s %s", to, body, buttons)
+
+    def send_list(self, to: str, body: str, button_text: str,
+                  rows: list[str]) -> None:
+        with self._lock:
+            self.sent.append({"to": to, "type": "list", "body": body,
+                              "button_text": button_text,
+                              "rows": list(rows)})
+        log.info("fake -> %s: %.80s %s", to, body, rows)
 
     def send_image(self, to: str, url: str, caption: str = "") -> None:
         with self._lock:
@@ -252,6 +266,16 @@ class CloudApiSender(WhatsAppSender):
         self._post({"messaging_product": "whatsapp", "to": to, "type": "interactive",
                     "interactive": {"type": "button", "body": {"text": body[:1024]},
                                     "action": {"buttons": action}}})
+
+    def send_list(self, to: str, body: str, button_text: str,
+                  rows: list[str]) -> None:
+        items = [{"id": r[:MAX_ROW_TITLE], "title": r[:MAX_ROW_TITLE]}
+                 for r in rows[:MAX_ROWS]]
+        self._post({"messaging_product": "whatsapp", "to": to, "type": "interactive",
+                    "interactive": {"type": "list", "body": {"text": body[:1024]},
+                                    "action": {"button": button_text[:MAX_BUTTON_TITLE],
+                                               "sections": [{"title": "Options",
+                                                             "rows": items}]}}})
 
     def send_image(self, to: str, url: str, caption: str = "") -> None:
         self._post({"messaging_product": "whatsapp", "to": to, "type": "image",

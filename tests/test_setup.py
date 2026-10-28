@@ -116,14 +116,12 @@ def test_setup_command_restarts(conn):
 
 
 def test_shops_with_books_skip_setup(conn, monkeypatch):
-    import app.agent as agent
     ensure_shop(conn, SHOP)
     conn.execute("INSERT INTO products (shop_id, name, stock_qty) VALUES (?, 'Bread', 5)",
                  (SHOP,))
     conn.commit()
-    monkeypatch.setattr(agent, "llm_chat", lambda c, s, t: "roger")
     msg, _ = handle_text(conn, SHOP, "hello")
-    assert msg == "roger"
+    assert "Step 1" not in msg and "Main menu" in msg
 
 
 def test_reset_demo_runs_setup_then_reseeds(conn):

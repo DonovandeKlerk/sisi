@@ -40,6 +40,23 @@ def _retry_after(response) -> float | None:
         return None
 
 
+MAX_BTNS = 3
+MAX_BTN_TITLE = 20
+MAX_ROWS = 10
+MAX_ROW_TITLE = 24
+
+
+def _numbered(body: str, options: list[str]) -> str:
+    """Numbered fallback ('1) .. 2) ..'); skipped when the body already
+    carries numbers (ask_clarify renders its own)."""
+    if "1)" in (body or ""):
+        return body
+    lines = [body or "", ""]
+    for i, o in enumerate(options, 1):
+        lines.append(f"{i}) {o}")
+    return "\n".join(lines)
+
+
 class VonageSender(WhatsAppSender):
     """Send via the Vonage Messages sandbox. Same interface as CloudApiSender."""
 
@@ -85,9 +102,76 @@ class VonageSender(WhatsAppSender):
         for chunk in split_message(body):
             self._post_text(to, chunk)
 
+    def _post_custom(self, to: str, custom: dict, label: str) -> None:
+        """POST a message_type=custom interactive payload (buttons/list)."""
+        if not self.api_key or not self.api_secret:
+            raise RuntimeError("VONAGE_API_KEY/VONAGE_API_SECRET are not set")
+        data = {"from": self.whatsapp_from, "to": _digits(to), "channel": "whatsapp",
+                "message_type": "custom", "custom": custom}
+
+        def send():
+            resp = httpx.post(VONAGE_MESSAGES_URL, auth=(self.api_key, self.api_secret),
+                              json=data, timeout=15)
+            resp.raise_for_status()
+            log.info("vonage custom %s sent to=%s status=%s", label,
+                     data["to"], resp.status_code)
+            return resp.json()
+
+        try:
+            call_with_retries(send)
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code if e.response is not None else "?"
+            if status == 429:
+                log.warning("vonage 429 to=%s retry-after=%s", data["to"],
+                            _retry_after(e.response))
+                raise RateLimited(_retry_after(e.response)) from e
+            text = e.response.text[:300] if e.response is not None else ""
+            log.warning("vonage custom %s failed to=%s status=%s body=%s",
+                        label, data["to"], status, text)
+            raise
+
     def send_buttons(self, to: str, body: str, buttons: list[str]) -> None:
-        options = " / ".join(buttons[:3])
-        self.send_text(to, f"{body}\n\nReply: {options}")
+        """Interactive reply buttons; numbered text when unsupported.
+
+        429 (RateLimited) is re-raised for the queue to retry; any other
+        failure falls back to '1) .. 2) ..' text the numbered tap resolves.
+        """
+        options = [b[:MAX_BTN_TITLE] for b in buttons[:MAX_BTNS]]
+        action = [{"type": "reply", "reply": {"id": o, "title": o}}
+                  for o in options]
+        custom = {"type": "interactive",
+                  "interactive": {"type": "button",
+                                  "body": {"text": body[:1024]},
+                                  "action": {"buttons": action}}}
+        try:
+            self._post_custom(to, custom, "buttons")
+        except RateLimited:
+            raise
+        except (httpx.HTTPError, RuntimeError) as e:
+            log.warning("vonage buttons fallback to=%s err=%r", _digits(to), e)
+            self.send_text(to, _numbered(body, buttons[:MAX_BTNS]))
+
+    def send_list(self, to: str, body: str, button_text: str,
+                  rows: list[str]) -> None:
+        """Interactive list (up to 10 rows); numbered text when unsupported."""
+        options = [r[:MAX_ROW_TITLE] for r in rows[:MAX_ROWS]]
+        custom = {"type": "interactive",
+                  "interactive": {
+                      "type": "list", "body": {"text": body[:1024]},
+                      "action": {
+                          "button": button_text[:MAX_BTN_TITLE],
+                          "sections": [{
+                              "title": "Options",
+                              "rows": [{"id": o, "title": o} for o in options],
+                          }],
+                      }}}
+        try:
+            self._post_custom(to, custom, "list")
+        except RateLimited:
+            raise
+        except (httpx.HTTPError, RuntimeError) as e:
+            log.warning("vonage list fallback to=%s err=%r", _digits(to), e)
+            self.send_text(to, _numbered(body, rows[:MAX_ROWS]))
 
     def _post_media(self, to: str, message_type: str, payload: dict) -> None:
         if not self.api_key or not self.api_secret:

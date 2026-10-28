@@ -287,9 +287,10 @@ def test_webhook_body_cap(sim_env):
 def test_rate_limit_drops_but_stays_200(sim_env, monkeypatch):
     _scripted_model(monkeypatch)
     client = TestClient(app)
+    # "help" yields one text reply (no list fan-out), so the count is exact.
     for i in range(main.RATE_MAX):
-        assert _post_text(client, "hi", f"wamid.r{i}").status_code == 200
-    over = _post_text(client, "hi", "wamid.rover")
+        assert _post_text(client, "help", f"wamid.r{i}").status_code == 200
+    over = _post_text(client, "help", "wamid.rover")
     assert over.status_code == 200  # no retry storm from Meta
     out = client.get("/_sim/outbox", params={"shop": SHOP}).json()["messages"]
     assert len(out) == main.RATE_MAX

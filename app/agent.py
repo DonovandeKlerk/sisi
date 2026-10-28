@@ -98,6 +98,87 @@ def take_media(shop_id: str) -> list[dict]:
     return MEDIA_OUTBOX.pop(shop_id, [])
 
 
+LIST_OUTBOX: dict[str, list[dict]] = {}
+"""Queued interactive lists per shop; main.py drains after the text reply."""
+
+
+def queue_list(shop_id: str, body: str, button_text: str,
+               rows: list[str]) -> None:
+    if rows:
+        LIST_OUTBOX.setdefault(shop_id, []).append(
+            {"body": body, "button_text": button_text, "rows": list(rows)})
+
+
+def take_lists(shop_id: str) -> list[dict]:
+    return LIST_OUTBOX.pop(shop_id, [])
+
+
+MENU_WORDS = {"menu", "hi", "hello", "hey", "imenyu"}
+
+MENU_ROWS = ["Sell", "Stock", "Who owes me", "All statements",
+             "Month-end report", "My reminders", "Settings"]
+"""Main menu: each row is typed text the router already handles."""
+
+
+def show_menu(conn: sqlite3.Connection, shop_id: str) -> str:
+    """Queue the main interactive list; the intro text is the reply."""
+    _store_options(conn, shop_id, MENU_ROWS)
+    queue_list(shop_id, _t("menu_intro"), _t("menu_button"), MENU_ROWS)
+    return _t("menu_intro")
+
+
+_OPTIONS_TTL = timedelta(minutes=10)
+
+
+def _store_options(conn: sqlite3.Connection, shop_id: str,
+                   options: list[str]) -> None:
+    """Remember offered buttons/list rows so '1' taps back to typed text."""
+    conn.execute(
+        "INSERT INTO flags (shop_id, key, value) VALUES (?, 'last-options', ?)"
+        " ON CONFLICT (shop_id, key) DO UPDATE SET value = excluded.value",
+        (shop_id, json.dumps({
+            "options": list(options),
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        })))
+    conn.commit()
+
+
+def _resolve_numbered(conn: sqlite3.Connection, shop_id: str,
+                      text: str) -> str:
+    """Map a bare '1'..'10' to the stored option. Otherwise return as-is.
+
+    Skipped while setup runs (digits are answers there) and while a
+    reminder-time offer is pending (a digit may be the hour).
+    """
+    m = re.match(r"\s*(\d{1,2})\s*[.)]?\s*$", text or "")
+    if m is None:
+        return text
+    n = int(m.group(1))
+    if n < 1:
+        return text
+    if setup_step(conn, shop_id) is not None or needs_setup(conn, shop_id):
+        return text
+    pend = get_pending(conn, shop_id)
+    if pend is not None and pend["action_type"] == "reminder_offer":
+        return text
+    row = conn.execute("SELECT value FROM flags WHERE shop_id = ? AND key = 'last-options'",
+                       (shop_id,)).fetchone()
+    if row is None:
+        return text
+    try:
+        saved = json.loads(row["value"])
+        created = datetime.strptime(
+            saved["ts"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+    except (ValueError, KeyError, TypeError):
+        return text
+    if datetime.now(timezone.utc) - created > _OPTIONS_TTL:
+        return text
+    options = saved.get("options") or []
+    if n > len(options):
+        return text
+    return options[n - 1]
+
+
 _STAFF_NAME: ContextVar[str | None] = ContextVar("sisi_staff", default=None)
 """Staff display name for this turn (None when the sender is the owner)."""
 
@@ -540,9 +621,15 @@ def route_composite(conn: sqlite3.Connection, shop_id: str, text: str):
         return _t("llm_dropped"), None
 
 
+_AFTER_STATEMENT = ["All statements", "Set reminder", "Menu"]
+_AFTER_REMINDERS = ["Set reminder", "Menu"]
+_AFTER_ORDER = ["Send it", "Menu"]
+
+
 def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
     """Returns (message, buttons_or_None), or None if the LLM should handle it."""
     ensure_shop(conn, shop_id)
+    text = _resolve_numbered(conn, shop_id, text)
     word = _normalize(text or "")
     if _STAFF_NAME.get() and (word in _STAFF_BLOCKED_EXACT
                               or word.startswith(_STAFF_BLOCKED_PREFIX)):
@@ -557,21 +644,23 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
         return add_staff(conn, shop_id, m.group(1), m.group(2).strip()), None
     if _composite_route(conn, shop_id, word):
         return route_composite(conn, shop_id, text)
+    if word in MENU_WORDS:
+        return show_menu(conn, shop_id), None
     if word in ("who recorded today", "who recorded", "staff today"):
         return who_recorded_today(conn, shop_id), None
     if word == "float" or word.startswith("float "):
         return set_float(conn, shop_id, _parse_float(word)), None
     multi = try_multi_statement_request(conn, shop_id, text)
     if multi is not None:
-        return multi, None
+        return multi, _AFTER_STATEMENT
     statement = try_statement_request(conn, shop_id, text)
     if statement is not None:
-        return statement, None
+        return statement, _AFTER_STATEMENT
     reminder = try_reminder_command(conn, shop_id, text)
     if reminder is not None:
-        return reminder, None
+        return reminder, _AFTER_REMINDERS
     if word in ORDER_WORDS:
-        return build_order(conn, shop_id), None
+        return build_order(conn, shop_id), _AFTER_ORDER
     if word == "send it" or word.startswith("send it "):
         return send_order(conn, shop_id, word[7:].strip() or None), None
     if word == "use original logo":
@@ -897,6 +986,7 @@ def handle_text(conn: sqlite3.Connection, shop_id: str, text: str):
             return message, None
     before = get_pending(conn, shop_id)
     before_id = before["id"] if before else None
+    text = _resolve_numbered(conn, shop_id, text)
     direct = try_deterministic(conn, shop_id, text)
     det_buttons = None
     if direct is not None:
@@ -925,6 +1015,8 @@ def handle_text(conn: sqlite3.Connection, shop_id: str, text: str):
         buttons = ["Yes", "No"]
     else:
         buttons = det_buttons
+    if buttons:
+        _store_options(conn, shop_id, buttons)
     return message, buttons
 
 

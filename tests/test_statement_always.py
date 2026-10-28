@@ -61,7 +61,7 @@ def _image_for(conn):
 ])
 def test_text_triggers_produce_statement_image(conn, ledger, text):
     msg, buttons = handle_text(conn, SHOP, text)
-    assert buttons is None
+    assert buttons == ["All statements", "Set reminder", "Menu"]
     assert "R40.00" in msg  # one short text with the total
     image = _image_for(conn)
     # The forward-caption is an instruction to the owner: same language as

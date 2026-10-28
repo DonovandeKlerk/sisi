@@ -18,7 +18,7 @@ import traceback
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, PlainTextResponse, Response
 
-from app.agent import handle_photo, handle_text, handle_voice, take_media
+from app.agent import handle_photo, handle_text, handle_voice, take_lists, take_media
 from app.db import connect, init_db, now_iso
 from app.i18n import CURRENT_LANG, STRINGS, detect, owner_lang
 from app.i18n import t as _t
@@ -304,6 +304,9 @@ def _handle_message(sender, msg: IncomingMessage) -> None:
             out.send_buttons(msg.shop_id, reply, buttons)
         else:
             out.send_text(msg.shop_id, reply)
+        for lst in take_lists(msg.shop_id):
+            out.send_list(msg.shop_id, lst["body"], lst["button_text"],
+                          lst["rows"])
         for item in [i for i in items if not i.get("first")]:
             out.send_media_item(msg.shop_id, item)
         out.flush()

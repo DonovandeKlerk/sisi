@@ -2761,13 +2761,21 @@ STRINGS["xh"].update({
 
 STRINGS["en"].update({
     "clarify_hint": "Reply 1, 2 or 3 — or just type your answer.",
+    "menu_intro": "📋 *Main menu*\nPick one below 👇",
+    "menu_button": "Choose",
 })
 STRINGS["zu"].update({
     "clarify_hint": "Phendula ngo 1, 2 noma 3 — noma vele ubhale impendulo yakho.",
+    "menu_intro": "📋 *Imenyu enkulu*\nKhetha enye ngezansi 👇",
+    "menu_button": "Khetha",
 })
 STRINGS["af"].update({
     "clarify_hint": "Antwoord 1, 2 of 3 — of tik net jou antwoord.",
+    "menu_intro": "📋 *Hoofkieslys*\nKies een hieronder 👇",
+    "menu_button": "Kies",
 })
 STRINGS["xh"].update({
     "clarify_hint": "Phendula ngo 1, 2 okanye 3 — okanye vele ubhale impendulo yakho.",
+    "menu_intro": "📋 *Imenyu ephambili*\nKhetha enye apha ngezantsi 👇",
+    "menu_button": "Khetha",
 })

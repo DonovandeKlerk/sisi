@@ -103,7 +103,7 @@ def test_offer_guards():
 
 def test_save_and_confirm_through_chat(conn):
     msg, buttons = handle_text(conn, SHOP, "remind me tomorrow 7am to pay rent")
-    assert buttons is None
+    assert buttons == ["Set reminder", "Menu"]
     assert msg.startswith("⏰ *Reminder set*")
     assert "pay rent" in msg and "07:00" in msg
     rows = conn.execute("SELECT * FROM reminders WHERE shop_id = ?",

@@ -161,6 +161,10 @@ def _send_claimed(sender, kind: str, payload: dict, to: str) -> None:
     elif kind == "buttons":
         sender.send_buttons(to, payload.get("body", ""),
                             payload.get("buttons", []))
+    elif kind == "list":
+        sender.send_list(to, payload.get("body", ""),
+                         payload.get("button_text", "Choose"),
+                         payload.get("rows", []))
     elif kind == "image":
         persist_media()  # publish the file + DB row before Vonage fetches it
         ok, detail = check_media(payload.get("url", ""), "image")
@@ -378,6 +382,15 @@ class QueuedSender:
             return
         enqueue(self._conn, to, "vonage", "buttons",
                 {"body": body, "buttons": buttons})
+        self._remember(to)
+
+    def send_list(self, to: str, body: str, button_text: str,
+                  rows: list[str]) -> None:
+        if not self._queued:
+            self._sender.send_list(to, body, button_text, rows)
+            return
+        enqueue(self._conn, to, "vonage", "list",
+                {"body": body, "button_text": button_text, "rows": rows})
         self._remember(to)
 
     def _media_delay(self, to: str) -> float:
