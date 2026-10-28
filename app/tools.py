@@ -1523,6 +1523,31 @@ def draft_reminder(conn: sqlite3.Connection, shop_id: str, customer: str) -> str
     return out
 
 
+def ask_clarify(conn: sqlite3.Connection, shop_id: str, question: str,
+                options: list | str | None = None) -> str:
+    """Render ONE clarifying question with numbered options (max 3).
+
+    Called by the model instead of guessing between real alternatives.
+    The options double as reply buttons via llm.chat_full.
+    """
+    ensure_shop(conn, shop_id)
+    if isinstance(options, str):
+        options = [options]
+    opts: list[str] = []
+    for o in options or []:
+        o = str(o).strip()
+        if o and o not in opts:
+            opts.append(o)
+    opts = opts[:3]
+    lines = ["❓ " + (question or "").strip()]
+    for i, o in enumerate(opts, 1):
+        lines.append(f"{i}) {o}")
+    if opts:
+        lines.append("")
+        lines.append(_t("clarify_hint"))
+    return "\n".join(lines).strip()
+
+
 _CATEGORY_ORDER = ["Bread", "Dairy", "Drinks", "Groceries", "Household", "Airtime"]
 _CATEGORY_HEAD_KEYS = {"Bread": "cat_bread", "Dairy": "cat_dairy",
                        "Drinks": "cat_drinks", "Groceries": "cat_groceries",
@@ -2850,6 +2875,7 @@ def save_shop_logo(conn: sqlite3.Connection, shop_id: str, image: bytes) -> str:
         f.write(image or b"")
     with open(tile_path, "wb") as f:
         f.write(tile)
+    _reports.logo_put(shop_id, tile)
     conn.execute("UPDATE shops SET logo_path = ?, logo_orig_path = ? WHERE shop_id = ?",
                  (tile_path, orig_path, shop_id))
     conn.execute("INSERT INTO flags (shop_id, key, value) VALUES (?, 'logo-review', '1')"
@@ -3590,6 +3616,13 @@ TOOL_DEFS = [
     _tool("list_debtors", "Everyone who owes on the credit book, with the total.", {}, []),
     _tool("draft_reminder", "Draft a polite payment reminder the owner forwards herself.",
           {"customer": {"type": "string"}}, ["customer"]),
+    _tool("ask_clarify", "Ask the owner ONE short clarifying question instead of"
+          " guessing. Use when a request is ambiguous (which product, which"
+          " customer, which account). Up to 3 short options; they become reply"
+          " buttons. Write the question and options in the owner's language.",
+          {"question": {"type": "string"},
+           "options": {"type": "array", "items": {"type": "string"}}},
+          ["question"]),
     _tool("record_sale", "Record something SOLD: reduces stock and counts toward cash-up."
           " Use whenever the owner says they sold something."
           " Omit buyer for cash, or name the buyer for a credit sale."
@@ -3666,6 +3699,7 @@ TOOL_FUNCS = {
     "get_balance": get_balance,
     "list_debtors": list_debtors,
     "draft_reminder": draft_reminder,
+    "ask_clarify": ask_clarify,
     "record_sale": record_sale,
     "add_stock": add_stock,
     "set_price": set_price,

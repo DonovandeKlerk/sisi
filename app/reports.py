@@ -151,48 +151,104 @@ def media_get(token: str):
 
 
 
-def shop_brand(conn, shop_id: str) -> dict:
-    """Owner-supplied branding for document headers. Never invented."""
+def logo_put(shop_id: str, tile_bytes: bytes) -> None:
+    """Publish logo tile bytes to the shared Dict. Best-effort; logs failure."""
+    name = os.environ.get("SISI_MEDIA_DICT", "")
+    if not name:
+        return
+    try:
+        import modal
+        modal.Dict.from_name(name, create_if_missing=True).put(
+            f"logo:{shop_id}", {"tile": bytes(tile_bytes)})
+    except Exception:
+        log.warning("logo dict put failed shop=%s", shop_id, exc_info=True)
+
+
+def logo_get(shop_id: str) -> bytes | None:
+    """Read logo tile bytes from the shared Dict. None when missing/local."""
+    name = os.environ.get("SISI_MEDIA_DICT", "")
+    if not name:
+        return None
+    try:
+        import modal
+        entry = modal.Dict.from_name(name).get(f"logo:{shop_id}")
+    except Exception:
+        log.warning("logo dict get failed shop=%s", shop_id, exc_info=True)
+        return None
+    if isinstance(entry, dict) and entry.get("tile"):
+        return entry["tile"]
+    return None
+
+
+def brand_logo_path(conn, shop_id: str) -> str:
+    """The ONE source of the display logo for every renderer.
+
+    Never a container-local path: the tile on the shared volume, refreshed
+    from the volume or materialized from the shared Dict when this
+    container's snapshot lacks it. Legacy files are tiled once, in place.
+    Returns "" for a name-only header.
+    """
+    from app import logo as _logo
     tools.ensure_shop(conn, shop_id)
     shop = tools.ensure_shop(conn, shop_id)
     keys = shop.keys()
     display = shop["logo_path"] or ""
     orig = shop["logo_orig_path"] if "logo_orig_path" in keys else ""
-    if not orig:
-        orig = display  # legacy single-file logos
-    if display and not Path(display).exists():
-        display = ""
+    safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
+    tile_path = str(_logos_dir() / f"{safe}-tile.png")
+
+    def _point(path: str) -> str:
+        if (shop["logo_path"] or "") != path:
+            conn.execute("UPDATE shops SET logo_path = ? WHERE shop_id = ?",
+                         (path, shop_id))
+            conn.commit()
+        return path
+
+    if Path(tile_path).exists():
+        return _point(tile_path)
+    if display or orig:
+        refresh_media()
+        if Path(tile_path).exists():
+            return _point(tile_path)
+    for src in (display, orig):
+        if src and src != tile_path and Path(src).exists():
+            try:
+                ensure_dirs()
+                with open(src, "rb") as f:
+                    tile = _logo.render_tile(f.read())
+                with open(tile_path, "wb") as f:
+                    f.write(tile)
+                logo_put(shop_id, tile)
+                persist_media()
+                return _point(tile_path)
+            except Exception:
+                log.warning("logo tiling failed for %s", shop_id,
+                            exc_info=True)
+    blob = logo_get(shop_id)
+    if blob:
+        try:
+            ensure_dirs()
+            with open(tile_path, "wb") as f:
+                f.write(blob)
+            persist_media()
+            return _point(tile_path)
+        except Exception:
+            log.warning("logo materialize failed for %s", shop_id,
+                        exc_info=True)
+    return ""
+
+
+def shop_brand(conn, shop_id: str) -> dict:
+    """Owner-supplied branding for document headers. Never invented."""
+    tools.ensure_shop(conn, shop_id)
+    shop = tools.ensure_shop(conn, shop_id)
+    keys = shop.keys()
+    orig = shop["logo_orig_path"] if "logo_orig_path" in keys else ""
     if orig and not Path(orig).exists():
         orig = ""
-    if display and not display.endswith("-tile.png"):
-        display = _migrate_logo_tile(conn, shop_id, orig or display)
     return {"name": shop["name"], "address": shop["address"] or "",
-            "phone": shop["phone"] or "", "logo": display, "logo_orig": orig,
-            "language": shop["language"] or "en"}
-
-
-def _migrate_logo_tile(conn, shop_id: str, source: str) -> str:
-    """One-time move of a legacy logo file into the standard tile.
-
-    Returns the tile path, or "" when tiling fails (name-only header).
-    """
-    try:
-        from app import logo as _logo
-        ensure_dirs()
-        safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
-        tile_path = str(LOGOS_DIR / f"{safe}-tile.png")
-        with open(source, "rb") as f:
-            raw = f.read()
-        with open(tile_path, "wb") as f:
-            f.write(_logo.render_tile(raw))
-        conn.execute("UPDATE shops SET logo_path = ? WHERE shop_id = ?",
-                     (tile_path, shop_id))
-        conn.commit()
-        return tile_path
-    except Exception:
-        log.warning("logo tile migration failed for %s", shop_id,
-                    exc_info=True)
-        return ""
+            "phone": shop["phone"] or "", "logo": brand_logo_path(conn, shop_id),
+            "logo_orig": orig, "language": shop["language"] or "en"}
 
 
 def maybe_logo_nudge(conn, shop_id: str) -> str:

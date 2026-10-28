@@ -2757,3 +2757,17 @@ STRINGS["xh"].update({
     "llm_tricky": "Le inzima. Ndicela undibuze kwakhona ngamagama ambalwa?",
     "logo_cap_shop": "Intloko yevenkile yakho",
 })
+
+
+STRINGS["en"].update({
+    "clarify_hint": "Reply 1, 2 or 3 — or just type your answer.",
+})
+STRINGS["zu"].update({
+    "clarify_hint": "Phendula ngo 1, 2 noma 3 — noma vele ubhale impendulo yakho.",
+})
+STRINGS["af"].update({
+    "clarify_hint": "Antwoord 1, 2 of 3 — of tik net jou antwoord.",
+})
+STRINGS["xh"].update({
+    "clarify_hint": "Phendula ngo 1, 2 okanye 3 — okanye vele ubhale impendulo yakho.",
+})

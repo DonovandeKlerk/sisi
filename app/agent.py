@@ -22,6 +22,7 @@ from app.setup import (
     start_setup,
 )
 from app.llm import chat as llm_chat
+from app.llm import chat_full as llm_chat_full
 from app.llm import save_turn
 from app.vision import VisionError, read_expiry_photo, read_shop_photo
 from app.voice import VoiceError, transcribe_audio
@@ -446,6 +447,99 @@ def try_reminder_offer(conn: sqlite3.Connection, shop_id: str,
                                   found["summary"])
 
 
+_INTENT_FAMILIES: dict[str, tuple[str, ...]] = {
+    "statement": ("statement", "receipt", "slip", "invoice", "risiti"),
+    "reminder": ("remind", "reminder", "khumbuz", "herinner", "snooze"),
+    "debtor": ("owe", "owes", "owing", "debt", "balance", "kwelet", "tyala",
+               "skuld"),
+    "stock": ("stock", "shelf", "shelfu", "isitokwe", "voorraad", "low",
+              "expire", "expiry", "running out"),
+    "order": ("order", "restock", "buy", "thenga", "koop", "wholesaler",
+              "supplier"),
+    "expense": ("expense", "paid", "pay", "khokha", "betaal", "hlawula",
+                "electricity", "rent", "wage", "transport"),
+    "cash": ("cash", "float", "imali", "kontant", "counted", "cashup",
+             "till"),
+    "sale": ("sold", "sell", "thengisa", "verkoop"),
+    "credit": ("credit", "book", "ibhuku", "skoloto", "took"),
+    "report": ("report", "month", "profit", "inzuzo", "ingxelo"),
+    "compliance": ("permit", "register", "fund", "compliance", "scam"),
+}
+
+_CONNECTIVES = {"and", "then", "also", "plus", "futhi", "en", "ook",
+                "kwaye", "kananjalo", "na"}
+
+
+def _intent_hits(word: str) -> set[str]:
+    """Intent families named in the message (4 languages + slang).
+
+    Short signals match whole tokens; longer stems also match inside
+    Bantu-concord words (okweletayo, ngikhumbuze, onetyala).
+    """
+    tokens = re.findall(r"[a-z0-9]+", word or "")
+    hits: set[str] = set()
+    for fam, signals in _INTENT_FAMILIES.items():
+        for sig in signals:
+            if " " in sig:
+                if sig in (word or ""):
+                    hits.add(fam)
+                    break
+            elif len(sig) >= 5:
+                if any(sig in tok for tok in tokens):
+                    hits.add(fam)
+                    break
+            elif sig in tokens:
+                hits.add(fam)
+                break
+    return hits
+
+
+def _has_connective(word: str) -> bool:
+    if "&" in (word or "") or ";" in (word or ""):
+        return True
+    return bool(_CONNECTIVES & set(re.findall(r"[a-z0-9]+", word or "")))
+
+
+def _composite_route(conn: sqlite3.Connection, shop_id: str,
+                     word: str) -> bool:
+    """True when a multi-job message should skip keywords for the LLM.
+
+    Never fires while any deterministic state is in flight (setup,
+    pending preview, awaited price, order draft, logo review) or for
+    the deterministic core (Yes/No/Undo, reset, delete).
+    """
+    if get_pending(conn, shop_id) is not None:
+        return False
+    if get_await_price(conn, shop_id) is not None:
+        return False
+    if get_order_draft(conn, shop_id) is not None:
+        return False
+    if setup_step(conn, shop_id) is not None:
+        return False
+    logo_row = conn.execute(
+        "SELECT 1 FROM flags WHERE shop_id = ? AND key IN"
+        " ('logo-pending', 'logo-review')", (shop_id,)).fetchone()
+    if logo_row is not None:
+        return False
+    if word in YES_WORDS or word in NO_WORDS or word in UNDO_WORDS:
+        return False
+    if word == "undo book":
+        return False
+    if word in RESET_WORDS or word in DELETE_WORDS:
+        return False
+    if len(_intent_hits(word)) < 2:
+        return False
+    return _has_connective(word)
+
+
+def route_composite(conn: sqlite3.Connection, shop_id: str, text: str):
+    """Run a multi-job message through the LLM with live shop context."""
+    try:
+        return llm_chat_full(conn, shop_id, text)
+    except Exception:  # noqa: BLE001 - composites must never go silent
+        return _t("llm_dropped"), None
+
+
 def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
     """Returns (message, buttons_or_None), or None if the LLM should handle it."""
     ensure_shop(conn, shop_id)
@@ -461,6 +555,8 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
                    re.IGNORECASE)
     if m and _STAFF_NAME.get() is None:
         return add_staff(conn, shop_id, m.group(1), m.group(2).strip()), None
+    if _composite_route(conn, shop_id, word):
+        return route_composite(conn, shop_id, text)
     if word in ("who recorded today", "who recorded", "staff today"):
         return who_recorded_today(conn, shop_id), None
     if word == "float" or word.startswith("float "):
@@ -802,8 +898,9 @@ def handle_text(conn: sqlite3.Connection, shop_id: str, text: str):
     before = get_pending(conn, shop_id)
     before_id = before["id"] if before else None
     direct = try_deterministic(conn, shop_id, text)
+    det_buttons = None
     if direct is not None:
-        message, _ = direct
+        message, det_buttons = direct
         save_turn(conn, shop_id, "user", text)
         save_turn(conn, shop_id, "assistant", message)
     else:
@@ -824,7 +921,10 @@ def handle_text(conn: sqlite3.Connection, shop_id: str, text: str):
                 message = route_to_llm(conn, shop_id, text)  # saves turns itself
     message = _maybe_first_offer(conn, shop_id, message)
     after = get_pending(conn, shop_id)
-    buttons = ["Yes", "No"] if after is not None and after["id"] != before_id else None
+    if after is not None and after["id"] != before_id:
+        buttons = ["Yes", "No"]
+    else:
+        buttons = det_buttons
     return message, buttons
 
 

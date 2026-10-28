@@ -127,12 +127,63 @@ def print_api_error(e: Exception) -> None:
         print(f"status_code: {status}", file=sys.stderr)
 
 
+def _shop_context(conn: sqlite3.Connection, shop_id: str) -> str:
+    """Compact live snapshot (stock, debtors, pending reminders) for the intent engine."""
+    lines: list[str] = []
+    try:
+        rows = conn.execute(
+            "SELECT name, stock_qty, price_cents FROM products"
+            " WHERE shop_id = ? ORDER BY name LIMIT 15", (shop_id,)).fetchall()
+        if rows:
+            lines.append("STOCK (name | on hand | price):")
+            for r in rows:
+                price = f"R{r['price_cents'] / 100:.2f}" if r["price_cents"] else "no price"
+                lines.append(f"- {r['name']} | {r['stock_qty']:g} | {price}")
+        debts = conn.execute(
+            "SELECT c.name AS name,"
+            " COALESCE((SELECT SUM(amount_cents) FROM credit_entries e"
+            "  WHERE e.customer_id = c.id AND e.reversed = 0), 0) -"
+            " COALESCE((SELECT SUM(amount_cents) FROM payments p"
+            "  WHERE p.customer_id = c.id AND p.reversed = 0), 0) AS bal"
+            " FROM customers c WHERE c.shop_id = ? ORDER BY bal DESC LIMIT 10",
+            (shop_id,)).fetchall()
+        debts = [d for d in debts if d["bal"] > 0]
+        if debts:
+            lines.append("DEBTORS (name owes):")
+            for d in debts:
+                lines.append(f"- {d['name']} owes R{d['bal'] / 100:.2f}")
+        rems = conn.execute(
+            "SELECT due_at, summary FROM reminders"
+            " WHERE shop_id = ? AND status = 'pending'"
+            " ORDER BY due_at LIMIT 5", (shop_id,)).fetchall()
+        if rems:
+            lines.append("PENDING REMINDERS (due | what):")
+            for m in rems:
+                lines.append(f"- {m['due_at']} | {m['summary']}")
+    except Exception:  # noqa: BLE001 - context is a hint, never fatal
+        return ""
+    return "\n".join(lines)
+
+
 def chat(conn: sqlite3.Connection, shop_id: str, text: str) -> str:
+    reply, _ = chat_full(conn, shop_id, text)
+    return reply
+
+
+def chat_full(conn: sqlite3.Connection, shop_id: str,
+              text: str) -> tuple[str, list[str] | None]:
+    """chat() plus reply-button options when the model asked to clarify."""
     model = config.model_name()
-    messages: list = [{"role": "system", "content": SYSTEM_PROMPT}]
+    system = SYSTEM_PROMPT
+    ctx = _shop_context(conn, shop_id)
+    if ctx:
+        system += ("\n\nLIVE SHOP CONTEXT (facts for this shop; use the tools to"
+                   " act on them, never guess these):\n" + ctx)
+    messages: list = [{"role": "system", "content": system}]
     messages += load_history(conn, shop_id)
     messages.append({"role": "user", "content": text})
     save_turn(conn, shop_id, "user", text)
+    options: list[str] | None = None
     for round_no in range(1, MAX_TOOL_ROUNDS + 1):
         try:
             resp = _complete(messages)
@@ -141,7 +192,7 @@ def chat(conn: sqlite3.Connection, shop_id: str, text: str) -> str:
             from app.i18n import t as _t
             reply = _t("llm_dropped")
             save_turn(conn, shop_id, "assistant", reply)
-            return reply
+            return reply, None
         log_usage(shop_id, model, getattr(resp, "usage", None), round_no)
         msg = resp.choices[0].message
         calls = list(getattr(msg, "tool_calls", None) or [])
@@ -149,12 +200,26 @@ def chat(conn: sqlite3.Connection, shop_id: str, text: str) -> str:
             from app.i18n import t as _t
             reply = (msg.content or "").strip() or _t("llm_say_again")
             save_turn(conn, shop_id, "assistant", reply)
-            return reply
+            return reply, options
         messages.append(msg)
         for call in calls:
+            if call.function.name == "ask_clarify":
+                options = _clarify_options(call.function.arguments)
             result = _run_tool(conn, shop_id, call.function.name, call.function.arguments)
             messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
     from app.i18n import t as _t
     reply = _t("llm_tricky")
     save_turn(conn, shop_id, "assistant", reply)
-    return reply
+    return reply, options
+
+
+def _clarify_options(raw_args: str | None) -> list[str] | None:
+    """Button labels (max 3, WhatsApp-sized) from an ask_clarify call."""
+    try:
+        opts = json.loads(raw_args or "{}").get("options") or []
+    except (json.JSONDecodeError, AttributeError):
+        return None
+    if isinstance(opts, str):
+        opts = [opts]
+    labels = [str(o).strip()[:20] for o in opts if str(o).strip()][:3]
+    return labels or None
