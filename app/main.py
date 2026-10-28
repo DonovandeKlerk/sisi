@@ -196,8 +196,12 @@ async def webhook_infobip_receive(request: Request,
     # compared in constant time. Fails closed when unconfigured. The handler
     # returns 200 instantly (dispatch is async) so Infobip never retries a
     # receipt; redelivery is still safe via the messages_seen messageId key.
-    expected = os.environ.get("INFOBIP_WEBHOOK_TOKEN", "")
-    if not expected or not hmac.compare_digest(token, expected):
+    expected = os.environ.get("INFOBIP_WEBHOOK_TOKEN", "").strip()
+    if not expected or not hmac.compare_digest(token.strip(), expected):
+        # Lengths only: distinguishes "secret empty" from "value mismatch"
+        # (e.g. pasted whitespace or truncation) without logging secrets.
+        log.warning("infobip webhook 403: secret %s len=%d got len=%d",
+                    "set" if expected else "UNSET", len(expected), len(token))
         raise HTTPException(status_code=403, detail="bad webhook token")
     raw = await request.body()
     if len(raw) > MAX_WEBHOOK_BYTES:

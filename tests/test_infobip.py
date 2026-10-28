@@ -370,6 +370,28 @@ def test_webhook_auth_and_limits(ib_env, monkeypatch):
     assert (r.status_code, r.json()) == (200, {"status": "ignored"})
 
 
+def test_webhook_tolerates_pasted_whitespace(ib_env, monkeypatch):
+    fake = _FakePost()
+    monkeypatch.setattr(infobip.httpx, "post", fake)
+    monkeypatch.setenv("INFOBIP_WEBHOOK_TOKEN", f"  {TOKEN}\n")
+    client = TestClient(app)
+    body = _payload(_item({"type": "TEXT", "text": "resend"}, mid="ib-ws-1"))
+    r = client.post(f"/webhook/infobip/{TOKEN}", json=body)
+    assert r.status_code == 200
+    texts = [c for c in fake.calls if c["url"].endswith("/message/text")]
+    assert len(texts) == 1
+
+
+def test_webhook_403_logs_lengths_not_values(ib_env, caplog):
+    client = TestClient(app)
+    body = _payload(_item({"type": "TEXT", "text": "hi"}))
+    r = client.post("/webhook/infobip/wrong", json=body)
+    assert r.status_code == 403
+    assert "secret set len=12 got len=5" in caplog.text
+    assert TOKEN not in caplog.text
+    assert "ib-key" not in caplog.text
+
+
 def test_webhook_fails_closed_without_token(ib_env, monkeypatch):
     monkeypatch.delenv("INFOBIP_WEBHOOK_TOKEN")
     client = TestClient(app)
