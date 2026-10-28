@@ -218,9 +218,9 @@ def _propose(conn: sqlite3.Connection, shop_id: str, action_type: str, payload: 
         (now_iso(), shop_id),
     )
     conn.execute(
-        "INSERT INTO pending_actions (shop_id, action_type, payload_json, preview_text)"
-        " VALUES (?, ?, ?, ?)",
-        (shop_id, action_type, json.dumps(payload), preview),
+        "INSERT INTO pending_actions (shop_id, action_type, payload_json, preview_text,"
+        " created_at) VALUES (?, ?, ?, ?, ?)",
+        (shop_id, action_type, json.dumps(payload), preview, now_iso()),
     )
     conn.commit()
     return preview
@@ -1769,6 +1769,7 @@ def _remove_shop_files(conn: sqlite3.Connection, shop_id: str, *logos: str) -> N
     paths = [p for p in logos if p]
     safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
     paths += [str(_reports.LOGOS_DIR / f"{safe}-{v}.png") for v in ("cutout", "badge")]
+    paths += [str(_reports.LOGOS_DIR / f"{safe}-staged-{v}.png") for v in ("tile", "orig")]
     for row in conn.execute("SELECT pdf_path, png_path FROM reports WHERE shop_id = ?",
                             (shop_id,)).fetchall():
         paths += [row["pdf_path"], row["png_path"]]
@@ -1811,6 +1812,7 @@ def delete_my_data(conn: sqlite3.Connection, shop_id: str) -> str:
         "products",
         "customers",
         "actions",
+        "task_plans",
     ):
         conn.execute(f"DELETE FROM {table} WHERE shop_id = ?", (shop_id,))
     conn.execute(
@@ -2898,11 +2900,191 @@ def save_shop_logo(conn: sqlite3.Connection, shop_id: str, image: bytes) -> str:
     return out
 
 
-def logo_pending(conn: sqlite3.Connection, shop_id: str) -> bool:
-    """True when the owner asked for a new logo and the photo is still coming."""
+def _staged_logo_paths(shop_id: str) -> tuple[str, str]:
+    """Staged (not yet live) tile + original paths for a shop."""
+    from app import reports as _reports
+    safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
+    return (str(_reports.LOGOS_DIR / f"{safe}-staged-tile.png"),
+            str(_reports.LOGOS_DIR / f"{safe}-staged-orig.png"))
+
+
+def get_staged_logo(conn: sqlite3.Connection, shop_id: str) -> dict | None:
+    """The staged logo awaiting Yes ({at, tile, orig}), or None."""
+    row = conn.execute("SELECT value FROM flags WHERE shop_id = ?"
+                       " AND key = 'logo-staged'", (shop_id,)).fetchone()
+    if row is None:
+        return None
+    try:
+        staged = json.loads(row["value"])
+    except ValueError:
+        return None
+    if not isinstance(staged, dict) or not staged.get("tile"):
+        return None
+    return staged
+
+
+def stage_shop_logo(conn: sqlite3.Connection, shop_id: str,
+                    image: bytes) -> str:
+    """Stage a logo photo for Yes/No review; the live logo is untouched.
+
+    Nothing stored changes until the owner replies Yes (apply) or No
+    (discard). Consumes any pending logo request.
+    """
+    import os as _os
+
+    from app import logo as _logo
+    from app import reports as _reports
+
+    from app.agent import queue_media as _queue
+    blocked = _staff_blocked()
+    if blocked:
+        return blocked
+    ensure_shop(conn, shop_id)
+    try:
+        tile = _logo.render_tile(image or b"")
+    except Exception:
+        return _t("logo_not_photo")
+    _reports.ensure_dirs()
+    tile_path, orig_path = _staged_logo_paths(shop_id)
+    with open(orig_path, "wb") as f:
+        f.write(image or b"")
+    with open(tile_path, "wb") as f:
+        f.write(tile)
+    conn.execute("INSERT INTO flags (shop_id, key, value)"
+                 " VALUES (?, 'logo-staged', ?)"
+                 " ON CONFLICT (shop_id, key) DO UPDATE"
+                 " SET value = excluded.value",
+                 (shop_id, json.dumps(
+                     {"at": datetime.now(timezone.utc).isoformat(),
+                      "tile": tile_path, "orig": orig_path})))
+    conn.execute("DELETE FROM flags WHERE shop_id = ? AND key = 'logo-pending'",
+                 (shop_id,))
+    conn.commit()
+    out = _t("logo_staged")
+    base = _os.environ.get("SISI_PUBLIC_URL", "").rstrip("/")
+    if base:
+        safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
+        brand = _reports.shop_brand(conn, shop_id)
+        brand = dict(brand, logo=tile_path, logo_orig=orig_path)
+        card = str(_reports.REPORTS_DIR / f"{safe}-profile.png")
+        with _doc_lang(_owner_lang(conn, shop_id)):
+            _reports.render_shop_card(brand, card)
+        token = _reports.store_card(conn, shop_id, "profile", card)
+        _queue(shop_id, [{"kind": "image", "url": f"{base}/media/{token}?f=png",
+                          "caption": _t("logo_cap_new"), "filename": ""}])
+    return out
+
+
+def apply_staged_logo(conn: sqlite3.Connection, shop_id: str) -> str:
+    """Yes: replace the live logo with the staged one (undoable)."""
+    import base64 as _b64
+
+    from app import reports as _reports
+    blocked = _staff_blocked()
+    if blocked:
+        return blocked
+    ensure_shop(conn, shop_id)
+    staged = get_staged_logo(conn, shop_id)
+    if staged is None:
+        return _t("logo_staged_none")
+    safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
+    live_tile = str(_reports.LOGOS_DIR / f"{safe}-tile.png")
+    live_orig = str(_reports.LOGOS_DIR / f"{safe}-orig.png")
+    old: dict = {"tile": None, "orig": None}
+    for key, path in (("tile", live_tile), ("orig", live_orig)):
+        try:
+            with open(path, "rb") as f:
+                old[key] = _b64.b64encode(f.read()).decode("ascii")
+        except OSError:
+            old[key] = None
+    with open(staged["tile"], "rb") as f:
+        tile_bytes = f.read()
+    with open(staged["orig"], "rb") as f:
+        orig_bytes = f.read()
+    with open(live_tile, "wb") as f:
+        f.write(tile_bytes)
+    with open(live_orig, "wb") as f:
+        f.write(orig_bytes)
+    _reports.logo_put(shop_id, tile_bytes)
+    conn.execute("UPDATE shops SET logo_path = ?, logo_orig_path = ?"
+                 " WHERE shop_id = ?", (live_tile, live_orig, shop_id))
+    conn.execute("DELETE FROM flags WHERE shop_id = ? AND key = 'logo-staged'",
+                 (shop_id,))
+    conn.execute("INSERT INTO actions (action_id, shop_id, kind, summary,"
+                 " data_json) VALUES (?, ?, 'logo', ?, ?)",
+                 (_action_id(), shop_id, "logo: replaced",
+                  json.dumps(old)))
+    conn.commit()
+    return _t("logo_applied")
+
+
+def discard_staged_logo(conn: sqlite3.Connection, shop_id: str) -> str:
+    """No: throw the staged logo away; the live logo is untouched."""
+    import os as _os
+    ensure_shop(conn, shop_id)
+    staged = get_staged_logo(conn, shop_id)
+    if staged is None:
+        return _t("logo_staged_none")
+    for path in (staged.get("tile"), staged.get("orig")):
+        try:
+            if path:
+                _os.remove(path)
+        except OSError:
+            pass
+    conn.execute("DELETE FROM flags WHERE shop_id = ? AND key = 'logo-staged'",
+                 (shop_id,))
+    conn.commit()
+    return _t("logo_kept")
+
+
+LOGO_PENDING_TTL = timedelta(minutes=30)
+"""A 'redo logo' request stops hijacking photos after this long."""
+
+
+def _logo_pending_at(conn: sqlite3.Connection, shop_id: str):
+    """Timestamp of the logo request, or None when absent/unparseable."""
     row = conn.execute("SELECT value FROM flags WHERE shop_id = ? AND key = 'logo-pending'",
                        (shop_id,)).fetchone()
-    return row is not None
+    if row is None:
+        return None
+    try:
+        return datetime.fromisoformat(row["value"])
+    except (ValueError, TypeError):
+        return None
+
+
+def logo_pending(conn: sqlite3.Connection, shop_id: str) -> bool:
+    """True when a fresh logo request is still waiting for its photo.
+
+    Stale requests (older than LOGO_PENDING_TTL) are cleared so they
+    can never hijack an unrelated photo again.
+    """
+    at = _logo_pending_at(conn, shop_id)
+    if at is None:
+        row = conn.execute("SELECT value FROM flags WHERE shop_id = ?"
+                           " AND key = 'logo-pending'", (shop_id,)).fetchone()
+        if row is None:
+            return False
+        conn.execute("DELETE FROM flags WHERE shop_id = ? AND key = 'logo-pending'",
+                     (shop_id,))
+        conn.commit()
+        return False
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) - at > LOGO_PENDING_TTL:
+        conn.execute("DELETE FROM flags WHERE shop_id = ? AND key = 'logo-pending'",
+                     (shop_id,))
+        conn.commit()
+        return False
+    return True
+
+
+def clear_logo_pending(conn: sqlite3.Connection, shop_id: str) -> bool:
+    """Drop any logo request (fresh or stale). True when one existed."""
+    cur = conn.execute("DELETE FROM flags WHERE shop_id = ? AND key = 'logo-pending'",
+                       (shop_id,))
+    conn.commit()
+    return cur.rowcount > 0
 
 
 def want_new_logo(conn: sqlite3.Connection, shop_id: str) -> str:
@@ -2911,9 +3093,10 @@ def want_new_logo(conn: sqlite3.Connection, shop_id: str) -> str:
     if blocked:
         return blocked
     ensure_shop(conn, shop_id)
-    conn.execute("INSERT INTO flags (shop_id, key, value) VALUES (?, 'logo-pending', '1')"
-                 " ON CONFLICT (shop_id, key) DO UPDATE SET value = '1'",
-                 (shop_id,))
+    stamp = datetime.now(timezone.utc).isoformat()
+    conn.execute("INSERT INTO flags (shop_id, key, value) VALUES (?, 'logo-pending', ?)"
+                 " ON CONFLICT (shop_id, key) DO UPDATE SET value = excluded.value",
+                 (shop_id, stamp))
     conn.commit()
     return _t("logo_send_prompt")
 
@@ -3464,6 +3647,65 @@ def undo_last_kind(conn: sqlite3.Connection, shop_id: str, kind: str, nothing_ms
     return _undo_row(conn, shop_id, row)
 
 
+def _undo_order(conn: sqlite3.Connection, shop_id: str, undo: dict) -> str:
+    """Undo a confirmed customer order: restore the previous order draft."""
+    prev = undo.get("previous")
+    if prev is None:
+        conn.execute("DELETE FROM order_drafts WHERE shop_id = ?", (shop_id,))
+    else:
+        _save_order_draft(conn, shop_id, prev)
+    return _t("undo_order_done")
+
+
+def _undo_customer(conn: sqlite3.Connection, shop_id: str, undo: dict) -> str:
+    """Undo a plan-added customer, unless the book already uses them."""
+    cid = undo.get("customer_id")
+    name = undo.get("name", "")
+    if cid is None:
+        return _t("undo_cust_done")
+    refs = 0
+    for table, column in (("credit_entries", "customer_id"),
+                          ("payments", "customer_id"),
+                          ("sales", "customer_id")):
+        refs += conn.execute(f"SELECT COUNT(*) n FROM {table}"
+                             " WHERE shop_id = ? AND customer_id = ?",
+                             (shop_id, cid)).fetchone()["n"]
+    if refs:
+        return _t("undo_cust_kept", name=name)
+    conn.execute("DELETE FROM customers WHERE id = ? AND shop_id = ?",
+                 (cid, shop_id))
+    return _t("undo_cust_done")
+
+
+def _undo_logo(conn: sqlite3.Connection, shop_id: str, undo: dict) -> str:
+    """Undo a logo replacement: restore the previous tile + original."""
+    import base64 as _b64
+
+    from app import reports as _reports
+    safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
+    live_tile = str(_reports.LOGOS_DIR / f"{safe}-tile.png")
+    live_orig = str(_reports.LOGOS_DIR / f"{safe}-orig.png")
+    for key, path in (("tile", live_tile), ("orig", live_orig)):
+        blob = undo.get(key)
+        if blob is None:
+            try:
+                import os as _os
+                _os.remove(path)
+            except OSError:
+                pass
+        else:
+            with open(path, "wb") as f:
+                f.write(_b64.b64decode(blob))
+    if undo.get("tile") is None:
+        conn.execute("UPDATE shops SET logo_path = '', logo_orig_path = ''"
+                     " WHERE shop_id = ?", (shop_id,))
+        _reports.logo_put(shop_id, b"")
+    else:
+        with open(live_tile, "rb") as f:
+            _reports.logo_put(shop_id, f.read())
+    return _t("undo_logo_done")
+
+
 def _undo_row(conn: sqlite3.Connection, shop_id: str, row) -> str:
     undo = json.loads(row["data_json"])
     kind = row["kind"]
@@ -3495,6 +3737,12 @@ def _undo_row(conn: sqlite3.Connection, shop_id: str, row) -> str:
         msg = _undo_book(conn, shop_id, undo, row["action_id"])
     elif kind == "receipt":
         msg = _undo_receipt(conn, shop_id, undo, row["action_id"])
+    elif kind == "order":
+        msg = _undo_order(conn, shop_id, undo)
+    elif kind == "customer":
+        msg = _undo_customer(conn, shop_id, undo)
+    elif kind == "logo":
+        msg = _undo_logo(conn, shop_id, undo)
     else:
         return _t("cannot_undo")
     conn.execute("UPDATE actions SET undone = 1, undone_at = ? WHERE action_id = ?",

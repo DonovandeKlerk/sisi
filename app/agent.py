@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -23,6 +24,19 @@ from app.setup import (
 )
 from app.llm import chat_full as llm_chat_full
 from app.llm import save_turn
+from app.orders import (
+    build_plan,
+    cancel_plan,
+    confirm_plan,
+    correct_plan_line,
+    get_plan,
+    get_plan_by_key,
+    plan_followup_message,
+    render_preview,
+    save_plan,
+)
+
+log = logging.getLogger("sisi.agent")
 from app.vision import VisionError, read_expiry_photo, read_shop_photo
 from app.voice import VoiceError, transcribe_audio
 from app.tools import (
@@ -62,8 +76,12 @@ from app.tools import (
     resolve_sender,
     reset_shop,
     confirm_logo,
-    save_shop_logo,
+    stage_shop_logo,
+    apply_staged_logo,
+    discard_staged_logo,
+    get_staged_logo,
     want_new_logo,
+    clear_logo_pending,
     logo_as_is,
     logo_pending,
     set_customer_language,
@@ -592,6 +610,10 @@ def _composite_route(conn: sqlite3.Connection, shop_id: str,
         return False
     if get_await_price(conn, shop_id) is not None:
         return False
+    if get_plan(conn, shop_id) is not None:
+        return False
+    if get_staged_logo(conn, shop_id) is not None:
+        return False
     if get_order_draft(conn, shop_id) is not None:
         return False
     if setup_step(conn, shop_id) is not None:
@@ -602,6 +624,8 @@ def _composite_route(conn: sqlite3.Connection, shop_id: str,
     if logo_row is not None:
         return False
     if word in YES_WORDS or word in NO_WORDS or word in UNDO_WORDS:
+        return False
+    if word in CANCEL_WORDS:
         return False
     if word == "undo book":
         return False
@@ -624,6 +648,140 @@ _AFTER_STATEMENT = ["All statements", "Set reminder", "Menu"]
 _AFTER_REMINDERS = ["Set reminder", "Menu"]
 _AFTER_ORDER = ["Send it", "Menu"]
 
+CANCEL_WORDS = {"cancel", "cancel that", "never mind", "nevermind",
+                "kanselleer", "kanselleer dit", "khansela", "ngiyayekisa",
+                "rhoxisa"}
+
+_WAIT_KEY = {"pending": "wait_pending", "plan": "wait_plan",
+             "logo": "wait_logo"}
+
+
+def _parse_ts(value: str) -> datetime:
+    """Parse a proposal timestamp (ISO or legacy pending format)."""
+    v = (value or "").strip()
+    if not v:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    try:
+        if "." in v:
+            dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+        else:
+            dt = datetime.strptime(v, "%Y-%m-%dT%H:%M:%SZ")
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        pass
+    try:
+        dt = datetime.strptime(v, "%Y-%m-%dT%H:%M:%fZ")
+        return dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _newest_proposal(conn: sqlite3.Connection, shop_id: str):
+    """Newest of (pending action, task plan, staged logo) for Yes/No.
+
+    Returns (kind, [older kinds still waiting]), or None when nothing
+    is waiting. Yes/No always act on the newest proposal.
+    """
+    cands: list[tuple[datetime, str]] = []
+    pend = get_pending(conn, shop_id)
+    if pend is not None:
+        cands.append((_parse_ts(pend["created_at"]), "pending"))
+    plan = get_plan(conn, shop_id)
+    if plan is not None:
+        cands.append((_parse_ts(plan["created_at"]), "plan"))
+    staged = get_staged_logo(conn, shop_id)
+    if staged is not None:
+        cands.append((_parse_ts(staged.get("at") or ""), "logo"))
+    if not cands:
+        return None
+    cands.sort()
+    return cands[-1][1], [c[1] for c in cands[:-1]]
+
+
+def _waiting_note(waiting: list[str]) -> str:
+    """One line per older proposal still waiting after a Yes."""
+    if not waiting:
+        return ""
+    return "\n\n" + "\n".join(
+        _t("still_waiting", what=_t(_WAIT_KEY[w])) for w in waiting)
+
+
+def confirm_newest(conn: sqlite3.Connection, shop_id: str) -> str:
+    """Yes: confirm the newest proposal (pending, plan, or staged logo)."""
+    pick = _newest_proposal(conn, shop_id)
+    if pick is None:
+        followup = plan_followup_message(conn, shop_id)
+        if followup is not None:
+            return followup
+        waiting = get_await_price(conn, shop_id)
+        if waiting is not None:
+            return _t("ag_price_needed", product=waiting["product"])
+        seen = confirm_logo(conn, shop_id)
+        if seen is not None:
+            return seen
+        return confirm_pending(conn, shop_id)
+    kind, waiting = pick
+    if kind == "plan":
+        return confirm_plan(conn, shop_id) + _waiting_note(waiting)
+    if kind == "logo":
+        return apply_staged_logo(conn, shop_id) + _waiting_note(waiting)
+    return confirm_pending(conn, shop_id) + _waiting_note(waiting)
+
+
+def cancel_newest(conn: sqlite3.Connection, shop_id: str) -> str:
+    """No: cancel the newest proposal (pending, plan, or staged logo)."""
+    pick = _newest_proposal(conn, shop_id)
+    if pick is None:
+        return cancel_pending(conn, shop_id)
+    kind, _waiting = pick
+    if kind == "plan":
+        return cancel_plan(conn, shop_id)
+    if kind == "logo":
+        return discard_staged_logo(conn, shop_id)
+    return cancel_pending(conn, shop_id)
+
+
+def try_order_plan(conn: sqlite3.Connection, shop_id: str,
+                   text: str) -> str | None:
+    """Order-bearing texts become one combined plan preview. None otherwise."""
+    plan, _question = build_plan(conn, shop_id, text or "", None, "")
+    if plan is None:
+        return None
+    existing = get_plan_by_key(conn, shop_id, plan["message_key"])
+    if existing is not None:
+        if existing["status"] == "confirmed":
+            return _t("ord_already")
+        return render_preview(conn, shop_id, existing)
+    saved = save_plan(conn, shop_id, plan)
+    return render_preview(conn, shop_id, saved)
+
+
+def _caption_action(conn: sqlite3.Connection, shop_id: str, caption: str):
+    """Route a photo caption through deterministic handlers (never the LLM).
+
+    Returns (message, buttons) or None. Control words (Yes/No/Undo,
+    menus, resets) are ignored so a caption can never confirm, wipe,
+    or navigate by accident.
+    """
+    word = _normalize(caption or "")
+    if not word:
+        return None
+    if word in YES_WORDS or word in NO_WORDS or word in UNDO_WORDS \
+            or word in CANCEL_WORDS or word in MENU_WORDS \
+            or word in HELP_WORDS or word in RESET_WORDS \
+            or word in DELETE_WORDS or word == "undo book":
+        return None
+    return try_deterministic(conn, shop_id, caption)
+
+
+def _store_evidence(digest: str, image: bytes) -> None:
+    """Keep photo bytes in the shared Dict so plans survive restarts."""
+    try:
+        from app import reports as _reports
+        _reports.evidence_put(digest, image or b"")
+    except Exception:
+        log.warning("evidence store failed", exc_info=True)
+
 
 def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
     """Returns (message, buttons_or_None), or None if the LLM should handle it."""
@@ -641,6 +799,9 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
                    re.IGNORECASE)
     if m and _STAFF_NAME.get() is None:
         return add_staff(conn, shop_id, m.group(1), m.group(2).strip()), None
+    planned = try_order_plan(conn, shop_id, text)
+    if planned is not None:
+        return planned, ["Yes", "No"]
     if _composite_route(conn, shop_id, word):
         return route_composite(conn, shop_id, text)
     if word in MENU_WORDS:
@@ -678,22 +839,24 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
         if parsed is None:
             return _t("ag_order_add_hint"), None
         return edit_order_add(conn, shop_id, *parsed), None
+    if word in CANCEL_WORDS:
+        if get_plan(conn, shop_id) is not None:
+            return cancel_plan(conn, shop_id), None
+        if get_staged_logo(conn, shop_id) is not None:
+            return discard_staged_logo(conn, shop_id), None
+        if clear_logo_pending(conn, shop_id):
+            return _t("logo_kept"), None
+        clear_await_price(conn, shop_id)
+        return cancel_pending(conn, shop_id), None
     if word in YES_WORDS:
-        if get_pending(conn, shop_id) is None:
-            waiting = get_await_price(conn, shop_id)
-            if waiting is not None:
-                return (_t("ag_price_needed",
-                           product=waiting['product']), None)
-            seen = confirm_logo(conn, shop_id)
-            if seen is not None:
-                return seen, None
-        return confirm_pending(conn, shop_id), None
+        return confirm_newest(conn, shop_id), None
     if word in NO_WORDS:
-        if get_pending(conn, shop_id) is None and get_await_price(conn, shop_id) is not None:
+        if _newest_proposal(conn, shop_id) is None \
+                and get_await_price(conn, shop_id) is not None:
             clear_await_price(conn, shop_id)
             return _t("ag_sale_dropped"), None
         clear_await_price(conn, shop_id)
-        return cancel_pending(conn, shop_id), None
+        return cancel_newest(conn, shop_id), None
     offered = try_offer_time(conn, shop_id, text)
     if offered is not None:
         return offered, None
@@ -768,7 +931,7 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
         if image is None:
             return _t("logo_howto"), None
         LAST_PHOTO.pop(shop_id, None)
-        return save_shop_logo(conn, shop_id, image), None
+        return stage_shop_logo(conn, shop_id, image), ["Yes", "No"]
     offer = try_reminder_offer(conn, shop_id, text)
     if offer is not None:
         return offer, None
@@ -878,17 +1041,21 @@ def handle_voice(conn: sqlite3.Connection, shop_id: str, audio: bytes,
     return transcript, _t("ag_heard", shown=shown, reply=reply), buttons
 
 
-_PHOTO_EMOJI = {"expiry": "📸", "book_page": "📒", "receipt": "🧾"}
+_PHOTO_EMOJI = {"expiry": "📸", "book_page": "📒", "receipt": "🧾",
+                "order": "🧾"}
 
 
 def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
                  caption: str = ""):
-    """Classify a photo (logo, expiry, book page, receipt) and propose saving it.
+    """Route a photo by THIS message's intent (caption + vision), then propose.
 
-    Returns (doc_or_None, reply, buttons). Nothing is saved until Yes.
+    An explicit caption ("logo", an order, a reminder) always beats a stale
+    logo request or a blind vision guess. Returns (doc_or_None, reply,
+    buttons). Nothing is saved until Yes.
     """
     shop_id, staff = _enter(conn, shop_id)
     ensure_shop(conn, shop_id)
+    caption = (caption or "").strip()
     _set_message_lang(conn, shop_id, caption)
     LAST_PHOTO[shop_id] = (image or b"", datetime.now(timezone.utc))
     if staff is None and setup_step(conn, shop_id):
@@ -905,25 +1072,75 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
         save_turn(conn, shop_id, "user", "[photo]")
         save_turn(conn, shop_id, "assistant", reply)
         return None, reply, None
-    if logo_pending(conn, shop_id) \
-            or (caption or "").strip().lower() == "logo":
-        reply = save_shop_logo(conn, shop_id, image or b"")
+    if caption.lower() == "logo" or _normalize(caption) in NEW_LOGO_WORDS:
+        reply = stage_shop_logo(conn, shop_id, image or b"")
         save_turn(conn, shop_id, "user", "[logo photo]")
         save_turn(conn, shop_id, "assistant", reply)
-        return None, reply, None
+        buttons = ["Yes", "No"] \
+            if get_staged_logo(conn, shop_id) is not None else None
+        if buttons:
+            _store_options(conn, shop_id, buttons)
+        return None, reply, buttons
     digest = hashlib.sha256(image or b"").hexdigest()
     seen = photo_seen(conn, shop_id, digest)
     if seen is not None:
         day = (seen["created_at"] or "")[:10]
         emoji = _PHOTO_EMOJI.get(seen["kind"], "📸")
         return None, _t("ag_photo_dup", emoji=emoji, day=day), None
+    _store_evidence(digest, image)
     before = get_pending(conn, shop_id)
     before_id = before["id"] if before else None
+    if not caption and logo_pending(conn, shop_id):
+        reply = stage_shop_logo(conn, shop_id, image or b"")
+        save_turn(conn, shop_id, "user", "[logo photo]")
+        save_turn(conn, shop_id, "assistant", reply)
+        buttons = ["Yes", "No"] \
+            if get_staged_logo(conn, shop_id) is not None else None
+        if buttons:
+            _store_options(conn, shop_id, buttons)
+        return None, reply, buttons
     try:
         doc = read_shop_photo(image, shop_id)
     except VisionError as e:
-        return None, str(e), None
+        doc, vision_error = None, str(e)
     save_turn(conn, shop_id, "user", "[photo]")
+    plan, question = build_plan(conn, shop_id, caption, doc, digest,
+                                message_key=digest, from_photo=True)
+    if plan is not None:
+        existing = get_plan_by_key(conn, shop_id, plan["message_key"])
+        if existing is not None and existing["status"] == "confirmed":
+            reply = _t("ord_already")
+        else:
+            had_fresh = logo_pending(conn, shop_id)
+            clear_logo_pending(conn, shop_id)
+            note = (_t("logo_req_dropped") + "\n\n") if had_fresh else ""
+            saved = existing if existing is not None \
+                else save_plan(conn, shop_id, plan)
+            reply = note + render_preview(conn, shop_id, saved)
+        save_turn(conn, shop_id, "assistant", reply)
+        _store_options(conn, shop_id, ["Yes", "No"])
+        return doc, reply, ["Yes", "No"]
+    if question is not None:
+        if logo_pending(conn, shop_id):
+            question = _t("ord_logo_or_task")
+        save_turn(conn, shop_id, "assistant", question)
+        return doc, question, None
+    if logo_pending(conn, shop_id):
+        reply = stage_shop_logo(conn, shop_id, image or b"")
+        save_turn(conn, shop_id, "user", "[logo photo]")
+        save_turn(conn, shop_id, "assistant", reply)
+        buttons = ["Yes", "No"] \
+            if get_staged_logo(conn, shop_id) is not None else None
+        if buttons:
+            _store_options(conn, shop_id, buttons)
+        return None, reply, buttons
+    if doc is None:
+        return None, vision_error, None
+    cap = _caption_action(conn, shop_id, caption) if caption else None
+    cap_after = get_pending(conn, shop_id)
+    cap_after_id = cap_after["id"] if cap_after is not None else None
+    cap_made_pending = cap is not None and cap_after is not None \
+        and cap_after_id != before_id
     kind = doc.get("doc_type", "other")
     if kind == "expiry":
         reply = check_expiry_photo(conn, shop_id, doc.get("expiry", {}).get("items", []),
@@ -933,12 +1150,24 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
     elif kind == "receipt":
         reply = propose_receipt(conn, shop_id, doc.get("receipt", {}), photo_hash=digest)
     else:
+        if cap is not None:
+            cap_text, cap_buttons = cap
+            save_turn(conn, shop_id, "assistant", cap_text)
+            if cap_buttons:
+                _store_options(conn, shop_id, cap_buttons)
+            return doc, cap_text, cap_buttons
         reply = _t("ag_photo_unknown")
         save_turn(conn, shop_id, "assistant", reply)
         return doc, reply, None
-    save_turn(conn, shop_id, "assistant", reply)
     after = get_pending(conn, shop_id)
+    vision_proposed = after is not None and (
+        after["id"] != cap_after_id)
+    if cap is not None and not (cap_made_pending and vision_proposed):
+        reply = reply + "\n\n" + cap[0]
+    save_turn(conn, shop_id, "assistant", reply)
     buttons = ["Yes", "No"] if after is not None and after["id"] != before_id else None
+    if buttons:
+        _store_options(conn, shop_id, buttons)
     return doc, reply, buttons
 
 
@@ -993,6 +1222,8 @@ def handle_text(conn: sqlite3.Connection, shop_id: str, text: str):
             return message, None
     before = get_pending(conn, shop_id)
     before_id = before["id"] if before else None
+    before_plan = get_plan(conn, shop_id)
+    before_plan_id = before_plan["plan_id"] if before_plan else None
     text = _resolve_numbered(conn, shop_id, text)
     direct = try_deterministic(conn, shop_id, text)
     det_buttons = None
@@ -1022,7 +1253,10 @@ def handle_text(conn: sqlite3.Connection, shop_id: str, text: str):
                     message = res
     message = _maybe_first_offer(conn, shop_id, message)
     after = get_pending(conn, shop_id)
+    after_plan = get_plan(conn, shop_id)
     if after is not None and after["id"] != before_id:
+        buttons = ["Yes", "No"]
+    elif after_plan is not None and after_plan["plan_id"] != before_plan_id:
         buttons = ["Yes", "No"]
     else:
         buttons = det_buttons
@@ -1056,12 +1290,15 @@ def _maybe_first_offer(conn: sqlite3.Connection, shop_id: str, message: str) -> 
 
 
 def try_line_correction(conn: sqlite3.Connection, shop_id: str, text: str) -> str | None:
-    """Rewrite one pending book/receipt line ("line 3 is 4 bread"). None otherwise."""
-    pend = get_pending(conn, shop_id)
-    if pend is None or pend["action_type"] not in ("book_page", "receipt"):
-        return None
+    """Rewrite one pending order/book/receipt line ("line 3 is 4 bread")."""
     m = re.match(r"\s*line\s+(\d+)\s+is\s+(.+)$", text or "", re.IGNORECASE)
     if not m:
+        return None
+    if get_plan(conn, shop_id) is not None:
+        return correct_plan_line(conn, shop_id, int(m.group(1)),
+                                 m.group(2).strip())
+    pend = get_pending(conn, shop_id)
+    if pend is None or pend["action_type"] not in ("book_page", "receipt"):
         return None
     if pend["action_type"] == "receipt":
         return correct_receipt_line(conn, shop_id, int(m.group(1)), m.group(2).strip())

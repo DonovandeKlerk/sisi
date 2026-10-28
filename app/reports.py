@@ -134,6 +134,30 @@ def media_put(token: str, files: dict) -> None:
     log.info("media dict put token=%s slots=%s", token, sorted(files))
 
 
+def evidence_put(digest: str, data: bytes) -> None:
+    """Keep raw photo bytes in the shared Dict so plans keep evidence.
+
+    No-op when local (tests/dev) or when the put fails — evidence is
+    best-effort and must never break the chat. Never raises.
+    """
+    if not digest or not data:
+        return
+    try:
+        handle = _media_dict()
+    except Exception:
+        log.warning("evidence dict unavailable", exc_info=True)
+        return
+    if handle is None:
+        return
+    try:
+        from datetime import datetime, timezone
+        handle.put(f"evidence:{digest}",
+                   {"kind": "evidence", "data": bytes(data),
+                    "created": datetime.now(timezone.utc).isoformat()})
+    except Exception:
+        log.warning("evidence put failed", exc_info=True)
+
+
 def media_get(token: str):
     """Read a Dict media entry. None on miss, when local, or on error."""
     try:

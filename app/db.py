@@ -123,6 +123,17 @@ CREATE TABLE IF NOT EXISTS pending_actions (
   resolved_at  TEXT
 );
 
+CREATE TABLE IF NOT EXISTS task_plans (
+  shop_id    TEXT NOT NULL REFERENCES shops(shop_id),
+  plan_id    TEXT NOT NULL,
+  message_key TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  expires_at TEXT NOT NULL DEFAULT '',
+  status     TEXT NOT NULL DEFAULT 'proposed',
+  plan_json  TEXT NOT NULL DEFAULT '{}',
+  PRIMARY KEY (shop_id, plan_id)
+);
+
 CREATE TABLE IF NOT EXISTS await_price (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   shop_id    TEXT NOT NULL REFERENCES shops(shop_id),
@@ -280,6 +291,7 @@ CREATE INDEX IF NOT EXISTS idx_stock_shop ON stock_moves(shop_id);
 CREATE INDEX IF NOT EXISTS idx_expiry_shop ON expiry_items(shop_id);
 CREATE INDEX IF NOT EXISTS idx_pending_shop ON pending_actions(shop_id);
 CREATE INDEX IF NOT EXISTS idx_await_shop ON await_price(shop_id);
+CREATE INDEX IF NOT EXISTS idx_plans_shop ON task_plans(shop_id, status);
 CREATE INDEX IF NOT EXISTS idx_cash_shop ON cash_moves(shop_id);
 CREATE INDEX IF NOT EXISTS idx_expense_shop ON expenses(shop_id);
 CREATE INDEX IF NOT EXISTS idx_supplier_shop ON supplier_moves(shop_id);

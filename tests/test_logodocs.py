@@ -8,7 +8,7 @@ import pytest
 
 from app import logo as logo_mod
 from app import reports
-from app.agent import handle_photo
+from app.agent import handle_photo, handle_text
 from app.tools import ensure_shop
 
 SHOP = "27710000046"
@@ -73,6 +73,7 @@ def test_save_publishes_logo_dict(conn, monkeypatch):
     _fake_dict_modal(monkeypatch, store)
     ensure_shop(conn, SHOP, "Doc Spaza")
     handle_photo(conn, SHOP, _photo_bytes(), "logo")
+    handle_text(conn, SHOP, "yes")  # staged logos go live on Yes
     assert store[f"logo:{SHOP}"]["tile"][:8] == b"\x89PNG\r\n\x1a\n"
 
 
@@ -82,6 +83,7 @@ def test_brand_materializes_tile_from_dict(conn, monkeypatch):
     _fake_dict_modal(monkeypatch, store)
     ensure_shop(conn, SHOP, "Doc Spaza")
     handle_photo(conn, SHOP, _photo_bytes(), "logo")
+    handle_text(conn, SHOP, "yes")  # staged logos go live on Yes
     tile = Path(reports.shop_brand(conn, SHOP)["logo"])
     orig = Path(reports.shop_brand(conn, SHOP)["logo_orig"])
     want = tile.read_bytes()
@@ -120,6 +122,7 @@ def test_every_renderer_shows_dict_only_logo(conn, tmp_path, monkeypatch):
     _fake_dict_modal(monkeypatch, store)
     ensure_shop(conn, SHOP, "Doc Spaza")
     handle_photo(conn, SHOP, _photo_bytes(), "logo")
+    handle_text(conn, SHOP, "yes")  # staged logos go live on Yes
     brand = reports.shop_brand(conn, SHOP)
     Path(brand["logo"]).unlink()
     Path(brand["logo_orig"]).unlink()

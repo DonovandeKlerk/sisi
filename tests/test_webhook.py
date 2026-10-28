@@ -330,4 +330,4 @@ def test_unsupported_type_gets_graceful_reply(sim_env):
     raw = json.dumps(payload).encode()
     assert client.post("/webhook", content=raw, headers=_signed(raw)).status_code == 200
     out = client.get("/_sim/outbox", params={"shop": SHOP}).json()["messages"]
-    assert len(out) == 1 and "text" in out[0]["body"]
+    assert len(out) == 1 and "can't watch videos" in out[0]["body"]

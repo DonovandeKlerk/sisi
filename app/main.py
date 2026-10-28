@@ -361,6 +361,10 @@ def _handle_message(sender, msg: IncomingMessage) -> None:
                 out.send_text(msg.shop_id, str(e))
                 out.flush()
                 return
+        elif msg.kind == "media:video":
+            reply, buttons = _t("unsupported_video"), None
+        elif msg.kind == "media:document":
+            reply, buttons = _t("unsupported_doc"), None
         elif msg.text is None:
             reply, buttons = _t("unsupported"), None
         else:

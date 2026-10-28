@@ -417,6 +417,10 @@ def render_context(conn: sqlite3.Connection, shop_id: str,
     from app.tools import account_balance, balance_cents, build_order, cash_up
     from app.tools import get_order_draft
     kind = (context or {}).get("kind", "")
+    if kind == "customer_order":
+        from app.orders import render_saved_order
+        return render_saved_order(conn, shop_id, context.get("plan_id", ""),
+                                  context.get("label", "")), []
     if kind == "order":
         text = build_order(conn, shop_id)
         draft = get_order_draft(conn, shop_id)

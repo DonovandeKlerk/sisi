@@ -329,7 +329,8 @@ def tick(conn: sqlite3.Connection, now: datetime | None = None) -> list[dict]:
     hm = now.strftime("%H:%M")
     jobs: list[dict] = []
     shops = conn.execute(
-        "SELECT shop_id, channel FROM shops WHERE channel IN ('meta', 'vonage')"
+        "SELECT shop_id, channel FROM shops"
+        " WHERE channel IN ('meta', 'vonage', 'infobip')"
     ).fetchall()
     for shop in shops:
         shop_id, channel = shop["shop_id"], shop["channel"]

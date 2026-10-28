@@ -61,17 +61,28 @@ def test_tile_never_crops_or_stretches():
     assert tile.getpixel((96, 96))[:3] == (200, 30, 30)
 
 
-def test_logo_caption_upload_saves_tile(conn):
+def test_logo_caption_upload_stages_until_yes(conn):
     ensure_shop(conn, SHOP, "Logo Spaza")
-    _, reply, _ = handle_photo(conn, SHOP, _photo_bytes(), "logo")
-    assert "Logo saved" in reply
-    assert "as-is" in reply
+    _, reply, buttons = handle_photo(conn, SHOP, _photo_bytes(), "logo")
+    assert "New logo?" in reply
+    assert buttons == ["Yes", "No"]
+    assert reports.shop_brand(conn, SHOP)["logo"] == ""  # live logo untouched
+    msg, _ = handle_text(conn, SHOP, "yes")
+    assert "Logo updated" in msg
     brand = reports.shop_brand(conn, SHOP)
     assert brand["logo"].endswith("-tile.png")
     assert brand["logo_orig"].endswith("-orig.png")
     from PIL import Image
     assert Image.open(brand["logo"]).size == (192, 192)
     assert Image.open(brand["logo_orig"]).size == (300, 200)
+
+
+def test_logo_no_keeps_old_logo(conn):
+    ensure_shop(conn, SHOP, "Logo Spaza")
+    handle_photo(conn, SHOP, _photo_bytes(), "logo")
+    msg, _ = handle_text(conn, SHOP, "no")
+    assert "Kept your old logo" in msg
+    assert reports.shop_brand(conn, SHOP)["logo"] == ""
 
 
 def test_new_logo_pending_next_image_is_logo(conn, monkeypatch):
@@ -87,14 +98,18 @@ def test_new_logo_pending_next_image_is_logo(conn, monkeypatch):
     assert msg.startswith("📷")
     assert conn.execute("SELECT value FROM flags WHERE shop_id = ?"
                         " AND key = 'logo-pending'", (SHOP,)).fetchone()
-    _, reply, _ = handle_photo(conn, SHOP, _photo_bytes())  # no caption
-    assert "Logo saved" in reply
-    assert reports.shop_brand(conn, SHOP)["logo"].endswith("-tile.png")
+    _, reply, buttons = handle_photo(conn, SHOP, _photo_bytes())  # no caption
+    assert "New logo?" in reply
+    assert buttons == ["Yes", "No"]
+    assert reports.shop_brand(conn, SHOP)["logo"] == ""  # staged, not live
     assert conn.execute("SELECT value FROM flags WHERE shop_id = ?"
                         " AND key = 'logo-pending'", (SHOP,)).fetchone() is None
     from app.agent import take_media
     items = take_media(SHOP)
     assert len(items) == 1 and items[0]["kind"] == "image"  # header preview
+    msg, _ = handle_text(conn, SHOP, "yes")
+    assert "Logo updated" in msg
+    assert reports.shop_brand(conn, SHOP)["logo"].endswith("-tile.png")
 
 
 @pytest.mark.parametrize("word", ["redo logo", "fix logo", "new logo",
@@ -120,7 +135,9 @@ def test_invalid_pending_image_keeps_pending(conn):
     assert conn.execute("SELECT value FROM flags WHERE shop_id = ?"
                         " AND key = 'logo-pending'", (SHOP,)).fetchone()
     _, reply, _ = handle_photo(conn, SHOP, _photo_bytes())
-    assert "Logo saved" in reply
+    assert "New logo?" in reply
+    msg, _ = handle_text(conn, SHOP, "yes")
+    assert "Logo updated" in msg
 
 
 def test_use_original_now_as_is(conn):
@@ -131,11 +148,11 @@ def test_use_original_now_as_is(conn):
     assert msg.startswith("📷")
 
 
-def test_yes_confirms_fresh_logo(conn):
+def test_yes_applies_staged_logo(conn):
     ensure_shop(conn, SHOP, "Logo Spaza")
     handle_photo(conn, SHOP, _photo_bytes(), "logo")
     msg, _ = handle_text(conn, SHOP, "yes")
-    assert "will head your documents" in msg
+    assert "Logo updated" in msg
     msg, _ = handle_text(conn, SHOP, "yes")
     assert "nothing waiting" in msg
 
@@ -159,6 +176,7 @@ def test_legacy_logo_migrates_to_tile(conn, tmp_path):
 def test_logo_on_every_document(conn, tmp_path):
     ensure_shop(conn, SHOP, "Logo Spaza")
     handle_photo(conn, SHOP, _photo_bytes(), "logo")
+    handle_text(conn, SHOP, "yes")
     brand = reports.shop_brand(conn, SHOP)
     plain = {"name": "Logo Spaza", "address": "", "phone": "", "logo": "",
              "logo_orig": ""}
