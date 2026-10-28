@@ -1095,20 +1095,10 @@ def render_card(d: dict, path: str, brand: dict | None = None) -> str:
     W, H = 1080, 1350
     img = Image.new("RGB", (W, H), _hex(SISI["paper"]))
     dr = ImageDraw.Draw(img)
-    dr.rectangle([0, 0, W, 300], fill=_hex(SISI["primary"]))
-    dr.rectangle([0, 300, W, 316], fill=_hex(SISI["accent"]))
-    f_title = _card_font(64)
+    y = _png_brand_header(img, b, _t("doc_title_month"), d["label"])
     f_big = _card_font(72)
     f_mid = _card_font(44)
     f_small = _card_font(36)
-    _paste_logo(img, b["logo"], (W - 220, 60, 160))
-    dr.text((60, 60), b["name"], font=f_title, fill="white")
-    dr.text((60, 150), f"{_t('doc_title_month')} · {d['label']}",
-            font=f_mid, fill="#FDE68A")
-    contact = " · ".join(p for p in (b["address"], b["phone"]) if p)
-    if contact:
-        dr.text((60, 225), contact[:60], font=f_small, fill="white")
-    y = 380
     margin = f"  ({round(d['gross'] * 100 / d['sales'])}%)" if d["sales"] else ""
     rows = [(_t("doc_sales"), cents_to_rand(d["sales"])),
             (_t("doc_gross_short") + margin, cents_to_rand(d["gross"])),

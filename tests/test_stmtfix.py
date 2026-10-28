@@ -103,6 +103,25 @@ def test_pdf_header_text_stays_in_text_column(tmp_path):
     assert open(pdf, "rb").read().count(b"/Image") >= 1
 
 
+def test_month_card_uses_shared_header(tmp_path, monkeypatch):
+    calls = []
+    real = reports._png_brand_header
+
+    def _spy(img, brand, title, date, height=300):
+        calls.append((title, date))
+        return real(img, brand, title, date, height)
+
+    monkeypatch.setattr(reports, "_png_brand_header", _spy)
+    brand = _long_brand(tmp_path)
+    d = {"shop": brand["name"], "label": "October 2026", "sales": 10000,
+         "gross": 4000, "exp_total": 1000, "net": 3000, "cash": 5000,
+         "petty": 500, "bank": 0, "debt_total": 2000, "insights": ["hi"]}
+    card = reports.render_card(d, str(tmp_path / "m.png"), brand)
+    assert calls  # routed through the shared two-column header
+    from PIL import Image
+    assert Image.open(card).size == (1080, 1350)
+
+
 def test_statement_card_long_address_renders(tmp_path):
     brand = _long_brand(tmp_path)
     data = {"name": "Sipho", "date": "2026-10-28",
