@@ -1,0 +1,44 @@
+# Sisi demo voiceover (~2:52, ~390 words at ~140 wpm)
+# Record to MP3 and save as video/public/voiceover.mp3 (overwrites the silent
+# placeholder). Burned-in captions in src/timing.ts follow this script.
+
+[HOOK 0:00-0:15]
+Under the counter of almost every spaza shop in South Africa, there is a
+school exercise book. The ibhuku. Who owes what, in pencil. Stock counted
+by eye. Expiry dates nobody has time to check.
+
+[MEET SISI 0:15-0:35]
+Meet Sisi. A WhatsApp assistant for spaza owners. No app to install,
+nothing new to learn. She speaks English and isiZulu, by text or voice
+note. And she never makes a mess of your records.
+
+[DEMO 0:35-2:00]
+MaZulu asks: how much does Sipho owe? Sisi checks the credit book.
+Seventy-three rand. Every cent accounted for.
+
+A sale is one message. Stock drops by itself. And when the shelf runs
+low, Sisi says so before the customer does.
+
+No typing needed. A voice note in her own words becomes a neat book
+entry — always confirmed first.
+
+A photo of the fridge, and Sisi reads every date stamp. Expired milk,
+off the shelf, before it can harm anyone.
+
+At seven, one word: cash up. Cash, book sales and payments in,
+totalled in seconds.
+
+And the paperwork: permits, the spaza fund, and a warning that
+applications are free — because scammers charge for what costs nothing.
+
+[HOW IT WORKS 2:00-2:30]
+Behind Sisi: Meta's Muse Spark reads and reasons. Muse Voice Transcribe
+hears every voice note. And vision checks every shelf, with dates in
+strict structured output. Every number is confirmed by the owner — and
+undone with one word. Your records stay yours. Say delete my data, and
+they're gone.
+
+[IMPACT 2:30-2:52]
+One hundred and fifty thousand spaza shops feed South Africa's
+townships. Five percent of GDP. Millions of jobs. Sisi gives each owner
+a sister who never forgets. Built with Meta's models. Meet Sisi.

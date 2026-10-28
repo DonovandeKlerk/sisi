@@ -22,12 +22,6 @@ image = (
     modal.Image.debian_slim()
     .apt_install("ffmpeg", "fonts-dejavu-core")
     .pip_install_from_requirements("requirements.txt")
-    # Bake the rembg isnet model into the image (plain python -c: needs no
-    # app source, so it is safe to run before the code is added).
-    .run_commands(
-        "python -c \"from rembg import new_session;"
-        " new_session('isnet-general-use')\""
-    )
     # Bake the app package into the image (deploy uploads only modal_app.py).
     .add_local_dir("app", remote_path="/root/app",
                    ignore=["__pycache__", "*.pyc", "*.pyo"])
@@ -93,14 +87,6 @@ def send_media(payload: dict) -> dict:
     _use_volume()
     from app.mediasend import send_media_deferred
     return send_media_deferred(**payload)
-
-
-@app.function(timeout=120)
-def polish_logo(shop_id: str) -> str:
-    """Background logo cut-out after setup step 4; result queued for later."""
-    _use_volume()
-    from app.setup import finish_polish
-    return finish_polish(shop_id)
 
 
 @app.function(schedule=modal.Period(minutes=1), timeout=120)

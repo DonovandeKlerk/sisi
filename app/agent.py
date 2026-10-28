@@ -16,7 +16,6 @@ from app.i18n import (CURRENT_LANG, NAMES, STRINGS, detect, normalize_lang,
                       owner_lang, t as _t)
 from app.setup import (
     answer as setup_answer,
-    flush_logo,
     mark_paused,
     needs_setup,
     setup_step,
@@ -64,8 +63,9 @@ from app.tools import (
     reset_shop,
     confirm_logo,
     save_shop_logo,
-    switch_logo,
-    redo_logo,
+    want_new_logo,
+    logo_as_is,
+    logo_pending,
     set_customer_language,
     set_customer_limit,
     set_expiry,
@@ -126,9 +126,11 @@ YES_WORDS = {"yes", "y", "yebo", "yeah", "ja", "ewe", "ok", "okay", "sharp", "sh
 NO_WORDS = {"no", "n", "nope", "cha", "hayi", "nee", "aowa"}
 UNDO_WORDS = {"undo"}
 RESET_WORDS = {"demo reset", "reset demo"}
-REDO_LOGO_WORDS = {"redo logo", "fix logo", "lungisa ilogo",
-                   "phinda wenze ilogo", "maak logo reg", "doen logo oor",
-                   "yenzi ilogo kwakhona"}
+NEW_LOGO_WORDS = {"redo logo", "fix logo", "new logo", "change logo",
+                  "lungisa ilogo", "phinda wenze ilogo", "ilogo entsha",
+                  "shintsha ilogo", "maak logo reg",
+                  "doen logo oor", "nuwe logo", "verander logo",
+                  "yenzi ilogo kwakhona", "tshintsha ilogo"}
 DELETE_WORDS = {"delete my data", "erase my data", "forget me"}
 HELP_WORDS = {"demo help", "help", "what can you do", "commands",
               "hulp", "usizo", "uncedo"}
@@ -321,28 +323,30 @@ def try_multi_statement_request(conn: sqlite3.Connection, shop_id: str,
                                 text: str) -> str | None:
     """Top-N / all-debtors / named-list statement requests. None otherwise."""
     word = _normalize(text or "")
-    if not _has_statement_word(word):
-        return None
     if "this month" in word and "statement" not in word:
         return None  # 'show my receipts this month' is the receipts list
     if re.search(r"\b(paid|payment|khokha|settled?|ibhadalile|betaal|hlawul\w*)\b",
                  word):
         return None  # payment recordings belong to the credit flow
+    has_stmt = _has_statement_word(word)
+    has_debtor = any(d in word for d in _DEBTOR_WORDS)
+    has_all = any(re.search(rf"\b{a}\b", word) for a in _ALL_WORDS)
+    if not has_stmt and not (has_all and has_debtor):
+        return None
     names = [r["name"] for r in conn.execute(
         "SELECT name FROM customers WHERE shop_id = ?", (shop_id,)).fetchall()]
     hits = _customers_in_text(word, names)
-    if len(hits) >= 2:
+    if has_stmt and len(hits) >= 2:
         return statements_named(conn, shop_id, hits)
     num = re.search(r"\d+", word)
-    if num and any(d in word for d in _DEBTOR_WORDS):
+    if has_stmt and num and has_debtor:
         return statements_top_n(conn, shop_id, int(num.group()))
-    if (any(re.search(rf"\b{a}\b", word) for a in _ALL_WORDS)
-            and (not hits or any(d in word for d in _DEBTOR_WORDS)
-                 or any(o in word for o in _OWE_WORDS))
-            and (any(c in word for c in _CUST_STMT_WORDS)
-                 or re.search(r"\bstate\b", word) is not None
-                 or any(d in word for d in _DEBTOR_WORDS)
-                 or any(o in word for o in _OWE_WORDS))):
+    receipt_only = (has_stmt and not has_debtor
+                    and not any(o in word for o in _OWE_WORDS)
+                    and not any(c in word for c in _CUST_STMT_WORDS)
+                    and re.search(r"\bstate\b", word) is None)
+    if has_all and (has_debtor or (has_stmt and not hits)) \
+            and not receipt_only:
         return statements_for_all(conn, shop_id)
     return None
 
@@ -475,11 +479,11 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
     if word == "send it" or word.startswith("send it "):
         return send_order(conn, shop_id, word[7:].strip() or None), None
     if word == "use original logo":
-        return switch_logo(conn, shop_id, "original"), None
+        return logo_as_is(conn, shop_id), None
     if word == "remove logo background":
-        return switch_logo(conn, shop_id, "cutout"), None
-    if word in REDO_LOGO_WORDS:
-        return redo_logo(conn, shop_id), None
+        return want_new_logo(conn, shop_id), None
+    if word in NEW_LOGO_WORDS:
+        return want_new_logo(conn, shop_id), None
     if word.startswith("remove "):
         if get_order_draft(conn, shop_id) is None:
             return _t("order_no_draft"), None
@@ -714,7 +718,8 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
         save_turn(conn, shop_id, "user", "[photo]")
         save_turn(conn, shop_id, "assistant", reply)
         return None, reply, None
-    if (caption or "").strip().lower() == "logo":
+    if logo_pending(conn, shop_id) \
+            or (caption or "").strip().lower() == "logo":
         reply = save_shop_logo(conn, shop_id, image or b"")
         save_turn(conn, shop_id, "user", "[logo photo]")
         save_turn(conn, shop_id, "assistant", reply)
@@ -818,9 +823,6 @@ def handle_text(conn: sqlite3.Connection, shop_id: str, text: str):
             else:
                 message = route_to_llm(conn, shop_id, text)  # saves turns itself
     message = _maybe_first_offer(conn, shop_id, message)
-    logo_note = flush_logo(conn, shop_id)
-    if logo_note:
-        message = f"{message}\n\n{logo_note}"
     after = get_pending(conn, shop_id)
     buttons = ["Yes", "No"] if after is not None and after["id"] != before_id else None
     return message, buttons

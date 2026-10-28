@@ -2839,43 +2839,27 @@ def save_shop_logo(conn: sqlite3.Connection, shop_id: str, image: bytes) -> str:
         return blocked
     ensure_shop(conn, shop_id)
     try:
-        done = _logo.process_upload(image or b"")
+        tile = _logo.render_tile(image or b"")
     except Exception:
         return _t("logo_not_photo")
-    if done["original"] is None:
-        return _t("logo_not_photo")
-    _logo.log_polish(shop_id, done)
     _reports.ensure_dirs()
     safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
     orig_path = str(_reports.LOGOS_DIR / f"{safe}-orig.png")
-    cut_path = str(_reports.LOGOS_DIR / f"{safe}-cutout.png")
+    tile_path = str(_reports.LOGOS_DIR / f"{safe}-tile.png")
     with open(orig_path, "wb") as f:
-        f.write(done["original"])
-    if done["used_cutout"]:
-        with open(cut_path, "wb") as f:
-            f.write(done["cutout"])
-        display = cut_path
-        note = _t("logo_cut_note")
-    else:
-        badge_path = str(_reports.LOGOS_DIR / f"{safe}-badge.png")
-        with open(badge_path, "wb") as f:
-            f.write(done["badge"])
-        display = badge_path
-        note = _t("logo_badge_note")
+        f.write(image or b"")
+    with open(tile_path, "wb") as f:
+        f.write(tile)
     conn.execute("UPDATE shops SET logo_path = ?, logo_orig_path = ? WHERE shop_id = ?",
-                 (display, orig_path, shop_id))
-    conn.execute("INSERT INTO flags (shop_id, key, value) VALUES (?, 'logo-mode', 'cutout')"
-                 " ON CONFLICT (shop_id, key) DO UPDATE SET value = 'cutout'",
-                 (shop_id,))
-    conn.execute("INSERT INTO flags (shop_id, key, value) VALUES (?, 'logo-method', ?)"
-                 " ON CONFLICT (shop_id, key) DO UPDATE SET value = excluded.value",
-                 (shop_id, done.get("method", "badge")))
+                 (tile_path, orig_path, shop_id))
     conn.execute("INSERT INTO flags (shop_id, key, value) VALUES (?, 'logo-review', '1')"
                  " ON CONFLICT (shop_id, key) DO UPDATE SET value = '1'",
                  (shop_id,))
+    conn.execute("DELETE FROM flags WHERE shop_id = ? AND key = 'logo-pending'",
+                 (shop_id,))
     conn.commit()
     brand = _reports.shop_brand(conn, shop_id)
-    out = _t("logo_saved", note=note)
+    out = _t("logo_saved", note=_t("logo_tile_note"))
     base = _os.environ.get("SISI_PUBLIC_URL", "").rstrip("/")
     if base:
         card = str(_reports.REPORTS_DIR / f"{safe}-profile.png")
@@ -2888,107 +2872,33 @@ def save_shop_logo(conn: sqlite3.Connection, shop_id: str, image: bytes) -> str:
     return out
 
 
-def switch_logo(conn: sqlite3.Connection, shop_id: str, mode: str) -> str:
-    """Switch the header logo between the cut-out and the original upload."""
-    import os as _os
+def logo_pending(conn: sqlite3.Connection, shop_id: str) -> bool:
+    """True when the owner asked for a new logo and the photo is still coming."""
+    row = conn.execute("SELECT value FROM flags WHERE shop_id = ? AND key = 'logo-pending'",
+                       (shop_id,)).fetchone()
+    return row is not None
 
-    from app import reports as _reports
 
-    from app.agent import queue_media as _queue
+def want_new_logo(conn: sqlite3.Connection, shop_id: str) -> str:
+    """'redo/new/change logo': the NEXT image becomes the logo."""
     blocked = _staff_blocked()
     if blocked:
         return blocked
     ensure_shop(conn, shop_id)
-    brand = _reports.shop_brand(conn, shop_id)
-    if not brand["logo"] and not brand["logo_orig"]:
-        return _t("logo_none")
-    if mode == "original" and not brand["logo_orig"]:
-        return _t("logo_one_version")
-    conn.execute("INSERT INTO flags (shop_id, key, value) VALUES (?, 'logo-mode', ?)"
-                 " ON CONFLICT (shop_id, key) DO UPDATE SET value = excluded.value",
-                 (shop_id, mode))
-    conn.execute("DELETE FROM flags WHERE shop_id = ? AND key = 'logo-review'",
+    conn.execute("INSERT INTO flags (shop_id, key, value) VALUES (?, 'logo-pending', '1')"
+                 " ON CONFLICT (shop_id, key) DO UPDATE SET value = '1'",
                  (shop_id,))
     conn.commit()
-    brand = _reports.shop_brand(conn, shop_id)
-    what = _t("logo_what_orig") if mode == "original" else _t("logo_what_cut")
-    _reports.ensure_dirs()
-    out = _t("logo_using", what=what)
-    base = _os.environ.get("SISI_PUBLIC_URL", "").rstrip("/")
-    if base:
-        safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
-        card = str(_reports.REPORTS_DIR / f"{safe}-profile.png")
-        with _doc_lang(_owner_lang(conn, shop_id)):
-            _reports.render_shop_card(brand, card)
-        token = _reports.store_card(conn, shop_id, "profile", card)
-        _queue(shop_id, [{"kind": "image", "url": f"{base}/media/{token}?f=png",
-                          "caption": _t("logo_cap"), "filename": ""}])
-        out += _t("logo_preview_below")
-    return out
+    return _t("logo_send_prompt")
 
 
-def redo_logo(conn: sqlite3.Connection, shop_id: str) -> str:
-    """'redo logo' / 'fix logo': reprocess from the saved original + preview."""
-    import concurrent.futures
-    import os as _os
-
-    from app import logo as _logo
-    from app import reports as _reports
-
-    from app.agent import queue_media as _queue
+def logo_as_is(conn: sqlite3.Connection, shop_id: str) -> str:
+    """Logos show as-is now; point the owner at the replacement command."""
     blocked = _staff_blocked()
     if blocked:
         return blocked
     ensure_shop(conn, shop_id)
-    brand = _reports.shop_brand(conn, shop_id)
-    if not brand["logo_orig"]:
-        return _t("logo_redo_none")
-    try:
-        with open(brand["logo_orig"], "rb") as f:
-            raw = f.read()
-    except OSError:
-        return _t("logo_redo_failed")
-    from app.setup import POLISH_TIMEOUT_S
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        try:
-            done = pool.submit(_logo.process_upload, raw).result(
-                timeout=POLISH_TIMEOUT_S)
-        except Exception:
-            done = None
-    if not done or done["original"] is None:
-        return _t("logo_redo_failed")
-    _logo.log_polish(shop_id, done)
-    _reports.ensure_dirs()
-    safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
-    if done["used_cutout"]:
-        display = str(_reports.LOGOS_DIR / f"{safe}-cutout.png")
-        with open(display, "wb") as f:
-            f.write(done["cutout"])
-        note = _t("logo_cut_note")
-    else:
-        display = str(_reports.LOGOS_DIR / f"{safe}-badge.png")
-        with open(display, "wb") as f:
-            f.write(done["badge"])
-        note = _t("logo_badge_note")
-    conn.execute("UPDATE shops SET logo_path = ? WHERE shop_id = ?",
-                 (display, shop_id))
-    conn.execute("INSERT INTO flags (shop_id, key, value) VALUES (?, 'logo-mode', 'cutout')"
-                 " ON CONFLICT (shop_id, key) DO UPDATE SET value = 'cutout'",
-                 (shop_id,))
-    conn.execute("INSERT INTO flags (shop_id, key, value) VALUES (?, 'logo-method', ?)"
-                 " ON CONFLICT (shop_id, key) DO UPDATE SET value = excluded.value",
-                 (shop_id, done.get("method", "badge")))
-    conn.commit()
-    out = _t("logo_redo_done", note=note)
-    base = _os.environ.get("SISI_PUBLIC_URL", "").rstrip("/")
-    if base:
-        card = str(_reports.REPORTS_DIR / f"{safe}-logofix.png")
-        with _doc_lang(_owner_lang(conn, shop_id)):
-            _reports.render_logo_compare(brand["logo_orig"], display, card)
-        token = _reports.store_card(conn, shop_id, "logofix", card)
-        _queue(shop_id, [{"kind": "image", "url": f"{base}/media/{token}?f=png",
-                          "caption": _t("logo_cap"), "filename": ""}])
-    return out
+    return _t("logo_as_is")
 
 
 def confirm_logo(conn: sqlite3.Connection, shop_id: str) -> str | None:

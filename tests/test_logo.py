@@ -1,4 +1,4 @@
-"""Logo background removal, fallback badge, switching, doc headers."""
+"""Logos show as-is in a header tile; replacement via pending state."""
 
 import io
 
@@ -25,23 +25,6 @@ def _photo_bytes(size=(300, 200), color=(20, 80, 40)):
     return buf.getvalue()
 
 
-def _cutout_bytes(square=140, size=200, hole=40):
-    from PIL import Image
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    px = img.load()
-    off = (size - square) // 2
-    hoff = (size - hole) // 2
-    for x in range(off, off + square):
-        for y in range(off, off + square):
-            px[x, y] = (20, 80, 40, 255)
-    for x in range(hoff, hoff + hole):
-        for y in range(hoff, hoff + hole):
-            px[x, y] = (0, 0, 0, 0)
-    buf = io.BytesIO()
-    img.save(buf, "PNG")
-    return buf.getvalue()
-
-
 @pytest.fixture(autouse=True)
 def _no_setup(conn):
     from app.setup import skip_setup
@@ -57,76 +40,125 @@ def _dirs(tmp_path, monkeypatch):
     LAST_PHOTO.clear()
 
 
-def _upload(conn, monkeypatch, cutout):
-    monkeypatch.setattr(logo_mod, "remove_bg", lambda b: cutout)
+def test_tile_renders_rounded_with_border():
+    from PIL import Image
+    tile = Image.open(io.BytesIO(logo_mod.render_tile(_photo_bytes())))
+    assert tile.size == (192, 192)
+    assert tile.mode == "RGBA"
+    assert tile.getpixel((0, 0))[3] == 0  # rounded corners transparent
+    assert tile.getpixel((191, 191))[3] == 0
+    assert tile.getpixel((96, 0))[:3] == (214, 211, 209)  # 1px border
+    assert tile.getpixel((96, 96))[:3] == (20, 80, 40)  # art kept as-is
+
+
+def test_tile_never_crops_or_stretches():
+    from PIL import Image
+    wide = Image.new("RGB", (400, 100), (200, 30, 30))
+    buf = io.BytesIO()
+    wide.save(buf, "PNG")
+    tile = Image.open(io.BytesIO(logo_mod.render_tile(buf.getvalue())))
+    assert tile.getpixel((4, 96))[:3] == (255, 255, 255)  # padded, not cropped
+    assert tile.getpixel((96, 96))[:3] == (200, 30, 30)
+
+
+def test_logo_caption_upload_saves_tile(conn):
     ensure_shop(conn, SHOP, "Logo Spaza")
     _, reply, _ = handle_photo(conn, SHOP, _photo_bytes(), "logo")
-    return reply
-
-
-def test_cutout_saved_with_transparency(conn, monkeypatch):
-    from PIL import Image
-    reply = _upload(conn, monkeypatch, _cutout_bytes())
-    assert "removed the background" in reply
+    assert "Logo saved" in reply
+    assert "as-is" in reply
     brand = reports.shop_brand(conn, SHOP)
-    assert brand["logo"].endswith("-cutout.png")
+    assert brand["logo"].endswith("-tile.png")
     assert brand["logo_orig"].endswith("-orig.png")
-    cut = Image.open(brand["logo"])
-    assert cut.mode == "RGBA"
-    assert cut.size == (140, 140)  # trimmed to content
-    orig = Image.open(brand["logo_orig"])
-    assert orig.size == (300, 200)
-
-
-def test_cutout_keeps_real_transparency(conn, monkeypatch):
     from PIL import Image
-    _upload(conn, monkeypatch, _cutout_bytes())
-    cut = Image.open(reports.shop_brand(conn, SHOP)["logo"])
-    lo, hi = cut.getchannel("A").getextrema()
-    assert (lo, hi) == (0, 255)
+    assert Image.open(brand["logo"]).size == (192, 192)
+    assert Image.open(brand["logo_orig"]).size == (300, 200)
 
 
-def test_fallback_badge_when_cutout_loses_too_much(conn, monkeypatch):
-    from PIL import Image
-    reply = _upload(conn, monkeypatch, _cutout_bytes(square=50))
-    assert "white badge" in reply
-    brand = reports.shop_brand(conn, SHOP)
-    assert brand["logo"].endswith("-badge.png")
-    badge = Image.open(brand["logo"])
-    assert badge.size == (512, 512)
-    assert badge.convert("RGB").getpixel((256, 40)) == (255, 255, 255)
-    assert badge.getpixel((5, 5))[3] == 0  # rounded corners stay transparent
+def test_new_logo_pending_next_image_is_logo(conn, monkeypatch):
+    import app.agent as agent
+    monkeypatch.setenv("SISI_PUBLIC_URL", "https://x.example")
+
+    def _boom(*a, **k):
+        raise AssertionError("vision must not read a pending logo")
+
+    monkeypatch.setattr(agent, "read_shop_photo", _boom)
+    ensure_shop(conn, SHOP, "Logo Spaza")
+    msg, _ = handle_text(conn, SHOP, "new logo")
+    assert msg.startswith("📷")
+    assert conn.execute("SELECT value FROM flags WHERE shop_id = ?"
+                        " AND key = 'logo-pending'", (SHOP,)).fetchone()
+    _, reply, _ = handle_photo(conn, SHOP, _photo_bytes())  # no caption
+    assert "Logo saved" in reply
+    assert reports.shop_brand(conn, SHOP)["logo"].endswith("-tile.png")
+    assert conn.execute("SELECT value FROM flags WHERE shop_id = ?"
+                        " AND key = 'logo-pending'", (SHOP,)).fetchone() is None
+    from app.agent import take_media
+    items = take_media(SHOP)
+    assert len(items) == 1 and items[0]["kind"] == "image"  # header preview
 
 
-def test_fallback_when_rembg_missing(conn, monkeypatch):
-    monkeypatch.setattr(logo_mod, "remove_bg", lambda b: None)
+@pytest.mark.parametrize("word", ["redo logo", "fix logo", "new logo",
+                                  "change logo", "lungisa ilogo",
+                                  "phinda wenze ilogo", "ilogo entsha",
+                                  "shintsha ilogo", "maak logo reg",
+                                  "doen logo oor", "nuwe logo",
+                                  "verander logo", "yenzi ilogo kwakhona",
+                                  "tshintsha ilogo"])
+def test_pending_words_all_languages(conn, word):
     ensure_shop(conn, SHOP)
-    _, reply, _ = handle_photo(conn, SHOP, _photo_bytes(), "logo")
-    assert "white badge" in reply
+    msg, _ = handle_text(conn, SHOP, word)
+    assert msg.startswith("📷")
+    assert conn.execute("SELECT value FROM flags WHERE shop_id = ?"
+                        " AND key = 'logo-pending'", (SHOP,)).fetchone()
 
 
-def test_switch_between_original_and_cutout(conn, monkeypatch):
-    _upload(conn, monkeypatch, _cutout_bytes())
-    brand = reports.shop_brand(conn, SHOP)
-    assert brand["logo"].endswith("-cutout.png")
+def test_invalid_pending_image_keeps_pending(conn):
+    ensure_shop(conn, SHOP)
+    handle_text(conn, SHOP, "change logo")
+    _, reply, _ = handle_photo(conn, SHOP, b"junk-bytes")
+    assert "not a photo" in reply
+    assert conn.execute("SELECT value FROM flags WHERE shop_id = ?"
+                        " AND key = 'logo-pending'", (SHOP,)).fetchone()
+    _, reply, _ = handle_photo(conn, SHOP, _photo_bytes())
+    assert "Logo saved" in reply
+
+
+def test_use_original_now_as_is(conn):
+    ensure_shop(conn, SHOP)
     msg, _ = handle_text(conn, SHOP, "use original logo")
-    assert "original" in msg
-    assert reports.shop_brand(conn, SHOP)["logo"].endswith("-orig.png")
+    assert "already shows as-is" in msg
     msg, _ = handle_text(conn, SHOP, "remove logo background")
-    assert "background-free" in msg
-    assert reports.shop_brand(conn, SHOP)["logo"].endswith("-cutout.png")
+    assert msg.startswith("📷")
 
 
-def test_yes_confirms_fresh_logo(conn, monkeypatch):
-    _upload(conn, monkeypatch, _cutout_bytes())
+def test_yes_confirms_fresh_logo(conn):
+    ensure_shop(conn, SHOP, "Logo Spaza")
+    handle_photo(conn, SHOP, _photo_bytes(), "logo")
     msg, _ = handle_text(conn, SHOP, "yes")
     assert "will head your documents" in msg
     msg, _ = handle_text(conn, SHOP, "yes")
     assert "nothing waiting" in msg
 
 
-def test_logo_on_every_document(conn, monkeypatch, tmp_path):
-    _upload(conn, monkeypatch, _cutout_bytes())
+def test_legacy_logo_migrates_to_tile(conn, tmp_path):
+    from pathlib import Path
+    ensure_shop(conn, SHOP, "Old Spaza")
+    logos = Path(reports.LOGOS_DIR)
+    logos.mkdir(parents=True, exist_ok=True)
+    old = logos / f"{SHOP}-badge.png"
+    old.write_bytes(_photo_bytes())
+    conn.execute("UPDATE shops SET logo_path = ?, logo_orig_path = ?"
+                 " WHERE shop_id = ?", (str(old), str(old), SHOP))
+    conn.commit()
+    brand = reports.shop_brand(conn, SHOP)
+    assert brand["logo"].endswith("-tile.png")
+    assert Path(brand["logo"]).exists()
+    assert reports.shop_brand(conn, SHOP)["logo"] == brand["logo"]
+
+
+def test_logo_on_every_document(conn, tmp_path):
+    ensure_shop(conn, SHOP, "Logo Spaza")
+    handle_photo(conn, SHOP, _photo_bytes(), "logo")
     brand = reports.shop_brand(conn, SHOP)
     plain = {"name": "Logo Spaza", "address": "", "phone": "", "logo": "",
              "logo_orig": ""}

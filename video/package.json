@@ -1,0 +1,20 @@
+{
+  "name": "sisi-video",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "render": "remotion render SisiDemo out/sisi_demo_draft.mp4 --codec h264 --crf 20",
+    "preview": "remotion studio"
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.539",
+    "remotion": "4.0.539",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "19.0.0",
+    "@types/react-dom": "19.0.0",
+    "typescript": "5.6.3"
+  }
+}

@@ -356,12 +356,6 @@ def tick(conn: sqlite3.Connection, now: datetime | None = None) -> list[dict]:
             jobs.append({"shop": shop_id, "channel": channel,
                          "text": daily_plan(conn, shop_id, day), "media": [],
                          "key": f"plan-{day}"})
-        from app import setup as _setup
-        logo = _setup.logo_result(conn, shop_id)
-        if logo:
-            jobs.append({"shop": shop_id, "channel": channel,
-                         "text": logo[0], "media": logo[1],
-                         "key": "logo-ready"})
         if (not nudge_off and now.weekday() == 6 and hm >= nudge_at
                 and _flag(conn, shop_id, f"snap-{day}") is None):
             _set_flag(conn, shop_id, f"snap-{day}")

@@ -4,7 +4,6 @@ import io
 
 import pytest
 
-from app import logo as logo_mod
 from app import reports
 from app.agent import LAST_PHOTO, MEDIA_OUTBOX, handle_photo, handle_text
 from app.tools import delete_my_data, ensure_shop, set_shop_address, set_shop_name, set_shop_phone
@@ -36,7 +35,6 @@ def _dirs(tmp_path, monkeypatch):
     monkeypatch.setattr(reports, "REPORTS_DIR", tmp_path / "reports")
     monkeypatch.setattr(reports, "LOGOS_DIR", tmp_path / "logos")
     monkeypatch.delenv("SISI_PUBLIC_URL", raising=False)
-    monkeypatch.setattr(logo_mod, "remove_bg", lambda b: None)
     MEDIA_OUTBOX.clear()
     LAST_PHOTO.clear()
 
@@ -65,10 +63,12 @@ def test_logo_caption_upload(conn):
     ensure_shop(conn, SHOP, "Corner Spaza")
     _, reply, buttons = handle_photo(conn, SHOP, _logo_bytes(), "logo")
     assert "Logo saved" in reply and buttons is None
+    assert "as-is" in reply
     brand = reports.shop_brand(conn, SHOP)
-    assert brand["logo"].endswith(".png")
+    assert brand["logo"].endswith("-tile.png")
+    assert brand["logo_orig"].endswith("-orig.png")
     from PIL import Image
-    assert Image.open(brand["logo"]).size == (512, 512)
+    assert Image.open(brand["logo"]).size == (192, 192)
 
 
 def test_logo_reply_to_photo(conn):

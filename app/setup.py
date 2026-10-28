@@ -77,8 +77,7 @@ def needs_setup(conn: sqlite3.Connection, shop_id: str) -> bool:
 def start_setup(conn: sqlite3.Connection, shop_id: str, reseed: bool = False) -> str:
     _set_flag(conn, shop_id, "setup-step", "1")
     conn.execute("DELETE FROM flags WHERE shop_id = ? AND key IN"
-                 " ('setup-done', 'setup-return', 'setup-reseed', 'setup-paused',"
-                 " 'logo-polish', 'logo-polish-started', 'logo-notified')",
+                 " ('setup-done', 'setup-return', 'setup-reseed', 'setup-paused')",
                  (shop_id,))
     if reseed:
         _set_flag(conn, shop_id, "setup-reseed", "1")
@@ -270,197 +269,24 @@ def _advance(conn: sqlite3.Connection, shop_id: str, step: int, ack: str | None)
     return f"{ack}\n\n{out}" if ack else out
 
 
-POLISH_TIMEOUT_S = 60
-
-LOGO_READY = "🖼️ Your logo is ready"
-LOGO_FAILED = ("⚠️ I couldn't clean up your logo. Send a clearer photo"
-               " with the caption logo any time.")
-
-
-def _logo_ready() -> str:
-    from app.i18n import t
-    return t("logo_ready")
-
-
-def _logo_failed() -> str:
-    from app.i18n import t
-    return t("logo_failed")
-
-
-def _sniff_ext(image: bytes) -> str:
-    img = image or b""
-    if img[:2] == b"\xff\xd8":
-        return "jpg"
-    if img[:8] == b"\x89PNG\r\n\x1a\n":
-        return "png"
-    if img[:4] == b"RIFF" and img[8:12] == b"WEBP":
-        return "webp"
-    return "img"
-
-
 def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes) -> str | None:
-    """Step-4 logo upload: save the original, polish in background, advance.
+    """Step-4 logo upload: save the original as-is, preview it, advance.
 
-    Never blocks: any bytes are accepted, heavy work runs in a worker.
+    Never blocks: invalid bytes skip the step and the flow continues.
     None when setup doesn't want a photo.
     """
-    from app import reports as _reports
+    from app.tools import save_shop_logo
     if setup_step(conn, shop_id) != 4:
         return None
+    from app.i18n import t
     try:
-        _reports.ensure_dirs()
-        safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
-        orig = str(_reports.LOGOS_DIR / f"{safe}-orig.{_sniff_ext(image)}")
-        with open(orig, "wb") as f:
-            f.write(image or b"")
-        conn.execute("UPDATE shops SET logo_orig_path = ? WHERE shop_id = ?",
-                     (orig, shop_id))
-        conn.commit()
-        request_polish(conn, shop_id)
+        saved = save_shop_logo(conn, shop_id, image or b"")
     except Exception:
         log.warning("setup logo save failed", exc_info=True)
-        from app.i18n import t
+        saved = ""
+    if not saved or saved == t("logo_not_photo"):
         return t("setup_logo_skipped", next=_advance(conn, shop_id, 4, None))
-    from app.i18n import t
-    ack = t("logo_received")
-    return f"{ack}\n\n{_advance(conn, shop_id, 4, None)}"
-
-
-def request_polish(conn: sqlite3.Connection,
-                   shop_id: str) -> object | None:
-    """Flag a logo for background polishing; spawn a worker, thread fallback.
-
-    Returns the fallback thread when one was started (tests join it), else
-    None.
-    """
-    import threading
-    import time
-    _set_flag(conn, shop_id, "logo-polish", "pending")
-    _set_flag(conn, shop_id, "logo-polish-started", str(int(time.time())))
-    spawned = False
-    if os.environ.get("SISI_SPAWN") == "1":
-        try:
-            import modal
-            modal.Function.from_name("sisi", "polish_logo").spawn(shop_id)
-            spawned = True
-        except Exception:
-            log.warning("polish spawn failed; using thread", exc_info=True)
-    if not spawned:
-        thread = threading.Thread(target=finish_polish, args=(shop_id,),
-                                  daemon=True)
-        thread.start()
-        return thread
-    return None
-
-
-def needs_repolish(conn: sqlite3.Connection, shop_id: str) -> bool:
-    """True when a shop has an original logo that predates good polishing.
-
-    Shops polished by the current code carry a logo-method flag; anything
-    with a saved original but no flag is reprocessed once from the
-    original. Never triggers while a polish is pending, and never
-    auto-retries a failed polish (the owner can say "redo logo").
-    """
-    import os as _os
-
-    from app.tools import ensure_shop
-    orig = ensure_shop(conn, shop_id)["logo_orig_path"] or ""
-    if not orig or not _os.path.exists(orig):
-        return False
-    if _flag(conn, shop_id, "logo-method"):
-        return False
-    return polish_state(conn, shop_id) not in ("pending", "failed")
-
-
-def repolish_scan(conn: sqlite3.Connection) -> dict:
-    """Re-polish every stale shop logo in the background. Returns {shop: thread}."""
-    out = {}
-    rows = conn.execute("SELECT shop_id FROM shops WHERE logo_orig_path <> ''"
-                        ).fetchall()
-    for row in rows:
-        try:
-            if needs_repolish(conn, row["shop_id"]):
-                out[row["shop_id"]] = request_polish(conn, row["shop_id"])
-        except Exception:
-            log.warning("repolish scan failed for %s", row["shop_id"],
-                        exc_info=True)
-    return out
-
-
-def finish_polish(shop_id: str, timeout_s: int = POLISH_TIMEOUT_S) -> str:
-    """Background worker body: cut out the logo or record failure. Own conn."""
-    import concurrent.futures
-    from app import logo as _logo
-    from app import reports as _reports
-    from app.db import connect, init_db
-    from app.tools import ensure_shop
-    try:
-        conn = connect()
-    except Exception:
-        log.warning("logo polish: no database", exc_info=True)
-        return "failed"
-    try:
-        init_db(conn)
-        ensure_shop(conn, shop_id)
-        orig = ensure_shop(conn, shop_id)["logo_orig_path"] or ""
-        try:
-            raw = open(orig, "rb").read() if orig else b""
-        except OSError:
-            raw = b""
-
-        def _work():
-            return _logo.process_upload(raw)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            try:
-                done = pool.submit(_work).result(timeout=timeout_s)
-            except Exception:
-                done = None
-        if not done or done["original"] is None:
-            raise ValueError("bad image")
-        _logo.log_polish(shop_id, done)
-        _set_flag(conn, shop_id, "logo-method", done.get("method", "badge"))
-        _reports.ensure_dirs()
-        safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
-        if done["used_cutout"]:
-            display = str(_reports.LOGOS_DIR / f"{safe}-cutout.png")
-            with open(display, "wb") as f:
-                f.write(done["cutout"])
-        else:
-            display = str(_reports.LOGOS_DIR / f"{safe}-badge.png")
-            with open(display, "wb") as f:
-                f.write(done["badge"])
-        conn.execute("UPDATE shops SET logo_path = ? WHERE shop_id = ?",
-                     (display, shop_id))
-        if not _flag(conn, shop_id, "logo-mode"):
-            conn.execute("INSERT INTO flags (shop_id, key, value)"
-                         " VALUES (?, 'logo-mode', 'cutout')"
-                         " ON CONFLICT (shop_id, key) DO NOTHING", (shop_id,))
-        outcome = "done"
-    except Exception:
-        log.warning("logo polish failed for %s", shop_id, exc_info=True)
-        outcome = "failed"
-    try:
-        _set_flag(conn, shop_id, "logo-polish", outcome)
-    finally:
-        conn.close()
-    return outcome
-
-
-def polish_state(conn: sqlite3.Connection, shop_id: str) -> str:
-    """done | failed | pending (stale pendings count as failed past timeout)."""
-    import time
-    state = _flag(conn, shop_id, "logo-polish")
-    if state != "pending":
-        return state or "none"
-    try:
-        started = int(_flag(conn, shop_id, "logo-polish-started") or "0")
-    except ValueError:
-        started = 0
-    if started and time.time() - started > POLISH_TIMEOUT_S:
-        _set_flag(conn, shop_id, "logo-polish", "failed")
-        return "failed"
-    return "pending"
+    return f"{saved}\n\n{_advance(conn, shop_id, 4, None)}"
 
 
 def _finish(conn: sqlite3.Connection, shop_id: str) -> str:
@@ -484,9 +310,6 @@ def _finish(conn: sqlite3.Connection, shop_id: str) -> str:
     out = t("setup_done", name=brand["name"])
     if _queue_header_card(conn, shop_id, t("cap_header")):
         out += t("setup_card_below")
-    note = flush_logo(conn, shop_id)
-    if note:
-        out += f"\n\n{note}"
     return out
 
 
@@ -511,42 +334,3 @@ def _queue_header_card(conn: sqlite3.Connection, shop_id: str,
     return True
 
 
-def logo_result(conn: sqlite3.Connection,
-                shop_id: str) -> tuple[str, list[dict]] | None:
-    """Terminal polish outcome, once: (text, media) or None.
-
-    Only after setup finished; marks logo-notified so it never repeats.
-    """
-    if setup_step(conn, shop_id) or not _flag(conn, shop_id, "setup-done"):
-        return None
-    if _flag(conn, shop_id, "logo-notified"):
-        return None
-    state = polish_state(conn, shop_id)
-    if state == "pending":
-        return None
-    _set_flag(conn, shop_id, "logo-notified", "1")
-    conn.execute("DELETE FROM flags WHERE shop_id = ? AND key = 'logo-polish'",
-                 (shop_id,))
-    conn.commit()
-    if state != "done":
-        return (_logo_failed(), []) if state == "failed" else None
-    from app.agent import MEDIA_OUTBOX
-    from app.i18n import t
-    before = len(MEDIA_OUTBOX.get(shop_id, []))
-    if _queue_header_card(conn, shop_id, t("cap_logo")):
-        media = MEDIA_OUTBOX.get(shop_id, [])[before:]
-        del MEDIA_OUTBOX[shop_id][before:]
-        return _logo_ready() + t("logo_ready_below"), media
-    return _logo_ready(), []
-
-
-def flush_logo(conn: sqlite3.Connection, shop_id: str) -> str | None:
-    """Deliver a finished logo polish after setup (queues the card)."""
-    got = logo_result(conn, shop_id)
-    if not got:
-        return None
-    text, media = got
-    if media:
-        from app.agent import queue_media as _queue
-        _queue(shop_id, media)
-    return text

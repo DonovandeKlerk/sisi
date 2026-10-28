@@ -81,6 +81,28 @@ def test_header_text_never_enters_logo_box(tmp_path):
     assert y >= 360
 
 
+def test_pdf_header_text_stays_in_text_column(tmp_path):
+    from reportlab.platypus import Paragraph
+    brand = _long_brand(tmp_path)
+    width = 400.0
+    text_w, logo_w = reports._pdf_header_cols(width, True)
+    assert text_w + reports.PDF_LOGO_GAP + logo_w == width
+    assert reports._pdf_header_cols(width, False) == [width]
+    st = reports._pdf_styles()
+    contact = " · ".join(p for p in (brand["address"], brand["phone"]) if p)
+    p = Paragraph(f"<b>{brand['name']}</b><br/>{contact}"
+                  f"<br/>Statement · Sipho", st["body"])
+    used_w, _ = p.wrap(text_w, 1000)
+    logo_left = text_w + reports.PDF_LOGO_GAP
+    assert used_w <= logo_left  # text bbox cannot reach the logo column
+    data = {"name": "Sipho", "date": "2026-10-28",
+            "items": [{"date": "2026-10-22", "item": "Bread",
+                       "qty": "2", "cents": 4000}],
+            "payments": [], "total": 4000}
+    pdf = reports.render_statement_pdf(data, brand, str(tmp_path / "l.pdf"))
+    assert open(pdf, "rb").read().count(b"/Image") >= 1
+
+
 def test_statement_card_long_address_renders(tmp_path):
     brand = _long_brand(tmp_path)
     data = {"name": "Sipho", "date": "2026-10-28",
@@ -174,3 +196,33 @@ def test_statements_named_unknown_ignored(conn, debtors):
     images, _ = _media_parts(SHOP)
     assert [_caption_name(m["caption"]) for m in images] == [
         "Sipho", "Thandi", "Thandi"]
+
+
+@pytest.mark.parametrize("phrase", ["all creditors",
+                                    "statements for everyone who owes",
+                                    "all statements",
+                                    "statements for 2 creditors",
+                                    "receipts for Sipho and Thandi"])
+def test_every_statement_phrasing_delivers_media(conn, debtors, phrase):
+    handle_text(conn, SHOP, phrase)
+    images, files = _media_parts(SHOP)
+    assert images, phrase  # never text-only
+    assert files, phrase
+    assert all("Forward this to" in m["caption"] or "👆" in m["caption"]
+               for m in images), phrase
+
+
+def test_month_end_report_delivers_media(conn):
+    ensure_shop(conn, SHOP, "Stmt Spaza")
+    handle_text(conn, SHOP, "month-end report")
+    images, files = _media_parts(SHOP)
+    assert len(images) == 1 and len(files) == 1
+    assert all(m["url"].startswith("https://x.example/media/")
+               for m in images + files)
+
+
+def test_old_month_report_delivers_media(conn):
+    ensure_shop(conn, SHOP, "Stmt Spaza")
+    handle_text(conn, SHOP, "report september")
+    images, files = _media_parts(SHOP)
+    assert len(images) == 1 and len(files) == 1

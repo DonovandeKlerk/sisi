@@ -114,22 +114,39 @@ def shop_brand(conn, shop_id: str) -> dict:
     orig = shop["logo_orig_path"] if "logo_orig_path" in keys else ""
     if not orig:
         orig = display  # legacy single-file logos
-    mode = conn.execute("SELECT value FROM flags WHERE shop_id = ? AND key = 'logo-mode'",
-                        (shop_id,)).fetchone()
-    logo = orig if (mode and mode["value"] == "original") else display
-    if logo and not Path(logo).exists():
-        logo = ""
+    if display and not Path(display).exists():
+        display = ""
     if orig and not Path(orig).exists():
         orig = ""
-    try:
-        from app.setup import needs_repolish, request_polish
-        if orig and needs_repolish(conn, shop_id):
-            request_polish(conn, shop_id)
-    except Exception:
-        log.warning("logo repolish trigger failed", exc_info=True)
+    if display and not display.endswith("-tile.png"):
+        display = _migrate_logo_tile(conn, shop_id, orig or display)
     return {"name": shop["name"], "address": shop["address"] or "",
-            "phone": shop["phone"] or "", "logo": logo, "logo_orig": orig,
+            "phone": shop["phone"] or "", "logo": display, "logo_orig": orig,
             "language": shop["language"] or "en"}
+
+
+def _migrate_logo_tile(conn, shop_id: str, source: str) -> str:
+    """One-time move of a legacy logo file into the standard tile.
+
+    Returns the tile path, or "" when tiling fails (name-only header).
+    """
+    try:
+        from app import logo as _logo
+        ensure_dirs()
+        safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
+        tile_path = str(LOGOS_DIR / f"{safe}-tile.png")
+        with open(source, "rb") as f:
+            raw = f.read()
+        with open(tile_path, "wb") as f:
+            f.write(_logo.render_tile(raw))
+        conn.execute("UPDATE shops SET logo_path = ? WHERE shop_id = ?",
+                     (tile_path, shop_id))
+        conn.commit()
+        return tile_path
+    except Exception:
+        log.warning("logo tile migration failed for %s", shop_id,
+                    exc_info=True)
+        return ""
 
 
 def maybe_logo_nudge(conn, shop_id: str) -> str:
@@ -656,31 +673,44 @@ def _pdf_footer(canvas, doc) -> None:
     canvas.restoreState()
 
 
+PDF_LOGO_PT = 44.0  # fixed logo column tile size (points)
+PDF_LOGO_GAP = 12.0  # gap between the text column and the logo column
+
+
+def _pdf_header_cols(width: float, has_logo: bool) -> list[float]:
+    """Table column widths: text column sized clear of the fixed logo column."""
+    if not has_logo:
+        return [width]
+    return [width - PDF_LOGO_PT - PDF_LOGO_GAP, PDF_LOGO_PT]
+
+
 def _pdf_brand_header(story: list, st: dict, brand: dict, doc_title: str,
                       date_str: str, width: float) -> None:
-    """Owner logo + shop name/address/phone + document title (or name-only)."""
+    """Two columns: text left, logo tile in a fixed right column (or name-only)."""
     from reportlab.platypus import Image as RLImage
     from reportlab.platypus import Paragraph, Spacer
-    cells: list = []
-    logo_w = 0.0
+    logo_ok = False
     if brand["logo"]:
         try:
             from PIL import Image as PILImage
             with PILImage.open(brand["logo"]) as im:
-                aspect = im.width / max(im.height, 1)
-            logo_h = 30.0
-            logo_w = min(max(logo_h * aspect, 12.0), 90.0)
-            cells.append(RLImage(brand["logo"], width=logo_w, height=logo_h))
+                im.verify()
+            logo_ok = True
         except Exception:
-            cells.append(Paragraph("", st["body"]))
+            logo_ok = False
     lines = [f"<b>{brand['name']}</b>"]
     contact = " · ".join(p for p in (brand["address"], brand["phone"]) if p)
     if contact:
         lines.append(contact)
     lines.append(f"{doc_title} · {date_str}")
-    cells.append(Paragraph("<br/>".join(lines), st["body"]))
-    widths = [logo_w + 8, width - logo_w - 8] if brand["logo"] else [width]
-    story.append(_pdf_table([cells if brand["logo"] else cells], widths, header=False))
+    if logo_ok:
+        cells: list = [Paragraph("<br/>".join(lines), st["body"]),
+                       RLImage(brand["logo"], width=PDF_LOGO_PT,
+                               height=PDF_LOGO_PT)]
+    else:
+        cells = [Paragraph("<br/>".join(lines), st["body"])]
+    story.append(_pdf_table([cells], _pdf_header_cols(width, logo_ok),
+                            header=False))
     story.append(Spacer(1, 6))
 
 
@@ -818,8 +848,9 @@ def _hex(h: str) -> tuple[int, int, int]:
     return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
 
 
-LOGO_BOX = 160  # square reserved for the logo, right side of the header
-LOGO_PAD = 16  # gap between text and the logo box
+LOGO_BOX = 96  # fixed logo column (square tile, right side of the header)
+LOGO_PAD = 20  # gap between the text column and the logo column
+LOGO_TOP = 56  # logo tile top edge within the header
 
 
 def _wrap_lines(dr, text: str, font, max_w: float, max_lines: int) -> list[str]:
@@ -839,31 +870,40 @@ def _wrap_lines(dr, text: str, font, max_w: float, max_lines: int) -> list[str]:
     return lines or [""]
 
 
+def _fit_font(dr, text: str, sizes: list[int], max_w: float):
+    """Largest font size that fits on one line, down to the minimum."""
+    font = _card_font(sizes[-1])
+    for size in sizes:
+        font = _card_font(size)
+        if dr.textlength(text, font=font) <= max_w:
+            break
+    return font
+
+
 def _header_text_lines(brand: dict, doc_title: str, date_str: str, W: int,
                        dr) -> tuple[list[dict], int]:
-    """Header text laid out left of the reserved logo box.
+    """Header text laid out in the left column, clear of the logo column.
 
-    Returns ([{x, y, text, font, fill}], logo_box_left). No line extends
-    past logo_box_left - LOGO_PAD, so text can never run under the logo.
+    Returns ([{x, y, text, font, fill}], logo_box_left). Fonts shrink to
+    their minimum before text wraps, and no line extends past
+    logo_box_left - LOGO_PAD, so text can never enter the logo column.
     """
     box_left = W - 60 - LOGO_BOX
     max_w = (box_left - LOGO_PAD - 60) if brand["logo"] else (W - 120)
-    name_font = _card_font(64)
-    if dr.textlength(brand["name"], font=name_font) > max_w:
-        name_font = _card_font(52)
     lines: list[dict] = []
     y = 50
+    name_font = _fit_font(dr, brand["name"], [64, 52, 44, 36], max_w)
     for row in _wrap_lines(dr, brand["name"], name_font, max_w, 2):
         lines.append({"x": 60, "y": y, "text": row, "font": name_font,
                       "fill": "white"})
         y += name_font.size + 11
     contact = " · ".join(p for p in (brand["address"], brand["phone"]) if p)
     if contact:
-        cfont = _card_font(36)
+        cfont = _fit_font(dr, contact, [36, 30, 26], max_w)
         for row in _wrap_lines(dr, contact, cfont, max_w, 2):
             lines.append({"x": 60, "y": y, "text": row, "font": cfont,
                           "fill": "white"})
-            y += 44
+            y += cfont.size + 8
     tfont = _card_font(44)
     title = f"{doc_title} · {date_str}"
     for size in (44, 36, 30):
@@ -890,7 +930,7 @@ def _png_brand_header(img, brand: dict, doc_title: str, date_str: str,
     height = max(height, bottom + 30)
     dr.rectangle([0, 0, W, height], fill=_hex(SISI["primary"]))
     dr.rectangle([0, height, W, height + 16], fill=_hex(SISI["accent"]))
-    _paste_logo(img, brand["logo"], (box_left, 60, LOGO_BOX))
+    _paste_logo(img, brand["logo"], (box_left, LOGO_TOP, LOGO_BOX))
     for line in lines:
         dr.text((line["x"], line["y"]), line["text"], font=line["font"],
                 fill=line["fill"])
@@ -1016,32 +1056,6 @@ def render_shop_card(brand: dict, path: str) -> str:
             font=_card_font(40), fill=_hex(SISI["ink"]))
     dr.text((60, y + 62), _t("doc_profile_note"),
             font=_card_font(34), fill=_hex(SISI["muted"]))
-    _png_footer(img)
-    img.save(path, "PNG")
-    return path
-
-
-def render_logo_compare(before_path: str, after_path: str, path: str) -> str:
-    """Before/after logo card for the redo-logo command (1080x640 PNG)."""
-    from PIL import Image, ImageDraw
-    W, H = 1080, 640
-    img = Image.new("RGB", (W, H), _hex(SISI["paper"]))
-    dr = ImageDraw.Draw(img)
-    dr.rectangle([0, 0, W, 150], fill=_hex(SISI["primary"]))
-    dr.text((60, 45), _t("logo_redo_title"), font=_card_font(52), fill="white")
-    for i, (src, label) in enumerate(((before_path, _t("logo_before")),
-                                     (after_path, _t("logo_after")))):
-        x0 = 60 + i * 500
-        panel = Image.new("RGB", (440, 330), "white")
-        try:
-            art = Image.open(src).convert("RGBA")
-            art.thumbnail((400, 260), Image.LANCZOS)
-            panel.paste(art, ((440 - art.width) // 2, 20), art)
-        except OSError:
-            pass
-        img.paste(panel, (x0, 190))
-        dr.text((x0, 535), label, font=_card_font(40),
-                fill=_hex(SISI["ink"]))
     _png_footer(img)
     img.save(path, "PNG")
     return path

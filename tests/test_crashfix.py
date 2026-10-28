@@ -21,18 +21,17 @@ def _clean(monkeypatch, tmp_path):
     assert isinstance(get_sender(), FakeSender)
 
 
-def test_switch_logo_creates_missing_dirs(conn, monkeypatch):
+def test_save_logo_creates_missing_dirs(conn):
     import io
     from PIL import Image
-    from app.tools import ensure_shop, save_shop_logo, switch_logo
-    monkeypatch.setattr("app.logo.remove_bg", lambda b: None)
+    from app.tools import ensure_shop, save_shop_logo
     ensure_shop(conn, SHOP)
     img = Image.new("RGB", (60, 40), "white")
     buf = io.BytesIO()
     img.save(buf, "PNG")
-    save_shop_logo(conn, SHOP, buf.getvalue())
-    out = switch_logo(conn, SHOP, "original")
-    assert "original" in out
+    out = save_shop_logo(conn, SHOP, buf.getvalue())
+    assert "Logo saved" in out
+    assert ensure_shop(conn, SHOP)["logo_path"].endswith("-tile.png")
 
 
 def test_finish_card_creates_missing_dirs(conn):

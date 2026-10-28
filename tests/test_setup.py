@@ -70,17 +70,14 @@ def test_full_flow_with_skips(conn):
     assert shop["address"] == "" and shop["logo_path"] == ""
 
 
-def test_logo_photo_step(conn, monkeypatch):
-    import app.setup as setup
-    monkeypatch.setattr(setup, "finish_polish",
-                        lambda shop_id, timeout_s=60: "done")
+def test_logo_photo_step(conn):
     _run(conn, SHOP, ["hi", "Shop", "12 Main Rd", "0820000001"])
     assert setup_step(conn, SHOP) == 4
     _, reply, _ = handle_photo(conn, SHOP, _photo())
-    assert "Logo received" in reply and "Step 5 of 7" in reply
+    assert "Logo saved" in reply and "Step 5 of 7" in reply
     shop = ensure_shop(conn, SHOP)
     assert shop["logo_orig_path"] != ""  # original saved immediately
-    assert shop["logo_path"] == ""  # cut-out still polishing
+    assert shop["logo_path"].endswith("-tile.png")  # tile saved at once
 
 
 def test_photo_before_logo_step_redirects(conn):

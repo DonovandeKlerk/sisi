@@ -12,7 +12,6 @@ import hmac
 import json
 import logging
 import os
-from contextlib import asynccontextmanager
 import time
 import traceback
 
@@ -38,28 +37,7 @@ from app.whatsapp import (
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 log = logging.getLogger("sisi")
 
-def _startup_repolish() -> None:
-    """Re-polish stale shop logos once per container start (background)."""
-    try:
-        from app.db import connect, init_db
-        from app.setup import repolish_scan
-        conn = connect()
-        try:
-            init_db(conn)
-            repolish_scan(conn)
-        finally:
-            conn.close()
-    except Exception:
-        log.warning("startup repolish scan failed", exc_info=True)
-
-
-@asynccontextmanager
-async def _lifespan(app: FastAPI):
-    _startup_repolish()
-    yield
-
-
-app = FastAPI(title="Sisi", lifespan=_lifespan)
+app = FastAPI(title="Sisi")
 
 
 UNSUPPORTED_REPLY = STRINGS["en"]["unsupported"]
@@ -133,7 +111,7 @@ def _dispatch(background_tasks: BackgroundTasks, msg: IncomingMessage) -> None:
     """Run handle-now in a spawned Modal worker on Modal, else a background task.
 
     Either way the webhook returns 200 instantly; slow work (vision, voice,
-    rembg, reports) never blocks the receipt.
+    reports) never blocks the receipt.
     """
     if os.environ.get("SISI_SPAWN") == "1":
         try:
