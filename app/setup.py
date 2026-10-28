@@ -326,8 +326,13 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes) -> str | 
     return f"{ack}\n\n{_advance(conn, shop_id, 4, None)}"
 
 
-def request_polish(conn: sqlite3.Connection, shop_id: str) -> None:
-    """Flag a logo for background polishing; spawn a worker, thread fallback."""
+def request_polish(conn: sqlite3.Connection,
+                   shop_id: str) -> object | None:
+    """Flag a logo for background polishing; spawn a worker, thread fallback.
+
+    Returns the fallback thread when one was started (tests join it), else
+    None.
+    """
     import threading
     import time
     _set_flag(conn, shop_id, "logo-polish", "pending")
@@ -344,6 +349,42 @@ def request_polish(conn: sqlite3.Connection, shop_id: str) -> None:
         thread = threading.Thread(target=finish_polish, args=(shop_id,),
                                   daemon=True)
         thread.start()
+        return thread
+    return None
+
+
+def needs_repolish(conn: sqlite3.Connection, shop_id: str) -> bool:
+    """True when a shop has an original logo that predates good polishing.
+
+    Shops polished by the current code carry a logo-method flag; anything
+    with a saved original but no flag is reprocessed once from the
+    original. Never triggers while a polish is pending, and never
+    auto-retries a failed polish (the owner can say "redo logo").
+    """
+    import os as _os
+
+    from app.tools import ensure_shop
+    orig = ensure_shop(conn, shop_id)["logo_orig_path"] or ""
+    if not orig or not _os.path.exists(orig):
+        return False
+    if _flag(conn, shop_id, "logo-method"):
+        return False
+    return polish_state(conn, shop_id) not in ("pending", "failed")
+
+
+def repolish_scan(conn: sqlite3.Connection) -> dict:
+    """Re-polish every stale shop logo in the background. Returns {shop: thread}."""
+    out = {}
+    rows = conn.execute("SELECT shop_id FROM shops WHERE logo_orig_path <> ''"
+                        ).fetchall()
+    for row in rows:
+        try:
+            if needs_repolish(conn, row["shop_id"]):
+                out[row["shop_id"]] = request_polish(conn, row["shop_id"])
+        except Exception:
+            log.warning("repolish scan failed for %s", row["shop_id"],
+                        exc_info=True)
+    return out
 
 
 def finish_polish(shop_id: str, timeout_s: int = POLISH_TIMEOUT_S) -> str:
@@ -377,6 +418,8 @@ def finish_polish(shop_id: str, timeout_s: int = POLISH_TIMEOUT_S) -> str:
                 done = None
         if not done or done["original"] is None:
             raise ValueError("bad image")
+        _logo.log_polish(shop_id, done)
+        _set_flag(conn, shop_id, "logo-method", done.get("method", "badge"))
         _reports.ensure_dirs()
         safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
         if done["used_cutout"]:
@@ -389,10 +432,10 @@ def finish_polish(shop_id: str, timeout_s: int = POLISH_TIMEOUT_S) -> str:
                 f.write(done["badge"])
         conn.execute("UPDATE shops SET logo_path = ? WHERE shop_id = ?",
                      (display, shop_id))
-        conn.execute("INSERT INTO flags (shop_id, key, value)"
-                     " VALUES (?, 'logo-mode', 'cutout')"
-                     " ON CONFLICT (shop_id, key) DO UPDATE SET value = 'cutout'",
-                     (shop_id,))
+        if not _flag(conn, shop_id, "logo-mode"):
+            conn.execute("INSERT INTO flags (shop_id, key, value)"
+                         " VALUES (?, 'logo-mode', 'cutout')"
+                         " ON CONFLICT (shop_id, key) DO NOTHING", (shop_id,))
         outcome = "done"
     except Exception:
         log.warning("logo polish failed for %s", shop_id, exc_info=True)

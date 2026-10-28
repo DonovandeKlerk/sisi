@@ -121,6 +121,12 @@ def shop_brand(conn, shop_id: str) -> dict:
         logo = ""
     if orig and not Path(orig).exists():
         orig = ""
+    try:
+        from app.setup import needs_repolish, request_polish
+        if orig and needs_repolish(conn, shop_id):
+            request_polish(conn, shop_id)
+    except Exception:
+        log.warning("logo repolish trigger failed", exc_info=True)
     return {"name": shop["name"], "address": shop["address"] or "",
             "phone": shop["phone"] or "", "logo": logo, "logo_orig": orig,
             "language": shop["language"] or "en"}
@@ -951,6 +957,32 @@ def render_shop_card(brand: dict, path: str) -> str:
             font=_card_font(40), fill=_hex(SISI["ink"]))
     dr.text((60, y + 62), _t("doc_profile_note"),
             font=_card_font(34), fill=_hex(SISI["muted"]))
+    _png_footer(img)
+    img.save(path, "PNG")
+    return path
+
+
+def render_logo_compare(before_path: str, after_path: str, path: str) -> str:
+    """Before/after logo card for the redo-logo command (1080x640 PNG)."""
+    from PIL import Image, ImageDraw
+    W, H = 1080, 640
+    img = Image.new("RGB", (W, H), _hex(SISI["paper"]))
+    dr = ImageDraw.Draw(img)
+    dr.rectangle([0, 0, W, 150], fill=_hex(SISI["primary"]))
+    dr.text((60, 45), _t("logo_redo_title"), font=_card_font(52), fill="white")
+    for i, (src, label) in enumerate(((before_path, _t("logo_before")),
+                                     (after_path, _t("logo_after")))):
+        x0 = 60 + i * 500
+        panel = Image.new("RGB", (440, 330), "white")
+        try:
+            art = Image.open(src).convert("RGBA")
+            art.thumbnail((400, 260), Image.LANCZOS)
+            panel.paste(art, ((440 - art.width) // 2, 20), art)
+        except OSError:
+            pass
+        img.paste(panel, (x0, 190))
+        dr.text((x0, 535), label, font=_card_font(40),
+                fill=_hex(SISI["ink"]))
     _png_footer(img)
     img.save(path, "PNG")
     return path

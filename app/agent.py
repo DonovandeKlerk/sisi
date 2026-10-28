@@ -65,6 +65,7 @@ from app.tools import (
     confirm_logo,
     save_shop_logo,
     switch_logo,
+    redo_logo,
     set_customer_language,
     set_customer_limit,
     set_expiry,
@@ -123,6 +124,9 @@ YES_WORDS = {"yes", "y", "yebo", "yeah", "ja", "ewe", "ok", "okay", "sharp", "sh
 NO_WORDS = {"no", "n", "nope", "cha", "hayi", "nee", "aowa"}
 UNDO_WORDS = {"undo"}
 RESET_WORDS = {"demo reset", "reset demo"}
+REDO_LOGO_WORDS = {"redo logo", "fix logo", "lungisa ilogo",
+                   "phinda wenze ilogo", "maak logo reg", "doen logo oor",
+                   "yenzi ilogo kwakhona"}
 DELETE_WORDS = {"delete my data", "erase my data", "forget me"}
 HELP_WORDS = {"demo help", "help", "what can you do", "commands",
               "hulp", "usizo", "uncedo"}
@@ -407,6 +411,8 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
         return switch_logo(conn, shop_id, "original"), None
     if word == "remove logo background":
         return switch_logo(conn, shop_id, "cutout"), None
+    if word in REDO_LOGO_WORDS:
+        return redo_logo(conn, shop_id), None
     if word.startswith("remove "):
         if get_order_draft(conn, shop_id) is None:
             return _t("order_no_draft"), None

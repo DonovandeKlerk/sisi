@@ -104,6 +104,7 @@ def test_success_arrives_after_all_set_with_card(conn, tmp_path, monkeypatch):
                  (str(logo), SHOP))
     conn.commit()
     _set_flag(conn, "logo-polish", "done")
+    _set_flag(conn, "logo-method", "solid")  # done by current code: no refire
     handle_text(conn, SHOP, "1500 cash, 300 petty")
     handle_text(conn, SHOP, "english")
     msg, _ = handle_text(conn, SHOP, "yes")

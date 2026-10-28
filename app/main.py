@@ -12,6 +12,7 @@ import hmac
 import json
 import logging
 import os
+from contextlib import asynccontextmanager
 import time
 import traceback
 
@@ -37,7 +38,29 @@ from app.whatsapp import (
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 log = logging.getLogger("sisi")
 
-app = FastAPI(title="Sisi")
+def _startup_repolish() -> None:
+    """Re-polish stale shop logos once per container start (background)."""
+    try:
+        from app.db import connect, init_db
+        from app.setup import repolish_scan
+        conn = connect()
+        try:
+            init_db(conn)
+            repolish_scan(conn)
+        finally:
+            conn.close()
+    except Exception:
+        log.warning("startup repolish scan failed", exc_info=True)
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    _startup_repolish()
+    yield
+
+
+app = FastAPI(title="Sisi", lifespan=_lifespan)
+
 
 UNSUPPORTED_REPLY = STRINGS["en"]["unsupported"]
 CONSENT_LINE = STRINGS["en"]["consent_ps"]

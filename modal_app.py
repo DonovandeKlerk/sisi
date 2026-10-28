@@ -22,10 +22,11 @@ image = (
     modal.Image.debian_slim()
     .apt_install("ffmpeg", "fonts-dejavu-core")
     .pip_install_from_requirements("requirements.txt")
-    # Bake the rembg u2net model into the image (plain python -c: needs no
+    # Bake the rembg isnet model into the image (plain python -c: needs no
     # app source, so it is safe to run before the code is added).
     .run_commands(
-        "python -c \"from rembg import new_session; new_session('u2net')\""
+        "python -c \"from rembg import new_session;"
+        " new_session('isnet-general-use')\""
     )
     # Bake the app package into the image (deploy uploads only modal_app.py).
     .add_local_dir("app", remote_path="/root/app",
