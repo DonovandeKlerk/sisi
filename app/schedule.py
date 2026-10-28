@@ -416,7 +416,12 @@ def run_due(now: datetime | None = None) -> list[dict]:
             if out is None:
                 out = QueuedSender.wrap(sender, conn, channel)
                 queues[job["shop"]] = out
-            out.send_text(job["shop"], job["text"])
+            from app.i18n import CURRENT_LANG, owner_lang
+            from app.mediasend import with_media_links
+
+            CURRENT_LANG.set(owner_lang(conn, job["shop"]))
+            out.send_text(job["shop"],
+                          with_media_links(job["text"], job["media"]))
             for item in job["media"]:
                 if item["kind"] == "file":
                     out.send_file(job["shop"], item["url"],

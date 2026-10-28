@@ -522,6 +522,9 @@ def send_due(conn: sqlite3.Connection, now: datetime | None = None) -> list[int]
         ctx_text, media = render_context(conn, shop_id, context)
         if ctx_text:
             text += f"\n\n{ctx_text}"
+        from app.mediasend import with_media_links
+
+        text = with_media_links(text, media)
         enqueue(conn, shop_id, channel, "text", {"body": text}, commit=False)
         for item in media:
             if item.get("kind") == "file":

@@ -292,8 +292,11 @@ def _handle_message(sender, msg: IncomingMessage) -> None:
             reply, buttons = _t("unsupported"), None
         else:
             reply, buttons = handle_text(conn, msg.shop_id, msg.text)
-        reply = _with_consent(conn, msg.shop_id, reply)
         items = take_media(msg.shop_id)
+        from app.mediasend import with_media_links
+
+        reply = with_media_links(reply, items)
+        reply = _with_consent(conn, msg.shop_id, reply)
         for item in [i for i in items if i.get("first")]:
             out.send_media_item(msg.shop_id, item)
         if buttons:
@@ -311,10 +314,19 @@ def _handle_message(sender, msg: IncomingMessage) -> None:
 
 @app.get("/media/{token}")
 def serve_media(token: str, f: str = "png"):
-    """Serve a month-end PDF/PNG by its unguessable per-report token (?f=pdf|png)."""
+    """Serve a report PNG/PDF by its unguessable token (?f=png|pdf or .suffix).
+
+    Files live on the shared Volume (never expire, so links and old
+    reports keep working); no auth so Vonage and owners can fetch them.
+    """
     from app.reports import get_report_by_token, refresh_media
 
     refresh_media()  # pick up files committed by worker containers first
+    if "." in token:
+        token, _, suffix = token.rpartition(".")
+        if suffix not in ("png", "pdf"):
+            raise HTTPException(status_code=404, detail="not found")
+        f = suffix
     if f not in ("png", "pdf"):
         raise HTTPException(status_code=404, detail="not found")
     conn = connect()

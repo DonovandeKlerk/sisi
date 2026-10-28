@@ -51,7 +51,6 @@ def web():
     # Force the volume path: a local SISI_DB value from the secret would
     # silently write to the container's ephemeral disk and lose shop data.
     _use_volume()
-    os.environ["SISI_SPAWN"] = "1"
     return fastapi_app
 
 
@@ -72,6 +71,8 @@ def _use_volume() -> None:
     os.environ["SISI_REPORTS"] = "/data/reports"
     os.environ["SISI_LOGOS"] = "/data/logos"
     os.environ["SISI_MEDIA_VOLUME"] = "sisi-data"
+    os.environ["SISI_SEND_LOCK"] = "sisi-sendlock"
+    os.environ["SISI_SPAWN"] = "1"
     from app.reports import ensure_dirs
     ensure_dirs()
 
@@ -83,6 +84,14 @@ def worker(msg: dict):
     from app.main import process_message
     from app.whatsapp import IncomingMessage
     process_message(IncomingMessage(**msg))
+
+
+@app.function(timeout=300)
+def send_media(payload: dict) -> dict:
+    """Background media send: 3s after the text, spaced, long 429 backoff."""
+    _use_volume()
+    from app.mediasend import send_media_deferred
+    return send_media_deferred(**payload)
 
 
 @app.function(timeout=120)

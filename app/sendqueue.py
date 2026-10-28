@@ -355,6 +355,7 @@ class QueuedSender:
         self._clock = clock
         self._sleep = sleep
         self._pace = pace_s
+        self._media_n: dict[str, int] = {}
 
     @classmethod
     def wrap(cls, sender, conn, channel: str, **kw) -> "QueuedSender":
@@ -379,22 +380,34 @@ class QueuedSender:
                 {"body": body, "buttons": buttons})
         self._remember(to)
 
+    def _media_delay(self, to: str) -> float:
+        from app.mediasend import MEDIA_GAP_S, MEDIA_TEXT_DELAY_S
+
+        n = self._media_n.get(to, 0)
+        self._media_n[to] = n + 1
+        return MEDIA_TEXT_DELAY_S + MEDIA_GAP_S * n
+
+    def _request_media(self, to: str, kind: str, payload: dict) -> None:
+        from app.mediasend import request_media_send
+
+        request_media_send(self._conn, to, "vonage", kind, payload,
+                           delay_s=self._media_delay(to))
+        self._remember(to)
+
     def send_image(self, to: str, url: str, caption: str = "") -> None:
         if not self._queued:
             self._sender.send_image(to, url, caption)
             return
-        enqueue(self._conn, to, "vonage", "image",
-                {"url": url, "caption": caption})
-        self._remember(to)
+        self._request_media(to, "image", {"url": url, "caption": caption})
 
     def send_file(self, to: str, url: str, filename: str,
                   caption: str = "") -> None:
         if not self._queued:
             self._sender.send_file(to, url, filename, caption)
             return
-        enqueue(self._conn, to, "vonage", "file",
-                {"url": url, "filename": filename, "caption": caption})
-        self._remember(to)
+        self._request_media(to, "file",
+                            {"url": url, "filename": filename,
+                             "caption": caption})
 
     def mark_read(self, message_id: str) -> bool:
         return self._sender.mark_read(message_id)

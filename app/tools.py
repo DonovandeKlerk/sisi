@@ -3045,9 +3045,10 @@ def resend_last_media(conn: sqlite3.Connection, shop_id: str) -> str:
             "filename": failed.get("filename", "")}
     channel = ensure_shop(conn, shop_id)["channel"] or "meta"
     if channel == "vonage":
-        from app.sendqueue import enqueue
-        enqueue(conn, shop_id, channel, kind,
-                {k: item[k] for k in ("url", "caption", "filename")})
+        from app.mediasend import request_media_send
+        request_media_send(conn, shop_id, channel, kind,
+                           {k: item[k] for k in ("url", "caption",
+                                                "filename")})
     else:
         from app.agent import queue_media as _queue
         _queue(shop_id, [item])
