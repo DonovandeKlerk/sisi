@@ -117,10 +117,41 @@ def test_hi_starts_setup_for_new_number(conn):
     assert FRESH not in LIST_OUTBOX
 
 
-def test_help_keeps_text_menu(conn):
+def test_help_opens_menu(conn):
     seed_demo(SHOP, conn)
     _use_english(conn)
     msg, _ = agent.handle_text(conn, SHOP, "help")
+    assert msg == "📋 *Main menu*\nPick one below 👇"
+    assert LIST_OUTBOX[SHOP][0]["rows"] == [
+        "Sell", "Stock", "Who owes me", "Statements", "Reports",
+        "Reminders", "Settings"]
+
+
+def test_help_mid_setup_keeps_text_and_resumes(conn):
+    agent.handle_text(conn, FRESH, "hi")
+    agent.handle_text(conn, FRESH, "Shop")
+    agent.handle_text(conn, FRESH, "Addr")
+    msg, _ = agent.handle_text(conn, FRESH, "help")
+    assert "Demo help" in msg
+    assert FRESH not in LIST_OUTBOX
+    msg, _ = agent.handle_text(conn, FRESH, "yes")
+    assert msg.startswith("Let's finish setting up, step 4 of 7")
+
+
+@pytest.mark.parametrize("word", ["help", "what can you do", "commands",
+                                  "hulp", "usizo", "uncedo"])
+def test_help_words_open_menu(conn, word):
+    seed_demo(SHOP, conn)
+    _use_english(conn)
+    msg, _ = agent.handle_text(conn, SHOP, word)
+    assert "📋" in msg
+    assert LIST_OUTBOX[SHOP][0]["rows"] == MENU_ROWS
+
+
+def test_demo_help_keeps_full_text(conn):
+    seed_demo(SHOP, conn)
+    _use_english(conn)
+    msg, _ = agent.handle_text(conn, SHOP, "demo help")
     assert msg.startswith("❓ *Demo help")
     assert SHOP not in LIST_OUTBOX
 
@@ -368,3 +399,66 @@ def test_process_message_delivers_menu_list(monkeypatch, tmp_path):
     sent = get_sender().pop_shop(SHOP)
     assert [m["type"] for m in sent] == ["text", "list"]
     assert sent[1]["rows"] == MENU_ROWS
+
+
+def test_every_row_tap_reaches_router_as_typed(conn, monkeypatch, tmp_path):
+    seed_demo(SHOP, conn)
+    _use_english(conn)
+    heard = []
+
+    def fake(messages):
+        heard.append([m["content"] for m in messages
+                      if isinstance(m, dict) and m.get("role") == "user"][-1])
+        return _resp("ok")
+
+    monkeypatch.setattr(llm, "TOKEN_LOG", tmp_path / "usage.log")
+    monkeypatch.setattr(llm, "_complete", fake)
+    agent.handle_text(conn, SHOP, "menu")
+    for i, row in enumerate(MENU_ROWS, 1):
+        agent.handle_text(conn, SHOP, "menu")
+        agent.handle_text(conn, SHOP, str(i))
+    # "Reminders" is a keyword (no LLM call); the rest arrive verbatim.
+    assert heard == [r for r in MENU_ROWS if r != "Reminders"]
+
+
+def test_unmatched_message_carries_shop_context(conn, monkeypatch, tmp_path):
+    seed_demo(SHOP, conn)
+    _use_english(conn)
+    calls = _stub(monkeypatch, tmp_path, [_resp("slow day")])
+    agent.handle_text(conn, SHOP, "so how is business today")
+    assert calls["n"] == 1
+    system = calls["messages"][0]["content"]
+    assert "Sasko White Bread 700g" in system
+    assert "Sipho" in system
+
+
+def test_unmatched_clarify_returns_buttons(conn, monkeypatch, tmp_path):
+    seed_demo(SHOP, conn)
+    _use_english(conn)
+    calls = _stub(monkeypatch, tmp_path, [
+        _resp(calls=[SimpleNamespace(
+            id="c1",
+            function=SimpleNamespace(
+                name="ask_clarify",
+                arguments=json.dumps(
+                    {"question": "Which bread?",
+                     "options": ["White", "Brown"]})))]),
+        _resp("❓ Which bread?\n1) White\n2) Brown"),
+    ])
+    msg, buttons = agent.handle_text(conn, SHOP, "sell")
+    assert calls["n"] == 2
+    assert buttons == ["White", "Brown"]
+    assert "1) White" in msg
+
+
+def test_voice_composite_routes_to_llm(conn, monkeypatch, tmp_path):
+    seed_demo(SHOP, conn)
+    _use_english(conn)
+    monkeypatch.setattr(agent, "transcribe_audio",
+                        lambda *a, **k: "who owes me most and remind them")
+    calls = _stub(monkeypatch, tmp_path, [_resp("both done")])
+    transcript, reply, _ = agent.handle_voice(conn, SHOP, b"ogg-bytes")
+    assert transcript == "who owes me most and remind them"
+    assert calls["n"] == 1
+    assert reply.startswith("Heard:")
+    assert "both done" in reply

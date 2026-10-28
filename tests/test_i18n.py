@@ -159,15 +159,31 @@ def test_owner_default_for_neutral_message(conn, shop):
 
 
 @pytest.mark.parametrize("lang,head", [
+    ("en", "📋 *Main menu*"),
+    ("zu", "📋 *Imenyu enkulu*"),
+    ("af", "📋 *Hoofkieslys*"),
+    ("xh", "📋 *Imenyu ephambili*"),
+])
+def test_help_menu_per_language(conn, shop, lang, head):
+    from app.agent import LIST_OUTBOX, MENU_ROWS, take_lists
+    conn.execute("UPDATE shops SET language = ? WHERE shop_id = ?", (lang, SHOP))
+    conn.commit()
+    msg, _ = handle_text(conn, SHOP, "help")
+    assert msg.startswith(head)
+    assert take_lists(SHOP)[0]["rows"] == MENU_ROWS
+    assert SHOP not in LIST_OUTBOX
+
+
+@pytest.mark.parametrize("lang,head", [
     ("en", "❓ *Demo help — try me*"),
     ("zu", "❓ *Usizo — zama mina*"),
     ("af", "❓ *Hulp — probeer my*"),
     ("xh", "❓ *Uncedo — ndizame*"),
 ])
-def test_help_menu_per_language(conn, shop, lang, head):
+def test_demo_help_text_per_language(conn, shop, lang, head):
     conn.execute("UPDATE shops SET language = ? WHERE shop_id = ?", (lang, SHOP))
     conn.commit()
-    msg, _ = handle_text(conn, SHOP, "help")
+    msg, _ = handle_text(conn, SHOP, "demo help")
     assert msg.startswith(head)
 
 

@@ -21,7 +21,6 @@ from app.setup import (
     setup_step,
     start_setup,
 )
-from app.llm import chat as llm_chat
 from app.llm import chat_full as llm_chat_full
 from app.llm import save_turn
 from app.vision import VisionError, read_expiry_photo, read_shop_photo
@@ -115,8 +114,8 @@ def take_lists(shop_id: str) -> list[dict]:
 
 MENU_WORDS = {"menu", "hi", "hello", "hey", "imenyu"}
 
-MENU_ROWS = ["Sell", "Stock", "Who owes me", "All statements",
-             "Month-end report", "My reminders", "Settings"]
+MENU_ROWS = ["Sell", "Stock", "Who owes me", "Statements", "Reports",
+             "Reminders", "Settings"]
 """Main menu: each row is typed text the router already handles."""
 
 
@@ -707,6 +706,8 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
     if word in DELETE_WORDS:
         return delete_my_data(conn, shop_id), None
     if word in HELP_WORDS:
+        if word != "demo help" and not needs_setup(conn, shop_id):
+            return show_menu(conn, shop_id), None
         return DEMO_HELP, None
     if word in ("month-end report", "month end report", "monthend report",
                 "month-end", "month end", "monthend"):
@@ -774,8 +775,9 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
     return None
 
 
-def route_to_llm(conn: sqlite3.Connection, shop_id: str, text: str) -> str:
-    return llm_chat(conn, shop_id, text)
+def route_to_llm(conn: sqlite3.Connection, shop_id: str, text: str):
+    """LLM fallback with live shop context. Returns (message, buttons)."""
+    return llm_chat_full(conn, shop_id, text)
 
 
 _PRICE_RES = (
@@ -972,6 +974,11 @@ def handle_text(conn: sqlite3.Connection, shop_id: str, text: str):
             save_turn(conn, shop_id, "assistant", message)
             return message, None
         if word0 in HELP_WORDS:
+            if word0 != "demo help" and not needs_setup(conn, shop_id):
+                message = show_menu(conn, shop_id)
+                save_turn(conn, shop_id, "user", text)
+                save_turn(conn, shop_id, "assistant", message)
+                return message, None
             mark_paused(conn, shop_id)
             save_turn(conn, shop_id, "user", text)
             save_turn(conn, shop_id, "assistant", _t("help_menu"))
@@ -1008,7 +1015,11 @@ def handle_text(conn: sqlite3.Connection, shop_id: str, text: str):
                 save_turn(conn, shop_id, "user", text)
                 save_turn(conn, shop_id, "assistant", message)
             else:
-                message = route_to_llm(conn, shop_id, text)  # saves turns itself
+                res = route_to_llm(conn, shop_id, text)  # saves turns itself
+                if isinstance(res, tuple):
+                    message, det_buttons = res
+                else:  # str (tests patching route_to_llm)
+                    message = res
     message = _maybe_first_offer(conn, shop_id, message)
     after = get_pending(conn, shop_id)
     if after is not None and after["id"] != before_id:

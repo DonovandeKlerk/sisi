@@ -92,9 +92,9 @@ def test_staff_sale_via_handle_text(conn, shop, monkeypatch):
 
     def fake_llm(c, s, t):
         assert s == OWNER  # staff act on the owner's shop
-        return record_sale(c, s, "Bread", 1)
+        return record_sale(c, s, "Bread", 1), None
 
-    monkeypatch.setattr(agent, "llm_chat", fake_llm)
+    monkeypatch.setattr(agent, "llm_chat_full", fake_llm)
     msg, buttons = handle_text(conn, STAFF, "sold 1 bread")
     assert buttons == ["Yes", "No"]
     assert get_pending(conn, OWNER) is not None

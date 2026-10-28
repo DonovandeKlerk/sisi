@@ -47,7 +47,7 @@ def test_other_text_goes_to_llm(conn, monkeypatch):
     seed_demo(SHOP, conn)
     assert try_deterministic(conn, SHOP, "Sipho took two bread") is None
     assert try_deterministic(conn, SHOP, "yes but change it") is None
-    monkeypatch.setattr(agent, "llm_chat", lambda c, s, t: "roger")
+    monkeypatch.setattr(agent, "llm_chat_full", lambda c, s, t: ("roger", None))
     msg, buttons = handle_text(conn, SHOP, "Sipho took two bread")
     assert (msg, buttons) == ("roger", None)
 
@@ -57,9 +57,9 @@ def test_new_preview_gets_yes_no_buttons(conn, monkeypatch):
 
     def fake_llm(c, shop_id, text):
         add_credit(c, shop_id, "Sipho", [{"product": "Coke 2L", "qty": 1}])
-        return "Save?"
+        return "Save?", None
 
-    monkeypatch.setattr(agent, "llm_chat", fake_llm)
+    monkeypatch.setattr(agent, "llm_chat_full", fake_llm)
     msg, buttons = handle_text(conn, SHOP, "Sipho took a Coke")
     assert buttons == ["Yes", "No"]
     msg, buttons = handle_text(conn, SHOP, "yes")

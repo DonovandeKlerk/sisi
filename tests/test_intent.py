@@ -295,7 +295,7 @@ def test_gate_skips_composite_while_pending(conn, monkeypatch, tmp_path):
     def boom(c, s, t):
         raise AssertionError("composite path must not run while pending")
 
-    monkeypatch.setattr(agent, "llm_chat_full", boom)
+    monkeypatch.setattr(agent, "route_composite", boom)
     _stub(monkeypatch, tmp_path, [_resp("ok")])
     msg, buttons = agent.handle_text(conn, SHOP, "cash up and show low stock")
     assert msg == "ok"
