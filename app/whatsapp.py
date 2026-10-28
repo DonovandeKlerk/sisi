@@ -70,8 +70,8 @@ class IncomingMessage:
     text: str | None  # text body, button title, or None when unsupported
     timestamp: str = ""
     media_id: str | None = None  # WhatsApp media id for audio/image/video
-    media_url: str | None = None  # Vonage-hosted media URL (vonage channel)
-    channel: str = "meta"  # inbound channel: "meta" or "vonage"
+    media_url: str | None = None  # provider-hosted media URL (vonage/infobip)
+    channel: str = "meta"  # inbound channel: "meta", "vonage" or "infobip"
     caption: str = ""  # image caption, e.g. "logo"
 
 

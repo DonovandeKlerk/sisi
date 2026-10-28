@@ -154,6 +154,34 @@ set), 256 KB webhook body cap, 30/min per-shop rate limit, retries with backoff
 on outbound calls, consent line on first contact, `delete my data` erasure, and
 no secrets in code or logs (`pip-audit` clean).
 
+## Infobip WhatsApp channel (alternative provider)
+
+Configure in the Modal secret `sisi-env` (dashboard edit — never replace the
+whole secret): `INFOBIP_API_KEY`, `INFOBIP_BASE_URL` (per-account, e.g.
+`https://xxx.api.infobip.com`), `INFOBIP_WHATSAPP_FROM` (sender number),
+`INFOBIP_WEBHOOK_TOKEN` (generate with
+`python -c 'import secrets; print(secrets.token_urlsafe(32))'`). Placeholders
+live in `.env.example`; no real values in Git. Redeploy, then in the Infobip
+portal go to **Channels and Numbers → WhatsApp → Senders → ⋯ → Edit
+configuration → Keywords → Forwarding action → Forward to HTTP** and set the
+URL to `https://...modal.run/webhook/infobip/<token>` (inbound); set the
+delivery-report URL to `https://...modal.run/webhook/infobip/dlr`. Inbound
+auth is the shared path token (constant-time compare, fails closed);
+sender mismatch, unknown types, oversize bodies and redeliveries (messageId
+dedupe) are dropped safely with instant 200s so Infobip never retries a
+receipt. Replies support text, native Yes/No buttons and lists (numbered-text
+fallback), images, documents, and read receipts; voice notes and photos flow
+through the same transcription and vision handlers.
+
+Trial limits (shared test sender): verified signup numbers only, ~100 free
+messages, and free-form replies only inside the 24h user-initiated window —
+outside it, only approved templates (`InfobipSender.send_template`, or
+`scripts/infobip_probe.py` for the first live send). Live traffic needs a
+paying account plus a registered WhatsApp sender; then point
+`INFOBIP_WHATSAPP_FROM` at your own number. Set `SISI_PROVIDER=infobip` only
+when ready: it locks **all** sends to Infobip and refuses Vonage/Meta sends
+instead of silently crossing providers.
+
 ## Honest notes
 
 - Muse Voice Transcribe does not officially support isiZulu/Afrikaans. Sisi uses an English language bias plus a keywords list of local brands and slang (Sasko, Albany, Iwisa, ibhuku, skoloto, …) and **always shows the owner what she understood before saving**.

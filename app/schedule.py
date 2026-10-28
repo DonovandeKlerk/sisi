@@ -6,9 +6,12 @@ All entry points take an explicit `now` (SAST) so tests can mock the clock.
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
+
+log = logging.getLogger("sisi.schedule")
 
 SAST = timezone(timedelta(hours=2))
 
@@ -395,9 +398,8 @@ def tick(conn: sqlite3.Connection, now: datetime | None = None) -> list[dict]:
 def run_due(now: datetime | None = None) -> list[dict]:
     """Plan and send every due job. Returns the sent jobs (for logs/tests)."""
     from app.db import connect, init_db
+    from app.providers import WrongProviderError, sender_for_channel
     from app.sendqueue import QueuedSender
-    from app.vonage import VonageSender
-    from app.whatsapp import get_sender
     conn = connect()
     try:
         init_db(conn)
@@ -405,7 +407,11 @@ def run_due(now: datetime | None = None) -> list[dict]:
         queues: dict[str, QueuedSender] = {}
         for job in jobs:
             channel = job["channel"] or "meta"
-            sender = VonageSender() if channel == "vonage" else get_sender()
+            try:
+                sender = sender_for_channel(channel)
+            except WrongProviderError as e:
+                log.error("schedule: %s; job %s skipped", e, job["key"])
+                continue
             out = queues.get(job["shop"])
             if out is None:
                 out = QueuedSender.wrap(sender, conn, channel)

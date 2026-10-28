@@ -20,6 +20,8 @@ import time
 
 import httpx
 
+from app.providers import QUEUED_CHANNELS, WrongProviderError
+
 log = logging.getLogger("sisi.sendqueue")
 
 PACE_S = 1.5
@@ -319,8 +321,13 @@ def drain_all(conn, sender_for_channel, *, clock=time.time, sleep=time.sleep,
         "SELECT DISTINCT to_number, channel FROM send_queue"
         " WHERE status = 'queued'").fetchall()
     for row in numbers:
-        stats = drain(conn, row["to_number"],
-                      sender_for_channel(row["channel"] or "meta"),
+        try:
+            sender = sender_for_channel(row["channel"] or "meta")
+        except WrongProviderError as e:
+            log.error("drain_all: %s; rows for %s stay parked", e,
+                      row["to_number"])
+            continue
+        stats = drain(conn, row["to_number"], sender,
                       clock=clock, sleep=sleep, pace_s=pace_s)
         totals["sent"] += stats["sent"]
         totals["failed"] += stats["failed"]
@@ -331,15 +338,14 @@ def drain_all(conn, sender_for_channel, *, clock=time.time, sleep=time.sleep,
 def send_immediate(channel: str, to: str, kind: str, payload: dict) -> dict:
     """Enqueue one message and drain it (for paths without an open conn)."""
     from app.db import connect, init_db
-    from app.vonage import VonageSender
-    from app.whatsapp import get_sender
+    from app.providers import sender_for_channel
     conn = connect()
     try:
         init_db(conn)
-        if (channel or "meta") == "vonage":
+        sender = sender_for_channel(channel or "meta")
+        if (channel or "meta") in QUEUED_CHANNELS:
             enqueue(conn, to, channel, kind, payload)
-            return drain(conn, to, VonageSender())
-        sender = get_sender()
+            return drain(conn, to, sender)
         _send_claimed(sender, kind, payload, to)
         return {"sent": 1, "rate_limited": False, "failed": 0}
     finally:
@@ -347,14 +353,15 @@ def send_immediate(channel: str, to: str, kind: str, payload: dict) -> dict:
 
 
 class QueuedSender:
-    """Sender interface that queues (Vonage) or passes through (others)."""
+    """Sender interface that queues (strict-limit channels) or passes through."""
 
     def __init__(self, sender, conn: sqlite3.Connection | None, queued: bool,
                  clock=time.time, sleep=time.sleep,
-                 pace_s: float = PACE_S) -> None:
+                 pace_s: float = PACE_S, channel: str = "") -> None:
         self._sender = sender
         self._conn = conn
         self._queued = queued
+        self._channel = channel or ("vonage" if queued else "meta")
         self._touched: list[str] = []
         self._clock = clock
         self._sleep = sleep
@@ -363,7 +370,8 @@ class QueuedSender:
 
     @classmethod
     def wrap(cls, sender, conn, channel: str, **kw) -> "QueuedSender":
-        return cls(sender, conn, (channel or "meta") == "vonage", **kw)
+        code = (channel or "meta").strip().lower() or "meta"
+        return cls(sender, conn, code in QUEUED_CHANNELS, channel=code, **kw)
 
     def _remember(self, to: str) -> None:
         if to not in self._touched:
@@ -373,14 +381,14 @@ class QueuedSender:
         if not self._queued:
             self._sender.send_text(to, body)
             return
-        enqueue(self._conn, to, "vonage", "text", {"body": body})
+        enqueue(self._conn, to, self._channel, "text", {"body": body})
         self._remember(to)
 
     def send_buttons(self, to: str, body: str, buttons: list[str]) -> None:
         if not self._queued:
             self._sender.send_buttons(to, body, buttons)
             return
-        enqueue(self._conn, to, "vonage", "buttons",
+        enqueue(self._conn, to, self._channel, "buttons",
                 {"body": body, "buttons": buttons})
         self._remember(to)
 
@@ -389,7 +397,7 @@ class QueuedSender:
         if not self._queued:
             self._sender.send_list(to, body, button_text, rows)
             return
-        enqueue(self._conn, to, "vonage", "list",
+        enqueue(self._conn, to, self._channel, "list",
                 {"body": body, "button_text": button_text, "rows": rows})
         self._remember(to)
 
@@ -403,7 +411,7 @@ class QueuedSender:
     def _request_media(self, to: str, kind: str, payload: dict) -> None:
         from app.mediasend import request_media_send
 
-        request_media_send(self._conn, to, "vonage", kind, payload,
+        request_media_send(self._conn, to, self._channel, kind, payload,
                            delay_s=self._media_delay(to))
         self._remember(to)
 

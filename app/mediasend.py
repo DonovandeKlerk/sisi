@@ -201,14 +201,9 @@ def send_media_deferred(shop_id: str, channel: str, kind: str, url: str,
     try:
         CURRENT_LANG.set(owner_lang(conn, shop_id))
         if sender is None:
-            if (channel or "meta") == "vonage":
-                from app.vonage import VonageSender
+            from app.providers import sender_for_channel
 
-                sender = VonageSender()
-            else:
-                from app.whatsapp import get_sender
-
-                sender = get_sender()
+            sender = sender_for_channel(channel)
         log.info("media worker to=%s kind=%s delay=%.0fs url=%s", shop_id,
                  kind, delay_s, url)
         if delay_s > 0:

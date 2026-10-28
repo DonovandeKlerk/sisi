@@ -25,6 +25,9 @@ from app.i18n import t as _t
 from app.vision import VisionError
 from app.voice import VoiceError
 from app.vonage import VonageSender, download_vonage_media, parse_vonage_webhook
+from app.infobip import (InfobipSender, download_infobip_media,
+                         parse_infobip_webhook)
+from app.providers import sender_for_channel
 from app.whatsapp import (
     FakeSender,
     IncomingMessage,
@@ -158,6 +161,69 @@ async def webhook_vonage_status():
     return {"status": "ok"}
 
 
+@app.post("/webhook/infobip/dlr")
+async def webhook_infobip_dlr(request: Request):
+    """Delivery reports: logged for ops, always 200 (never retry-triggering).
+
+    Declared before the token route below so /dlr is not swallowed by {token}.
+    """
+    try:
+        payload = json.loads(await request.body() or b"{}")
+    except ValueError:
+        return {"status": "ignored"}
+    try:
+        results = payload.get("results", []) if isinstance(payload, dict) else []
+        if isinstance(results, list):
+            for r in results:
+                if not isinstance(r, dict):
+                    continue
+                status = r.get("status") or {}
+                name = status.get("name") if isinstance(status, dict) else status
+                log.info("infobip dlr id=%s to=%s status=%s", r.get("messageId"),
+                         r.get("to"), name)
+    except Exception:
+        log.warning("infobip dlr parse failed", exc_info=True)
+    return {"status": "ok"}
+
+
+@app.post("/webhook/infobip/{token}")
+async def webhook_infobip_receive(request: Request,
+                                  background_tasks: BackgroundTasks,
+                                  token: str):
+    # Infobip signs nothing on sender "Forward to HTTP" posts, so auth is a
+    # shared secret embedded in the configured URL path:
+    #   https://<app>/webhook/infobip/<INFOBIP_WEBHOOK_TOKEN>
+    # compared in constant time. Fails closed when unconfigured. The handler
+    # returns 200 instantly (dispatch is async) so Infobip never retries a
+    # receipt; redelivery is still safe via the messages_seen messageId key.
+    expected = os.environ.get("INFOBIP_WEBHOOK_TOKEN", "")
+    if not expected or not hmac.compare_digest(token, expected):
+        raise HTTPException(status_code=403, detail="bad webhook token")
+    raw = await request.body()
+    if len(raw) > MAX_WEBHOOK_BYTES:
+        raise HTTPException(status_code=413, detail="payload too large")
+    try:
+        payload = json.loads(raw or b"{}")
+    except ValueError:
+        return {"status": "ignored"}
+    msgs = parse_infobip_webhook(payload)
+    if not msgs:
+        log.warning("infobip inbound dropped: no messages keys=%s",
+                    sorted(payload.keys()) if isinstance(payload, dict) else "?")
+    for msg in msgs:
+        log.info("infobip inbound id=%s from=%s type=%s", msg.message_id,
+                 msg.shop_id, msg.kind)
+        if _rate_limited(msg.shop_id):
+            log.warning("rate-limited %s", msg.shop_id)
+            continue
+        try:
+            InfobipSender().mark_read(msg.message_id)
+        except Exception:
+            log.warning("mark-read failed", exc_info=True)
+        _dispatch(background_tasks, msg)
+    return {"status": "ok"}
+
+
 def _already_seen(message_id: str, shop_id: str) -> bool:
     conn = connect()
     try:
@@ -187,8 +253,10 @@ def _with_consent(conn, shop_id: str, reply: str) -> str:
 
 
 def _download_msg_media(msg: IncomingMessage, label: str) -> bytes | None:
-    """Fetch message media for either channel. None when the message has no media ref."""
+    """Fetch message media for any channel. None when the message has no media ref."""
     if msg.media_url:
+        if (msg.channel or "meta") == "infobip":
+            return download_infobip_media(msg.media_url)
         return download_vonage_media(msg.media_url)
     if msg.media_id:
         return download_media(msg.media_id, label)
@@ -226,7 +294,7 @@ def process_message(msg: IncomingMessage) -> None:
         if _already_seen(msg.message_id, msg.shop_id):
             log.info("duplicate %s ignored", msg.message_id)
             return
-        sender = VonageSender() if msg.channel == "vonage" else get_sender()
+        sender = sender_for_channel(msg.channel or "meta")
         try:
             _handle_message(sender, msg)
         except Exception:
@@ -321,7 +389,7 @@ def serve_media(token: str, f: str = "png"):
     """Serve a report PNG/PDF by its unguessable token (?f=png|pdf or .suffix).
 
     Bytes come from the shared Dict first (cross-container safe), then the
-    shared Volume path; no auth so Vonage and owners can fetch them.
+    shared Volume path; no auth so providers and owners can fetch them.
     """
     from app.reports import get_report_by_token, media_get, refresh_media
     from app.reports import row_file_for

@@ -96,16 +96,14 @@ def every_minute():
     import logging
     _use_volume()
     from app.db import connect, init_db
+    from app.providers import sender_for_channel
     from app.reminders import send_due
     from app.sendqueue import drain_all
-    from app.vonage import VonageSender
-    from app.whatsapp import get_sender
     conn = connect()
     try:
         init_db(conn)
         for rid in send_due(conn):
             logging.getLogger("sisi").info("reminder %s fired", rid)
-        drain_all(conn, lambda channel: VonageSender()
-                  if channel == "vonage" else get_sender())
+        drain_all(conn, sender_for_channel)
     finally:
         conn.close()
