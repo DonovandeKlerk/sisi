@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import calendar
+import logging
 import math
 import os
 import secrets
@@ -15,6 +16,8 @@ from app.i18n import acct_name as _acct_name
 from app.i18n import cat_name as _cat_name
 from app.i18n import doc_lang, month_year as _month_year, owner_lang
 from app.i18n import t as _t
+
+log = logging.getLogger("sisi.reports")
 
 # Sisi brand theme (theme-factory custom): warm South African spaza feel —
 # deep till-green, marigold accent, cream paper, dark ink.
@@ -65,6 +68,40 @@ def ensure_dirs() -> None:
     for d in (_reports_dir(), _logos_dir(), _reports_dir() / "receipts",
               _reports_dir() / "statements"):
         d.mkdir(parents=True, exist_ok=True)
+
+
+def persist_media() -> None:
+    """Publish generated files + DB rows so other containers can serve them.
+
+    On Modal the worker that renders a card/PDF is not the web container
+    that serves /media/<id>; commit the shared volume after writing.
+    No-op unless SISI_MEDIA_VOLUME names the volume (Modal only).
+    Never raises: a failed commit must not break sending (logged instead).
+    """
+    name = os.environ.get("SISI_MEDIA_VOLUME", "")
+    if not name:
+        return
+    try:
+        import modal
+        modal.Volume.from_name(name).commit()
+    except Exception:
+        log.warning("media volume commit failed", exc_info=True)
+
+
+def refresh_media() -> None:
+    """Reload the shared volume before serving /media (cross-container reads).
+
+    Picks up files + DB rows committed by worker containers since this
+    container's snapshot. No-op unless SISI_MEDIA_VOLUME is set. Never raises.
+    """
+    name = os.environ.get("SISI_MEDIA_VOLUME", "")
+    if not name:
+        return
+    try:
+        import modal
+        modal.Volume.from_name(name).reload()
+    except Exception:
+        log.warning("media volume reload failed", exc_info=True)
 
 
 

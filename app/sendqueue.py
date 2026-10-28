@@ -22,10 +22,10 @@ import httpx
 
 log = logging.getLogger("sisi.sendqueue")
 
-PACE_S = 1.2
+PACE_S = 1.5
 BACKOFF_S = (2.0, 4.0, 8.0, 16.0)  # sums to 30s
 DRAIN_BUDGET_S = 40.0  # covers the 30s backoff plus pacing drift
-MEDIA_FALLBACK = "⚠️ Couldn't send the picture, reply 'resend' to try again"
+MEDIA_FALLBACK = "Couldn't send the PDF/card, reply 'resend' to try again"
 
 
 def _fallback_text() -> str:
@@ -51,15 +51,28 @@ def _retry_after_s(response) -> float | None:
 
 def enqueue(conn: sqlite3.Connection, to: str, channel: str, kind: str,
             payload: dict, commit: bool = True) -> int:
-    """Queue one outbound message. kind: text | buttons | image | file."""
-    cur = conn.execute(
-        "INSERT INTO send_queue (to_number, channel, kind, payload_json)"
-        " VALUES (?, ?, ?, ?)",
-        (to, channel or "", kind, json.dumps(payload or {})),
-    )
+    """Queue one outbound message. kind: text | buttons | image | file.
+
+    Long texts split into ≤1500-char rows up front, so every HTTP send —
+    not just every row — leaves the per-number gap (pieces that still fit
+    together re-merge at drain time). Returns the last row id.
+    """
+    from app.whatsapp import split_message
+    payload = dict(payload or {})
+    bodies = split_message(payload.get("body", "")) if kind == "text" else []
+    chunks = bodies or [None]
+    row_id = -1
+    for body in chunks:
+        chunk = dict(payload, body=body) if body is not None else payload
+        cur = conn.execute(
+            "INSERT INTO send_queue (to_number, channel, kind, payload_json)"
+            " VALUES (?, ?, ?, ?)",
+            (to, channel or "", kind, json.dumps(chunk)),
+        )
+        row_id = cur.lastrowid
     if commit:
         conn.commit()
-    return cur.lastrowid
+    return row_id
 
 
 def _head(conn: sqlite3.Connection, to: str, now: float):
@@ -142,12 +155,14 @@ def check_media(url: str, kind: str, timeout: float = 5.0) -> tuple[bool, str]:
 
 
 def _send_claimed(sender, kind: str, payload: dict, to: str) -> None:
+    from app.reports import persist_media
     if kind == "text":
         sender.send_text(to, payload.get("body", ""))
     elif kind == "buttons":
         sender.send_buttons(to, payload.get("body", ""),
                             payload.get("buttons", []))
     elif kind == "image":
+        persist_media()  # publish the file + DB row before Vonage fetches it
         ok, detail = check_media(payload.get("url", ""), "image")
         log.info("media check image %s -> %s (%s)", payload.get("url", ""),
                  "ok" if ok else "BAD", detail)
@@ -157,6 +172,7 @@ def _send_claimed(sender, kind: str, payload: dict, to: str) -> None:
         sender.send_image(to, payload.get("url", ""),
                           payload.get("caption", ""))
     elif kind == "file":
+        persist_media()  # publish the file + DB row before Vonage fetches it
         ok, detail = check_media(payload.get("url", ""), "file")
         log.info("media check file %s -> %s (%s)", payload.get("url", ""),
                  "ok" if ok else "BAD", detail)

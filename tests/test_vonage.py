@@ -334,11 +334,12 @@ def test_vonage_status_and_bad_json(vg_env):
     assert bad.status_code == 200 and bad.json() == {"status": "ignored"}
 
 
-def test_mark_read_patch_shape(vg_env):
+def test_mark_read_patch_shape(vg_env, monkeypatch):
+    monkeypatch.setenv("VONAGE_API_BASE", "https://messages.nexmo.com")
     assert VonageSender().mark_read("uuid-9") is True
     assert len(PATCH_CALLS) == 1
     call = PATCH_CALLS[0]
-    assert call["url"] == "https://messages-sandbox.nexmo.com/v1/messages/uuid-9"
+    assert call["url"] == "https://messages.nexmo.com/v1/messages/uuid-9"
     assert call["json"] == {"status": "read",
                             "replying_indicator": {"show": "true", "type": "text"}}
 
@@ -347,5 +348,11 @@ def test_mark_read_failure_is_silent(vg_env, monkeypatch):
     def _boom(url, **kw):
         raise RuntimeError("nope")
 
+    monkeypatch.setenv("VONAGE_API_BASE", "https://messages.nexmo.com")
     monkeypatch.setattr(vonage.httpx, "patch", _boom)
     assert VonageSender().mark_read("uuid-9") is False
+
+
+def test_mark_read_skipped_on_sandbox(vg_env):
+    assert VonageSender().mark_read("uuid-9") is False
+    assert PATCH_CALLS == []

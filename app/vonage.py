@@ -130,6 +130,8 @@ class VonageSender(WhatsAppSender):
             return False
         base = os.environ.get("VONAGE_API_BASE",
                               "https://messages-sandbox.nexmo.com").rstrip("/")
+        if "sandbox" in base:
+            return False  # sandbox has no mark-read endpoint (always 404s)
         try:
             resp = httpx.patch(f"{base}/v1/messages/{message_id}",
                                auth=(self.api_key, self.api_secret),

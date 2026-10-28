@@ -57,7 +57,7 @@ def test_order_and_pacing(conn, clock):
     assert stats == {"sent": 3, "rate_limited": False, "failed": 0}
     kinds = [m["type"] for m in sender.pop_shop(SHOP)]
     assert kinds == ["buttons", "text", "image"]
-    assert clock.sleeps == [1.2, 1.2]
+    assert clock.sleeps == [1.5, 1.5]
     assert _queued(conn) == []
 
 

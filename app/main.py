@@ -312,8 +312,9 @@ def _handle_message(sender, msg: IncomingMessage) -> None:
 @app.get("/media/{token}")
 def serve_media(token: str, f: str = "png"):
     """Serve a month-end PDF/PNG by its unguessable per-report token (?f=pdf|png)."""
-    from app.reports import get_report_by_token
+    from app.reports import get_report_by_token, refresh_media
 
+    refresh_media()  # pick up files committed by worker containers first
     if f not in ("png", "pdf"):
         raise HTTPException(status_code=404, detail="not found")
     conn = connect()
