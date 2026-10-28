@@ -3063,7 +3063,9 @@ def customer_statement(conn: sqlite3.Connection, shop_id: str, customer: str) ->
                 total=cents_to_rand(data['total']), tail=tail)
 
 
-def statements_for_all(conn: sqlite3.Connection, shop_id: str) -> str:
+def statements_for_customers(conn: sqlite3.Connection, shop_id: str,
+                             ids: list[int], head: str) -> str:
+    """One statement card (all pages) per customer id, queued in order."""
     blocked = _staff_blocked()
     if blocked:
         return blocked
@@ -3071,27 +3073,63 @@ def statements_for_all(conn: sqlite3.Connection, shop_id: str) -> str:
 
     from app import reports as _reports
     ensure_shop(conn, shop_id)
-    rows = conn.execute(
-        "SELECT c.id, c.name, MIN(e.created_at) first FROM customers c"
-        " JOIN credit_entries e ON e.customer_id = c.id AND e.reversed = 0"
-        " WHERE c.shop_id = ? GROUP BY c.id ORDER BY first",
-        (shop_id,)).fetchall()
+    by_id = {r["id"]: r["name"] for r in conn.execute(
+        "SELECT id, name FROM customers WHERE shop_id = ?", (shop_id,))}
     made = []
     brand = _reports.shop_brand(conn, shop_id)
     _reports.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     base = _os.environ.get("SISI_PUBLIC_URL", "").rstrip("/")
-    for r in rows:
-        lang = statement_lang(conn, shop_id, r["id"])
+    for cid in ids:
+        if cid not in by_id:
+            continue
+        lang = statement_lang(conn, shop_id, cid)
         with _doc_lang(lang):
-            data = _reports.statement_data(conn, shop_id, r["name"])
+            data = _reports.statement_data(conn, shop_id, by_id[cid])
         if data is None or data["total"] <= 0:
             continue
         _queue_statement(conn, shop_id, data, brand, base, lang)
-        made.append(_t("stmts_line", name=data['name'], total=cents_to_rand(data['total'])))
+        made.append(_t("stmts_line", name=data['name'],
+                       total=cents_to_rand(data['total'])))
     if not made:
         return _t("debt_clean")
     tail = _t("stmts_tail_each") if base else _t("stmts_tail_file")
-    return _t("stmts_head") + "\n" + "\n".join(made) + "\n\n" + tail
+    return head + "\n" + "\n".join(made) + "\n\n" + tail
+
+
+def statements_for_all(conn: sqlite3.Connection, shop_id: str) -> str:
+    ensure_shop(conn, shop_id)
+    rows = conn.execute(
+        "SELECT c.id, MIN(e.created_at) first FROM customers c"
+        " JOIN credit_entries e ON e.customer_id = c.id AND e.reversed = 0"
+        " WHERE c.shop_id = ? GROUP BY c.id ORDER BY first",
+        (shop_id,)).fetchall()
+    return statements_for_customers(conn, shop_id, [r["id"] for r in rows],
+                                    _t("stmts_head"))
+
+
+def statements_top_n(conn: sqlite3.Connection, shop_id: str, n: int) -> str:
+    """Statements for the top N debtors by balance (highest first)."""
+    ensure_shop(conn, shop_id)
+    rows = conn.execute("SELECT id FROM customers WHERE shop_id = ?",
+                        (shop_id,)).fetchall()
+    owed = [(balance_cents(conn, shop_id, r["id"]), r["id"]) for r in rows]
+    owed = [(b, i) for b, i in owed if b > 0]
+    owed.sort(reverse=True)
+    return statements_for_customers(conn, shop_id,
+                                    [i for _, i in owed[:max(n, 0)]],
+                                    _t("stmts_head_n", n=n))
+
+
+def statements_named(conn: sqlite3.Connection, shop_id: str,
+                     names: list[str]) -> str:
+    """Statements for explicitly named customers, in the order named."""
+    ensure_shop(conn, shop_id)
+    rows = conn.execute("SELECT id, name FROM customers WHERE shop_id = ?",
+                        (shop_id,)).fetchall()
+    by_name = {r["name"].strip().lower(): r["id"] for r in rows}
+    ids = [by_name[n.strip().lower()] for n in names if n.strip().lower() in by_name]
+    return statements_for_customers(conn, shop_id, ids,
+                                    _t("stmts_head_some"))
 
 
 def resend_last_media(conn: sqlite3.Connection, shop_id: str) -> str:

@@ -818,23 +818,82 @@ def _hex(h: str) -> tuple[int, int, int]:
     return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
 
 
+LOGO_BOX = 160  # square reserved for the logo, right side of the header
+LOGO_PAD = 16  # gap between text and the logo box
+
+
+def _wrap_lines(dr, text: str, font, max_w: float, max_lines: int) -> list[str]:
+    """Greedy word wrap; overlong tail is ellipsized on the last line."""
+    words = (text or "").split()
+    lines: list[str] = []
+    for word in words:
+        if lines and dr.textlength(f"{lines[-1]} {word}", font=font) <= max_w:
+            lines[-1] = f"{lines[-1]} {word}"
+        else:
+            lines.append(word)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        while lines and dr.textlength(lines[-1] + "…", font=font) > max_w:
+            lines[-1] = lines[-1][:-1]
+        lines[-1] = (lines[-1] + "…") if lines else "…"
+    return lines or [""]
+
+
+def _header_text_lines(brand: dict, doc_title: str, date_str: str, W: int,
+                       dr) -> tuple[list[dict], int]:
+    """Header text laid out left of the reserved logo box.
+
+    Returns ([{x, y, text, font, fill}], logo_box_left). No line extends
+    past logo_box_left - LOGO_PAD, so text can never run under the logo.
+    """
+    box_left = W - 60 - LOGO_BOX
+    max_w = (box_left - LOGO_PAD - 60) if brand["logo"] else (W - 120)
+    name_font = _card_font(64)
+    if dr.textlength(brand["name"], font=name_font) > max_w:
+        name_font = _card_font(52)
+    lines: list[dict] = []
+    y = 50
+    for row in _wrap_lines(dr, brand["name"], name_font, max_w, 2):
+        lines.append({"x": 60, "y": y, "text": row, "font": name_font,
+                      "fill": "white"})
+        y += name_font.size + 11
+    contact = " · ".join(p for p in (brand["address"], brand["phone"]) if p)
+    if contact:
+        cfont = _card_font(36)
+        for row in _wrap_lines(dr, contact, cfont, max_w, 2):
+            lines.append({"x": 60, "y": y, "text": row, "font": cfont,
+                          "fill": "white"})
+            y += 44
+    tfont = _card_font(44)
+    title = f"{doc_title} · {date_str}"
+    for size in (44, 36, 30):
+        tfont = _card_font(size)
+        if dr.textlength(title, font=tfont) <= max_w:
+            break
+    else:
+        while title and dr.textlength(title + "…", font=tfont) > max_w:
+            title = title[:-1]
+        title += "…"
+    lines.append({"x": 60, "y": y, "text": title, "font": tfont,
+                  "fill": "#FDE68A"})
+    return lines, box_left
+
+
 def _png_brand_header(img, brand: dict, doc_title: str, date_str: str,
                       height: int = 300) -> int:
     """Shared green header: logo, shop name, contact, doc title. Returns y."""
     from PIL import ImageDraw
     W = img.width
     dr = ImageDraw.Draw(img)
+    lines, box_left = _header_text_lines(brand, doc_title, date_str, W, dr)
+    bottom = max(l["y"] + l["font"].size + 11 for l in lines)
+    height = max(height, bottom + 30)
     dr.rectangle([0, 0, W, height], fill=_hex(SISI["primary"]))
     dr.rectangle([0, height, W, height + 16], fill=_hex(SISI["accent"]))
-    _paste_logo(img, brand["logo"], (W - 220, 60, 160))
-    dr.text((60, 50), brand["name"], font=_card_font(64), fill="white")
-    contact = " · ".join(p for p in (brand["address"], brand["phone"]) if p)
-    y = 140
-    if contact:
-        dr.text((60, y), contact[:60], font=_card_font(36), fill="white")
-        y += 60
-    dr.text((60, y), f"{doc_title} · {date_str}", font=_card_font(44),
-            fill="#FDE68A")
+    _paste_logo(img, brand["logo"], (box_left, 60, LOGO_BOX))
+    for line in lines:
+        dr.text((line["x"], line["y"]), line["text"], font=line["font"],
+                fill=line["fill"])
     return height + 60
 
 

@@ -18,11 +18,14 @@ import logging
 log = logging.getLogger("sisi.logo")
 
 SOLID_TOL = 36.0  # max RGB distance from the background colour
+SOLID_TOL_LOOSE = 60.0  # second attempt: textured backdrops (dark slate…)
 SOLID_BORDER_FRAC = 0.85  # border pixels that must match it
 KEPT_MIN = 0.15  # quality gate: fraction of pixels kept
 KEPT_MAX = 0.95
 CORE_FRAC = 1 / 3  # centre box used by the not-cut check
 CORE_MIN = 0.15  # min opaque fraction inside that box
+EDGE_TOUCH_PX = 2  # opaque this close to the image edge counts as touching
+KEPT_BLEED_OK = 0.60  # full-bleed designs may legitimately touch the edge
 
 
 def remove_bg(image_bytes: bytes) -> bytes | None:
@@ -67,10 +70,32 @@ def _core_intact(img) -> bool:
     return (sum(hist[128:]) / total) >= CORE_MIN if total else False
 
 
-def _passes(img) -> tuple[bool, float]:
-    """Quality gate: keeps 15-95% of pixels and the core is not cut."""
+def _touches_edge(img) -> bool:
+    """True when solid pixels reach the image edge (leftover background)."""
+    solid = img.getchannel("A").point(lambda v: 255 if v >= 128 else 0)
+    bbox = solid.getbbox()
+    if not bbox:
+        return False
+    w, h = img.size
+    return (bbox[0] <= EDGE_TOUCH_PX or bbox[1] <= EDGE_TOUCH_PX
+            or bbox[2] >= w - 1 - EDGE_TOUCH_PX
+            or bbox[3] >= h - 1 - EDGE_TOUCH_PX)
+
+
+def _passes(img) -> tuple[bool, float, str]:
+    """Quality gate: keeps 15-95%, core not cut, no edge-touching leftovers.
+
+    Full-bleed designs (kept >= 60%) may touch the edge legitimately.
+    Returns (ok, kept, reason-when-rejected).
+    """
     kept = _alpha_coverage(img)
-    return (KEPT_MIN <= kept <= KEPT_MAX and _core_intact(img)), kept
+    if not KEPT_MIN <= kept <= KEPT_MAX:
+        return False, kept, f"kept {kept:.0%} outside 15-95%"
+    if not _core_intact(img):
+        return False, kept, "logo core cut through"
+    if kept < KEPT_BLEED_OK and _touches_edge(img):
+        return False, kept, "cut touches image edge (leftover background)"
+    return True, kept, ""
 
 
 def trim_transparent(img):
@@ -85,15 +110,13 @@ def _dist(a: tuple, b: tuple) -> float:
     return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2) ** 0.5
 
 
-def solid_bg_cutout(img):
+def solid_bg_cutout(img, tol: float = SOLID_TOL):
     """Remove a near-solid background, or None when the border is mixed.
 
     Samples every border pixel; when one colour dominates (white, black,
     or a coloured square), flood-fills it away from the edges with a 1px
     feather. Interior regions of the same colour are left alone.
     """
-    from collections import Counter
-
     from PIL import Image, ImageDraw, ImageFilter
 
     rgb = img.convert("RGB")
@@ -104,10 +127,11 @@ def solid_bg_cutout(img):
     border = ([px[x, 0] for x in range(w)] + [px[x, h - 1] for x in range(w)]
               + [px[0, y] for y in range(1, h - 1)]
               + [px[w - 1, y] for y in range(1, h - 1)])
-    quant = Counter((c[0] >> 3, c[1] >> 3, c[2] >> 3) for c in border)
-    (qr, qg, qb), _ = quant.most_common(1)[0]
-    bg = (qr << 3 | 4, qg << 3 | 4, qb << 3 | 4)
-    near = sum(1 for c in border if _dist(c, bg) <= SOLID_TOL)
+    mid = len(border) // 2
+    bg = (sorted(c[0] for c in border)[mid],
+          sorted(c[1] for c in border)[mid],
+          sorted(c[2] for c in border)[mid])
+    near = sum(1 for c in border if _dist(c, bg) <= tol)
     if near / len(border) < SOLID_BORDER_FRAC:
         return None
     base_alpha = img.getchannel("A") if img.mode == "RGBA" else None
@@ -118,8 +142,9 @@ def solid_bg_cutout(img):
         for x in range(w):
             if apix is not None and apix[x, y] <= 128:
                 continue  # already transparent; output keeps source alpha
-            if _dist(px[x, y], bg) <= SOLID_TOL:
+            if _dist(px[x, y], bg) <= tol:
                 wpix[x, y] = 0
+    work = work.filter(ImageFilter.MedianFilter(3))  # kill speckle noise
     seeds = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1),
              (w // 2, 0), (w // 2, h - 1), (0, h // 2), (w - 1, h // 2)]
     for s in seeds:
@@ -155,33 +180,33 @@ def process_upload(image_bytes: bytes, max_side: int = 512) -> dict:
     method = "badge"
     kept = 1.0
     reason = ""
-    solid = None
-    try:
-        solid = solid_bg_cutout(img)
-    except Exception:
-        solid = None
-    if solid is not None:
-        ok, kept = _passes(solid)
+    for tol in (SOLID_TOL, SOLID_TOL_LOOSE):
+        try:
+            solid = solid_bg_cutout(img, tol)
+        except Exception:
+            solid = None
+        if solid is None:
+            reason = "no solid background"
+            continue
+        ok, kept, why = _passes(solid)
         if ok:
             cutout, method = trim_transparent(solid), "solid"
-        else:
-            reason = f"solid cut failed quality (kept {kept:.0%})"
-    else:
-        reason = "no solid background"
+            reason = ""
+            break
+        reason = f"solid cut failed quality ({why})"
     if cutout is None:
         rem = remove_bg(image_bytes)
         if rem:
             try:
                 candidate = Image.open(io.BytesIO(rem)).convert("RGBA")
                 candidate.thumbnail((max_side * 2, max_side * 2))
-                ok, kept = _passes(candidate)
+                ok, kept, why = _passes(candidate)
                 if ok:
                     cutout, method = trim_transparent(candidate), "rembg"
                     reason = ""
                 else:
-                    reason = (f"{reason}; rembg failed quality"
-                              f" (kept {kept:.0%})" if reason else
-                              f"rembg failed quality (kept {kept:.0%})")
+                    bit = f"rembg failed quality ({why})"
+                    reason = f"{reason}; {bit}" if reason else bit
             except Exception:
                 reason = f"{reason}; rembg output unreadable" if reason \
                     else "rembg output unreadable"

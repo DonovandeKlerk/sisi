@@ -73,6 +73,8 @@ from app.tools import (
     set_nudge,
     who_recorded_today,
     statements_for_all,
+    statements_named,
+    statements_top_n,
     send_order,
     set_shop_address,
     set_shop_name,
@@ -264,12 +266,19 @@ def slow_status(text: str) -> str | None:
     return None
 
 
-_STATEMENT_TRIGGERS = ("statement", "isitatimende", "sitatimende", "receipt",
+_STATEMENT_TRIGGERS = ("statement", "isitatimende", "sitatimende",
+                       "itatimende", "receipt",
                        "irisithi", "risithi", "iresithi", "slip",
                        "staat", "strokie", "afskrif", "istatimenti",
                        "isiliphu",
                        "something to send", "to send to", "send it to",
                        "send this to", "make a picture", "picture for")
+
+_DEBTOR_WORDS = ("debtor", "creditor", "abakwelet", "debiteure", "abatyali",
+                 "skuldenaar")
+_ALL_WORDS = ("all", "everyone", "bonke", "alle", "almal")
+_OWE_WORDS = ("owe", "owes", "owing", "owed", "abakwelet", "abatyala",
+              "tyala", "skuld", "skoloto", "etyala")
 
 
 def _customer_in_text(word: str, names: list[str]) -> str | None:
@@ -280,6 +289,61 @@ def _customer_in_text(word: str, names: list[str]) -> str | None:
         if re.search(rf"\b(?:sika|ka|owa|wa)?{re.escape(name.strip().lower())}\b",
                      word):
             return name
+    return None
+
+
+def _has_statement_word(word: str) -> bool:
+    if any(t in word for t in _STATEMENT_TRIGGERS):
+        return True
+    return re.search(r"\bstate\b", word) is not None  # Afrikaans plural
+
+
+def _customers_in_text(word: str, names: list[str]) -> list[str]:
+    """Every roster name mentioned, in the order mentioned (Nguni prefixes ok)."""
+    found: list[tuple[int, str]] = []
+    for name in names:
+        clean = name.strip()
+        if not clean:
+            continue
+        m = re.search(r"\b(?:sika|zika|ka|owa|wa|no|na|u|o)?"
+                      + re.escape(clean.lower()) + r"\b", word)
+        if m:
+            found.append((m.start(), name))
+    found.sort()
+    return [name for _, name in found]
+
+
+_CUST_STMT_WORDS = ("statement", "isitatimende", "sitatimende",
+                    "itatimende", "istatimenti", "staat", "strokie", "afskrif")
+
+
+def try_multi_statement_request(conn: sqlite3.Connection, shop_id: str,
+                                text: str) -> str | None:
+    """Top-N / all-debtors / named-list statement requests. None otherwise."""
+    word = _normalize(text or "")
+    if not _has_statement_word(word):
+        return None
+    if "this month" in word and "statement" not in word:
+        return None  # 'show my receipts this month' is the receipts list
+    if re.search(r"\b(paid|payment|khokha|settled?|ibhadalile|betaal|hlawul\w*)\b",
+                 word):
+        return None  # payment recordings belong to the credit flow
+    names = [r["name"] for r in conn.execute(
+        "SELECT name FROM customers WHERE shop_id = ?", (shop_id,)).fetchall()]
+    hits = _customers_in_text(word, names)
+    if len(hits) >= 2:
+        return statements_named(conn, shop_id, hits)
+    num = re.search(r"\d+", word)
+    if num and any(d in word for d in _DEBTOR_WORDS):
+        return statements_top_n(conn, shop_id, int(num.group()))
+    if (any(re.search(rf"\b{a}\b", word) for a in _ALL_WORDS)
+            and (not hits or any(d in word for d in _DEBTOR_WORDS)
+                 or any(o in word for o in _OWE_WORDS))
+            and (any(c in word for c in _CUST_STMT_WORDS)
+                 or re.search(r"\bstate\b", word) is not None
+                 or any(d in word for d in _DEBTOR_WORDS)
+                 or any(o in word for o in _OWE_WORDS))):
+        return statements_for_all(conn, shop_id)
     return None
 
 
@@ -397,6 +461,9 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
         return who_recorded_today(conn, shop_id), None
     if word == "float" or word.startswith("float "):
         return set_float(conn, shop_id, _parse_float(word)), None
+    multi = try_multi_statement_request(conn, shop_id, text)
+    if multi is not None:
+        return multi, None
     statement = try_statement_request(conn, shop_id, text)
     if statement is not None:
         return statement, None

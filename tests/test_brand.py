@@ -4,6 +4,7 @@ import io
 
 import pytest
 
+from app import logo as logo_mod
 from app import reports
 from app.agent import LAST_PHOTO, MEDIA_OUTBOX, handle_photo, handle_text
 from app.tools import delete_my_data, ensure_shop, set_shop_address, set_shop_name, set_shop_phone
@@ -35,6 +36,7 @@ def _dirs(tmp_path, monkeypatch):
     monkeypatch.setattr(reports, "REPORTS_DIR", tmp_path / "reports")
     monkeypatch.setattr(reports, "LOGOS_DIR", tmp_path / "logos")
     monkeypatch.delenv("SISI_PUBLIC_URL", raising=False)
+    monkeypatch.setattr(logo_mod, "remove_bg", lambda b: None)
     MEDIA_OUTBOX.clear()
     LAST_PHOTO.clear()
 

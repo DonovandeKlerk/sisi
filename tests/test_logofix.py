@@ -100,6 +100,36 @@ def test_dark_square_logo_loses_the_square(monkeypatch):
     assert cut.getpixel((cx, cy))[3] == 255  # inner design kept
 
 
+def _textured_dark_logo():
+    import random
+    from PIL import Image, ImageDraw
+    rng = random.Random(7)
+    img = Image.new("RGB", (200, 200), (20, 20, 20))
+    px = img.load()
+    for x in range(200):
+        for y in range(200):
+            n = rng.randint(-30, 30)
+            px[x, y] = (20 + n, 20 + n, 20 + n)
+    d = ImageDraw.Draw(img)
+    d.ellipse([45, 45, 155, 155], fill=(176, 112, 48))
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def test_textured_dark_bg_uses_loose_tier(monkeypatch):
+    from PIL import Image
+    monkeypatch.setattr(logo_mod, "remove_bg", lambda b: None)
+    assert logo_mod.solid_bg_cutout(
+        Image.open(io.BytesIO(_textured_dark_logo())).convert("RGBA"),
+        logo_mod.SOLID_TOL) is None  # strict tier rejects the texture
+    done = logo_mod.process_upload(_textured_dark_logo())
+    assert done["method"] == "solid"
+    assert done["used_cutout"]
+    cut = Image.open(io.BytesIO(done["cutout"]))
+    assert cut.getpixel((1, 1))[3] == 0
+
+
 def test_white_bg_logo_is_cut(monkeypatch):
     from PIL import Image
     monkeypatch.setattr(logo_mod, "remove_bg", lambda b: None)
