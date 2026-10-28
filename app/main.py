@@ -16,7 +16,7 @@ import time
 import traceback
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse, Response
 
 from app.agent import handle_photo, handle_text, handle_voice, take_media
 from app.db import connect, init_db, now_iso
@@ -317,10 +317,11 @@ def _handle_message(sender, msg: IncomingMessage) -> None:
 def serve_media(token: str, f: str = "png"):
     """Serve a report PNG/PDF by its unguessable token (?f=png|pdf or .suffix).
 
-    Files live on the shared Volume (never expire, so links and old
-    reports keep working); no auth so Vonage and owners can fetch them.
+    Bytes come from the shared Dict first (cross-container safe), then the
+    shared Volume path; no auth so Vonage and owners can fetch them.
     """
-    from app.reports import get_report_by_token, refresh_media
+    from app.reports import get_report_by_token, media_get, refresh_media
+    from app.reports import row_file_for
 
     refresh_media()  # pick up files committed by worker containers first
     if "." in token:
@@ -330,18 +331,23 @@ def serve_media(token: str, f: str = "png"):
         f = suffix
     if f not in ("png", "pdf"):
         raise HTTPException(status_code=404, detail="not found")
+    media = "application/pdf" if f == "pdf" else "image/png"
+    entry = media_get(token)
+    if entry and entry.get(f):
+        log.info("media dict hit token=%s", token)
+        return Response(entry[f], media_type=media, headers={
+            "Content-Disposition":
+                f"attachment; filename=\"{entry.get('name') or f'{token}.{f}'}\""})
     conn = connect()
     try:
         init_db(conn)
         row = get_report_by_token(conn, token)
     finally:
         conn.close()
-    if row is None:
+    path = row_file_for(row, f) if row is not None else ""
+    if not path or not os.path.exists(path):
+        log.warning("media miss token=%s", token)
         raise HTTPException(status_code=404, detail="not found")
-    path = row["pdf_path"] if f == "pdf" else row["png_path"]
-    if not path:
-        raise HTTPException(status_code=404, detail="not found")
-    media = "application/pdf" if f == "pdf" else "image/png"
     return FileResponse(path, media_type=media,
                         filename=path.rsplit("/", 1)[-1])
 

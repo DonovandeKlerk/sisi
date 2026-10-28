@@ -66,6 +66,7 @@ def _use_volume() -> None:
     os.environ["SISI_REPORTS"] = "/data/reports"
     os.environ["SISI_LOGOS"] = "/data/logos"
     os.environ["SISI_MEDIA_VOLUME"] = "sisi-data"
+    os.environ["SISI_MEDIA_DICT"] = "sisi-media"
     os.environ["SISI_SEND_LOCK"] = "sisi-sendlock"
     os.environ["SISI_SPAWN"] = "1"
     from app.reports import ensure_dirs

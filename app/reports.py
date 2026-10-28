@@ -104,6 +104,52 @@ def refresh_media() -> None:
         log.warning("media volume reload failed", exc_info=True)
 
 
+def _media_dict():
+    """Shared Dict for media bytes, or None when unconfigured (local/dev)."""
+    name = os.environ.get("SISI_MEDIA_DICT", "")
+    if not name:
+        return None
+    import modal
+    return modal.Dict.from_name(name, create_if_missing=True)
+
+
+def media_put(token: str, files: dict) -> None:
+    """Store media bytes in the shared Dict under token. No-op when local.
+
+    files maps "png"/"pdf" to file paths. Raises when the Dict is
+    configured but the put fails: callers must not print a link or queue
+    a send until this succeeds.
+    """
+    handle = _media_dict()
+    if handle is None:
+        return
+    from datetime import datetime, timezone
+    entry: dict = {"png": None, "pdf": None, "name": "",
+                   "created": datetime.now(timezone.utc).isoformat()}
+    for slot, path in files.items():
+        with open(path, "rb") as f:
+            entry[slot] = f.read()
+        entry["name"] = Path(path).name
+    handle.put(token, entry)
+    log.info("media dict put token=%s slots=%s", token, sorted(files))
+
+
+def media_get(token: str):
+    """Read a Dict media entry. None on miss, when local, or on error."""
+    try:
+        handle = _media_dict()
+    except Exception:
+        log.warning("media dict unavailable", exc_info=True)
+        return None
+    if handle is None:
+        return None
+    try:
+        return handle.get(token)
+    except Exception:
+        log.warning("media dict get failed token=%s", token, exc_info=True)
+        return None
+
+
 
 def shop_brand(conn, shop_id: str) -> dict:
     """Owner-supplied branding for document headers. Never invented."""
@@ -362,6 +408,7 @@ def save_report_files(conn, shop_id: str, month: str) -> dict:
     render_pdf(d, pdf_path, brand)
     render_card(d, png_path, brand)
     token = secrets.token_hex(16)
+    media_put(token, {"pdf": pdf_path, "png": png_path})
     conn.execute(
         "INSERT INTO reports (shop_id, month, pdf_path, png_path, token)"
         " VALUES (?, ?, ?, ?, ?)"
@@ -378,22 +425,40 @@ def get_report(conn, shop_id: str, month: str):
                         (shop_id, month)).fetchone()
 
 
-def store_card(conn, shop_id: str, key: str, png_path: str) -> str:
+def store_card(conn, shop_id: str, key: str, file_path: str) -> str:
     """File a one-off card (profile, statement, snapshot, order) for /media."""
     token = secrets.token_hex(16)
+    slot = "pdf" if str(file_path).lower().endswith(".pdf") else "png"
+    media_put(token, {slot: file_path})
     conn.execute(
         "INSERT INTO reports (shop_id, month, png_path, token)"
         " VALUES (?, ?, ?, ?)"
         " ON CONFLICT (shop_id, month) DO UPDATE SET png_path = excluded.png_path,"
         " token = excluded.token,"
         " created_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
-        (shop_id, key, png_path, token))
+        (shop_id, key, file_path, token))
     conn.commit()
     return token
 
 
 def get_report_by_token(conn, token: str):
     return conn.execute("SELECT * FROM reports WHERE token = ?", (token,)).fetchone()
+
+
+def row_file_for(row, f: str) -> str:
+    """Volume file backing a token for format f (png|pdf). "" when none.
+
+    Statement PDFs are filed in the png_path column, so match by file
+    extension rather than by column.
+    """
+    for col in ("pdf_path", "png_path"):
+        try:
+            path = row[col] or ""
+        except (IndexError, KeyError):
+            path = ""
+        if path and str(path).lower().endswith(f".{f}"):
+            return str(path)
+    return ""
 
 
 def build_month_end(conn, shop_id: str, month: str | None = None,
@@ -415,6 +480,11 @@ def build_month_end(conn, shop_id: str, month: str | None = None,
             save_report_files(conn, shop_id, m)
         row = get_report(conn, shop_id, m)
         reused = False
+    if reused and row:
+        files = {slot: row[f"{slot}_path"] for slot in ("pdf", "png")
+                 if row[f"{slot}_path"]}
+        if files:
+            media_put(row["token"], files)
     text = month_short(conn, shop_id, m)
     if reused:
         text += _t("rep_resend")
