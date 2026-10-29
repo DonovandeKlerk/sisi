@@ -246,7 +246,8 @@ def confirm_pending(conn: sqlite3.Connection, shop_id: str) -> str:
     if payload.get("photo_hash"):
         photo_kind = {"expiry_note": "expiry", "book_page": "book_page",
                       "receipt": "receipt",
-                      "stock_intake": "stock"}.get(row["action_type"], "")
+                      "stock_intake": "stock",
+                      "stock_intake_item": "stock"}.get(row["action_type"], "")
         record_photo(conn, shop_id, payload["photo_hash"], photo_kind)
     conn.execute(
         "INSERT INTO actions (action_id, shop_id, kind, summary, data_json) VALUES (?, ?, ?, ?, ?)",
@@ -1995,8 +1996,9 @@ def _guided_skip_item(conn: sqlite3.Connection, shop_id: str,
         nxt_idx += 1
     skipped = _t("g_skipped", name=name)
     if nxt_idx >= len(items):
+        done = _guided_summary(items)
         clear_intake_session(conn, shop_id)
-        return skipped
+        return f"{skipped}\n{done}"
     session["current"] = nxt_idx
     nxt_item = items[nxt_idx]
     nxt = _guided_next_field(nxt_item)
@@ -2501,6 +2503,158 @@ def propose_intake_item(conn: sqlite3.Connection, shop_id: str,
     return _propose(conn, shop_id, "stock_intake_item", payload,
                     f"{head}\n{_guided_line_detail(item)}\n"
                     f"{_t('g_preview_ask')}")
+
+
+def _guided_qty_bit(item: dict, totals: dict, stock) -> str:
+    """Short qty display for saves and summaries ("x3", "x2 packs (10 singles)")."""
+    unit = (item.get("sell_unit") or "").strip().lower()
+    packs = item.get("packs")
+    if unit in ("singles", "both") and packs and stock is not None:
+        return _t("g_pack_qty", p=_fmt_qty(packs),
+                  unit=item.get("unit") or "packs",
+                  s=_fmt_qty(stock))
+    if stock is None:
+        return ""
+    bit = f"×{_fmt_qty(stock)}"
+    if unit == "pack":
+        word = item.get("unit") or totals.get("pack_name") or ""
+        if word:
+            bit += f" {word}"
+    return bit
+
+
+def _guided_summary(items: list) -> str:
+    """Final intake summary: saved lines (name x qty), skipped, pending counts."""
+    saved = [e for e in items if e.get("state") == "done"]
+    skipped = [e for e in items if e.get("state") == "skipped"]
+    pending = [e for e in items if e.get("state") in (None, "pending")]
+    lines = [_t("g_summary", saved=len(saved), skipped=len(skipped),
+                pending=len(pending))]
+    for entry in saved:
+        totals = guided_pack_totals(entry)
+        qty = _guided_qty_bit(entry, totals, totals["stock_units"])
+        lines.append(f"• {(entry.get('name') or '?').strip()} {qty}".rstrip())
+    for entry in skipped:
+        lines.append(_t("g_skipped", name=(entry.get("name") or "?").strip()))
+    return "\n".join(lines)
+
+
+def _apply_stock_intake_item(conn: sqlite3.Connection, shop_id: str,
+                             payload: dict, action_id: str):
+    """Save one guided item atomically, then advance or summarize.
+
+    Converts the previewed line to an add_stock payload via
+    guided_pack_totals (cost passes through untouched, int-or-float),
+    marks the item done, and appends the next prompt or the final
+    summary. Kind "stock" so undo names the product. Own action_id per
+    item keeps saves and undos per-item and atomic.
+    """
+    item = dict(payload.get("item") or {})
+    try:
+        idx = int(payload.get("idx", 0))
+    except (TypeError, ValueError):
+        idx = 0
+    name = (item.get("name") or "").strip() or "?"
+    totals = guided_pack_totals(item)
+    stock = totals["stock_units"]
+    if stock is None:
+        stock = item.get("qty") or 0  # defensive; propose guarantees qty
+    unit = (item.get("sell_unit") or "").strip().lower()
+    if unit == "whole":
+        unit = "pack"
+    # Shoplist prices are display-only; only stated prices are written.
+    if unit == "pack":
+        stated = item.get("pack_sell_source") == "stated" \
+            or item.get("sell_source") == "stated"
+        price = None
+        pack_price = totals["pack_price_cents"] if stated else None
+    elif unit == "both":
+        price = totals["price_cents"] \
+            if item.get("sell_source") == "stated" else None
+        pack_price = totals["pack_price_cents"] \
+            if item.get("pack_sell_source") == "stated" else None
+    else:
+        price = totals["price_cents"] \
+            if item.get("sell_source") == "stated" else None
+        pack_price = None
+    _msg, _k, _s, undo = _apply_add_stock(conn, shop_id, {
+        "product_id": item.get("product_id"), "name": name,
+        "qty": stock,
+        "wholesaler": payload.get("supplier") or item.get("supplier") or "",
+        "cost_cents": totals["cost_cents"], "price_cents": price,
+        "pack_price_cents": pack_price,
+        "pack_name": totals["pack_name"] or "",
+        "account": "cash"}, action_id)
+    # _apply_add_stock only inserts cost/price for new rows: fill the
+    # pack columns here (same values it wrote for existing rows, so
+    # its old_pack undo stash stays correct; new rows undo by delete).
+    row_fix: dict[str, object] = {}
+    if pack_price is not None:
+        row_fix["pack_price_cents"] = pack_price
+    if unit == "both" and totals["pack_name"] and totals["pack_size"]:
+        prow = conn.execute("SELECT pack_name, pack_size FROM products"
+                            " WHERE id = ?",
+                            (undo["product_id"],)).fetchone()
+        undo["old_pack_name"] = prow["pack_name"] if prow else None
+        undo["old_pack_size"] = prow["pack_size"] if prow else None
+        row_fix["pack_name"] = totals["pack_name"]
+        row_fix["pack_size"] = totals["pack_size"]
+    if row_fix:
+        cols = ", ".join(f"{col} = ?" for col in row_fix)
+        conn.execute(f"UPDATE products SET {cols} WHERE id = ?",
+                     (*row_fix.values(), undo["product_id"]))
+    summary = f"stock {name} +{_fmt_qty(stock)}"
+    saved_line = _t("g_item_saved", name=name,
+                    qty=_guided_qty_bit(item, totals, stock))
+    session = get_intake_session(conn, shop_id)
+    items = (session or {}).get("items_json") or []
+    if session is None or idx != session.get("current") \
+            or idx < 0 or idx >= len(items):
+        # The Yes still stands (this item is saved); only the guided
+        # context is gone, so there is nothing to advance to.
+        return (f"{saved_line}\n{_t('g_no_preview')}", "stock",
+                summary, undo)
+    items[idx]["state"] = "done"
+    nxt_idx = idx + 1
+    while nxt_idx < len(items) and items[nxt_idx].get("state") not in (
+            None, "pending"):
+        nxt_idx += 1
+    if nxt_idx >= len(items):
+        done = _guided_summary(items)
+        clear_intake_session(conn, shop_id)
+        return (f"{saved_line}\n{done}", "stock", summary, undo)
+    session["current"] = nxt_idx
+    nxt = _guided_next_field(items[nxt_idx])
+    session["field"] = nxt
+    save_intake_session(conn, shop_id, session)
+    if nxt is None:
+        return (f"{saved_line}\n"
+                f"{propose_intake_item(conn, shop_id, nxt_idx)}",
+                "stock", summary, undo)
+    head = _t("g_item", i=nxt_idx + 1, n=len(items),
+              name=items[nxt_idx].get("name") or "?")
+    return (f"{saved_line}\n{head}\n"
+            f"{ask_intake_field(items[nxt_idx], nxt)}",
+            "stock", summary, undo)
+
+
+def guided_skip_pending(conn: sqlite3.Connection, shop_id: str) -> str:
+    """No on an item preview: skip that item and carry on (never generic)."""
+    pend = get_pending(conn, shop_id)
+    session = get_intake_session(conn, shop_id)
+    items = (session or {}).get("items_json") or []
+    try:
+        idx = (json.loads(pend["payload_json"]) or {}).get("idx", 0) \
+            if pend is not None else 0
+        idx = int(idx)
+    except (ValueError, TypeError):
+        idx = 0
+    if session is None or pend is None \
+            or pend["action_type"] != "stock_intake_item" \
+            or idx < 0 or idx >= len(items):
+        return cancel_pending(conn, shop_id)
+    session["current"] = idx
+    return _guided_skip_item(conn, shop_id, session)
 
 
 def _guided_set_name(conn: sqlite3.Connection, shop_id: str, item: dict,
@@ -5820,6 +5974,12 @@ def _undo_stock(conn: sqlite3.Connection, shop_id: str, undo: dict, action_id: s
         if "old_pack" in undo:
             sets.append("pack_price_cents = ?")
             params.append(undo["old_pack"])
+        if "old_pack_name" in undo:
+            sets.append("pack_name = ?")
+            params.append(undo["old_pack_name"])
+        if "old_pack_size" in undo:
+            sets.append("pack_size = ?")
+            params.append(undo["old_pack_size"])
         conn.execute(f"UPDATE products SET {', '.join(sets)} WHERE id = ?", (*params, pid))
         return _t("undo_stock", name=name, stock=_fmt_qty(stock))
     conn.execute("DELETE FROM stock_moves WHERE product_id = ?", (pid,))
@@ -6018,6 +6178,7 @@ _APPLIERS = {
     "record_sale": _apply_record_sale,
     "add_stock": _apply_add_stock,
     "stock_intake": _apply_stock_intake,
+    "stock_intake_item": _apply_stock_intake_item,
     "set_price": _apply_set_price,
     "expiry_note": _apply_expiry_note,
     "read_slip": _apply_slip,

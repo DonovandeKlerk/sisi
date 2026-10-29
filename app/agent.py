@@ -55,6 +55,7 @@ from app.tools import (
     edit_order_add,
     edit_order_remove,
     get_order_draft,
+    guided_skip_pending,
     set_float,
     check_expiry_photo,
     clear_await_price,
@@ -1016,6 +1017,9 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str,
             reply = answer_intake_session(conn, shop_id, text)
             if reply is not None:
                 return reply, None
+        pend = get_pending(conn, shop_id)
+        if pend is not None and pend["action_type"] == "stock_intake_item":
+            return guided_skip_pending(conn, shop_id), None
         clear_await_price(conn, shop_id)
         return cancel_newest(conn, shop_id), None
     offered = try_offer_time(conn, shop_id, text)

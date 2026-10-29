@@ -3166,6 +3166,9 @@ STRINGS["en"].update({
                   " Reply 'restock' to use it again."),
     "g_resume_line": "📌 Still on item {i} of {n}: {q}",
     "g_required": "That one I really need — {hint}",
+    "g_item_saved": "✅ Saved {name} {qty}.",
+    "g_summary": "📦 *Intake done: {saved} saved, {skipped} skipped, {pending} still to go.*",
+    "g_no_preview": "That intake already closed — this item was saved on its own.",
 })
 STRINGS["zu"].update({
     "g_head": "📦 *Ukungenisa isitoko: {done} kokungu-{total} sekwenziwe*",
@@ -3204,6 +3207,9 @@ STRINGS["zu"].update({
                   " Phendula ngo-'restock' ukusisebenzisa futhi."),
     "g_resume_line": "📌 Usakunto {i} kokungu-{n}: {q}",
     "g_required": "Lena ngiyidinga ngempela — {hint}",
+    "g_item_saved": "✅ Kulondoloziwe: {name} {qty}.",
+    "g_summary": "📦 *Ukungenisa kuqediwe: {saved} okulondoloziwe, {skipped} okweqiwe, {pending} okuseleyo.*",
+    "g_no_preview": "Lokho kungenisa sekuvaliwe — le nto ilondolozwe yodwa.",
 })
 STRINGS["af"].update({
     "g_head": "📦 *Voorraad-inname: {done} van {total} klaar*",
@@ -3242,6 +3248,9 @@ STRINGS["af"].update({
                   " Antwoord 'restock' om dit weer te gebruik."),
     "g_resume_line": "📌 Steeds op item {i} van {n}: {q}",
     "g_required": "Daardie een het ek regtig nodig — {hint}",
+    "g_item_saved": "✅ Gestoor: {name} {qty}.",
+    "g_summary": "📦 *Inname klaar: {saved} gestoor, {skipped} oorgeslaan, {pending} oor.*",
+    "g_no_preview": "Daardie inname is reeds gesluit — hierdie item is apart gestoor.",
 })
 STRINGS["xh"].update({
     "g_head": "📦 *Ukungeniswa kwesitokhwe: {done} kwezingu-{total} kwenziwe*",
@@ -3280,4 +3289,7 @@ STRINGS["xh"].update({
                   " Phendula ngo-'restock' ukuwusebenzisa kwakhona."),
     "g_resume_line": "📌 Usakwinto {i} kwezingu-{n}: {q}",
     "g_required": "Le ndiyidinga ngenene — {hint}",
+    "g_item_saved": "✅ Kugcinwe: {name} {qty}.",
+    "g_summary": "📦 *Inqanawe igqityiwe: {saved} okugciniweyo, {skipped} okutsityweyo, {pending} okuseleyo.*",
+    "g_no_preview": "Laa nqanawe sele uvaliwe — le nto igcinwe yodwa.",
 })
