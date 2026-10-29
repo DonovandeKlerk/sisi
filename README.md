@@ -18,11 +18,12 @@ flowchart LR
     VON -- "/webhook/vonage" --> API[FastAPI on Modal]
     WA -- "/webhook (alt)" --> API
     API -- spawn --> Worker[worker: slow jobs off-request]
-    API --> Agent[agent.py: Yes/No/Undo deterministic]
+    API --> Agent[agent.py: exact commands in code]
     Agent --> Voice[Muse Voice Transcribe]
     Agent --> Vision[Muse Spark vision + SAM 3.1]
-    Agent --> LLM[Muse Spark tool loop]
-    LLM --> Tools[tools.py: dry-run preview]
+    Agent --> Plan[interpreter.py: planner proposes JSON]
+    Plan --> Exec[executors validate + run in code]
+    Exec --> Tools[tools.py: dry-run preview]
     Tools --> DB[(SQLite + files on Modal volume)]
     Agent -- reply + Yes/No buttons --> VON
     CRON[15-min tick: nudges, snapshots, expiry] --> Agent
@@ -33,11 +34,20 @@ channel. Webhooks return 200 instantly: each message is handled by a spawned
 Modal worker (background task locally), with read receipts, typing indicators
 and ⏳ status lines while slow work runs.
 
+Understanding is split: the model reads the full message (transcript,
+caption, vision brief, history, open state) and proposes a structured plan;
+code validates it and runs each task through the existing tools, so Yes/No,
+undo, money math, permissions and duplicate protection never depend on the
+model. Exact commands (menus, Yes/No/Undo, reminder management, statements)
+stay on deterministic fast paths; multi-intent messages always reach the
+planner. A manual probe script (`scripts/eval_live.py`, fictional data only)
+checks planner quality, latency and cost per case.
+
 ## AI models (Meta Muse)
 
 | Job | Model | How |
 |---|---|---|
-| Agent + tool calling + replies | `muse-spark-1.3` (`-contributor` for dev/tests) | Chat Completions, tools, `tool_choice: auto` |
+| Understanding + task plans | `muse-spark-1.3` (`-contributor` for dev/tests) | Chat Completions, strict JSON plan schema, `reasoning_effort: low` (env `SISI_REASONING_EFFORT`) |
 | Vision (expiry, slips, shelves) | `muse-spark-1.3` | base64 data URL + `response_format: json_schema` |
 | Voice notes | `muse-voice-transcribe-1.0` | `POST /v1/asr/transcribe`, 16 kHz mono wav via ffmpeg |
 | Shelf counting (stretch) | `sam-3.1` | `POST /v1/responses` (streamed) |

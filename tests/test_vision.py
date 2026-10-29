@@ -148,12 +148,33 @@ def test_prepare_without_ffmpeg_returns_original(monkeypatch):
 # --- agent + endpoints -----------------------------------------------------
 
 
+def _stub_plan(monkeypatch, body):
+    import json as _json
+    from types import SimpleNamespace as _NS
+
+    import app.interpreter as interp
+
+    def fake(messages):
+        return _NS(choices=[_NS(message=_NS(content=_json.dumps(body)))],
+                  usage=_NS(prompt_tokens=1, completion_tokens=1,
+                            total_tokens=2))
+
+    monkeypatch.setattr(interp, "propose_plan", fake)
+
+
+def _expiry_plan():
+    return {"understood": "expiry photo",
+            "tasks": [{"kind": "expiry_photo", "args": {}, "quote": ""}],
+            "question": None, "options": []}
+
+
 def test_handle_photo_proposes_preview(photo_env, monkeypatch):
     import app.db as db
 
     monkeypatch.setenv("SISI_TODAY", "2026-11-01")
     monkeypatch.setattr(agent, "read_shop_photo", lambda *a, **k: _expiry_doc([
         {"product": "Fresh Milk 1L", "qty": 2, "expiry_date": "2026-10-30"}]))
+    _stub_plan(monkeypatch, _expiry_plan())
     conn = db.connect(str(photo_env / "photo.db"))
     try:
         findings, reply, buttons = agent.handle_photo(conn, SHOP, b"jpg")
@@ -168,6 +189,7 @@ def test_handle_photo_nothing_readable(photo_env, monkeypatch):
     import app.db as db
 
     monkeypatch.setattr(agent, "read_shop_photo", lambda *a, **k: _expiry_doc([]))
+    _stub_plan(monkeypatch, _expiry_plan())
     conn = db.connect(str(photo_env / "photo.db"))
     try:
         findings, reply, buttons = agent.handle_photo(conn, SHOP, b"jpg")
@@ -180,6 +202,8 @@ def test_handle_photo_nothing_readable(photo_env, monkeypatch):
         raise VisionError(CANT_READ)
 
     monkeypatch.setattr(agent, "read_shop_photo", boom)
+    _stub_plan(monkeypatch, {"understood": "unreadable photo", "tasks": [],
+                             "question": CANT_READ, "options": []})
     conn = db.connect(str(photo_env / "photo.db"))
     try:
         findings, reply, buttons = agent.handle_photo(conn, SHOP, b"jpg")
@@ -192,6 +216,7 @@ def test_sim_photo_endpoint(photo_env, monkeypatch):
     monkeypatch.setenv("SISI_TODAY", "2026-11-01")
     monkeypatch.setattr(agent, "read_shop_photo", lambda *a, **k: _expiry_doc([
         {"product": "Fresh Milk 1L", "qty": 2, "expiry_date": "2026-10-30"}]))
+    _stub_plan(monkeypatch, _expiry_plan())
     client = TestClient(app)
     r = client.post("/_sim/photo", params={"shop": SHOP}, content=b"jpg-bytes",
                     headers={"Content-Type": "image/jpeg"})
@@ -217,6 +242,7 @@ def test_webhook_image_message_end_to_end(photo_env, monkeypatch):
     monkeypatch.setattr(main, "download_media", lambda _mid, _label="voice note": b"jpg")
     monkeypatch.setattr(agent, "read_shop_photo", lambda *a, **k: _expiry_doc([
         {"product": "Fresh Milk 1L", "qty": 2, "expiry_date": "2026-10-30"}]))
+    _stub_plan(monkeypatch, _expiry_plan())
     payload = {"object": "whatsapp_business_account", "entry": [{"changes": [{
         "value": {"messages": [{"id": "wamid.p1", "from": SHOP, "type": "image",
                                 "image": {"id": "media-1", "mime_type": "image/jpeg"}}]}}]}]}

@@ -91,6 +91,69 @@ def _complete(messages: list) -> object:
     )
 
 
+PLAN_KINDS = (
+    "reminder", "reminder_offer", "reminder_list", "reminder_cancel",
+    "reminder_move", "reminder_snooze", "order", "sale", "credit",
+    "payment", "stock_add", "stock_list", "low_stock", "restock",
+    "order_send", "order_add", "order_remove", "price_set", "expense",
+    "drawing", "count", "supplier_payment", "cash", "sales", "profit",
+    "debtors", "balance", "statement", "statements_all", "receipts",
+    "report", "compliance", "book_page", "receipt_doc", "expiry_photo",
+    "logo", "affordability", "set_language", "set_profile", "float_set",
+    "nudge", "daily_plan", "staff_add", "who_recorded", "limit_set",
+    "expiry_set", "draft", "cashup", "best_sellers", "show_profile",
+    "chat",
+)
+
+PLAN_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "sisi_plan",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "understood": {"type": "string"},
+                "tasks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string", "enum": list(PLAN_KINDS)},
+                            "quote": {"type": "string"},
+                            "args": {"type": "object"},
+                        },
+                        "required": ["kind", "args"],
+                        "additionalProperties": False,
+                    },
+                },
+                "question": {"type": ["string", "null"]},
+                "options": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["understood", "tasks", "question"],
+            "additionalProperties": False,
+        },
+    },
+}
+"""Structured interpretation: validated in code before anything executes."""
+
+
+REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
+
+
+def reasoning_effort() -> str:
+    """Live read so SISI_REASONING_EFFORT can tune cost/latency per run."""
+    effort = os.environ.get("SISI_REASONING_EFFORT", "low")
+    return effort if effort in REASONING_EFFORTS else "low"
+
+
+def propose_plan(messages: list) -> object:
+    """One structured planning call. Thin seam so tests can stub it."""
+    return get_client().chat.completions.create(
+        model=config.model_name(), messages=messages,
+        response_format=PLAN_SCHEMA, reasoning_effort=reasoning_effort(),
+    )
+
+
 def _run_tool(conn: sqlite3.Connection, shop_id: str, name: str, raw_args: str | None) -> str:
     try:
         args = json.loads(raw_args or "{}")

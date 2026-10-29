@@ -43,23 +43,38 @@ def test_multilingual_yes_no(conn):
         assert msg == "OK, I did not save it.", word
 
 
-def test_other_text_goes_to_llm(conn, monkeypatch):
+def _stub_plan(monkeypatch, tasks, understood="test reading"):
+    import json
+    from types import SimpleNamespace
+
+    import app.interpreter as interp
+
+    def fake(messages):
+        body = {"understood": understood, "tasks": tasks,
+                "question": None, "options": []}
+        return SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content=json.dumps(body)))],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1,
+                                  total_tokens=2))
+
+    monkeypatch.setattr(interp, "propose_plan", fake)
+
+
+def test_other_text_goes_to_planner(conn, monkeypatch):
     seed_demo(SHOP, conn)
-    assert try_deterministic(conn, SHOP, "Sipho took two bread") is None
-    assert try_deterministic(conn, SHOP, "yes but change it") is None
-    monkeypatch.setattr(agent, "llm_chat_full", lambda c, s, t: ("roger", None))
+    _stub_plan(monkeypatch, [{"kind": "chat", "args": {"reply": "roger"},
+                              "quote": ""}])
     msg, buttons = handle_text(conn, SHOP, "Sipho took two bread")
     assert (msg, buttons) == ("roger", None)
 
 
 def test_new_preview_gets_yes_no_buttons(conn, monkeypatch):
     seed_demo(SHOP, conn)
-
-    def fake_llm(c, shop_id, text):
-        add_credit(c, shop_id, "Sipho", [{"product": "Coke 2L", "qty": 1}])
-        return "Save?", None
-
-    monkeypatch.setattr(agent, "llm_chat_full", fake_llm)
+    _stub_plan(monkeypatch, [{"kind": "credit",
+                              "args": {"customer": "Sipho", "items": [
+                                  {"product": "Coke 2L", "qty": 1}]},
+                              "quote": "Sipho took a Coke"}])
     msg, buttons = handle_text(conn, SHOP, "Sipho took a Coke")
     assert buttons == ["Yes", "No"]
     msg, buttons = handle_text(conn, SHOP, "yes")

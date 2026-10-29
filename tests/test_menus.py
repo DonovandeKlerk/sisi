@@ -20,16 +20,18 @@ SHOP = DEMO_SHOP_ID
 FRESH = "27710000099"
 
 
-def _resp(content=None, calls=None):
-    return SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(
-            content=content, tool_calls=calls or []))],
-        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1,
-                              total_tokens=2),
-    )
+def _plan_body(tasks=(), question=None, options=(), understood="menu test"):
+    return {"understood": understood, "tasks": list(tasks),
+            "question": question, "options": list(options)}
+
+
+def _chat_reply(text):
+    return _plan_body([{"kind": "chat", "args": {"reply": text},
+                        "quote": ""}])
 
 
 def _stub(monkeypatch, tmp_path, script):
+    import app.interpreter as interp
     monkeypatch.setattr(llm, "TOKEN_LOG", tmp_path / "usage.log")
     calls = {"n": 0, "messages": []}
 
@@ -39,9 +41,14 @@ def _stub(monkeypatch, tmp_path, script):
         item = script[min(calls["n"] - 1, len(script) - 1)]
         if isinstance(item, Exception):
             raise item
-        return item
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content=json.dumps(item)))],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1,
+                                  total_tokens=2),
+        )
 
-    monkeypatch.setattr(llm, "_complete", fake)
+    monkeypatch.setattr(interp, "propose_plan", fake)
     return calls
 
 
@@ -171,25 +178,21 @@ def test_menu_intro_follows_owner_language(conn):
 def test_numbered_tap_resolves_to_row_text(conn, monkeypatch, tmp_path):
     seed_demo(SHOP, conn)
     agent.handle_text(conn, SHOP, "menu")
-    calls = _stub(monkeypatch, tmp_path, [_resp("debtors here")])
+    calls = _stub(monkeypatch, tmp_path, [_chat_reply("debtors here")])
     msg, _ = agent.handle_text(conn, SHOP, "3")
-    assert _user_texts(calls)[-1] == "Who owes me"
+    assert _user_texts(calls)[-1].split("\n")[1] == "Who owes me"
     assert msg == "debtors here"
 
 
 def test_numbered_yes_confirms_pending(conn, monkeypatch, tmp_path):
     seed_demo(SHOP, conn)
-    calls = _stub(monkeypatch, tmp_path, [
-        _resp(calls=[SimpleNamespace(
-            id="c1",
-            function=SimpleNamespace(
-                name="record_sale",
-                arguments=json.dumps({"product": "Sasko White Bread 700g",
-                                      "qty": 2})))]),
-        _resp("Preview above."),
-    ])
+    calls = _stub(monkeypatch, tmp_path, [_plan_body(
+        [{"kind": "sale",
+          "args": {"items": [{"product": "Sasko White Bread 700g",
+                               "qty": 2}]},
+          "quote": "sell 2 bread"}])])
     agent.handle_text(conn, SHOP, "sell 2 bread then cash up")
-    assert calls["n"] == 2
+    assert calls["n"] == 1
     from app.tools import get_pending
     assert get_pending(conn, SHOP) is not None
     msg, _ = agent.handle_text(conn, SHOP, "1")
@@ -199,17 +202,13 @@ def test_numbered_yes_confirms_pending(conn, monkeypatch, tmp_path):
 
 def test_numbered_no_cancels_pending(conn, monkeypatch, tmp_path):
     seed_demo(SHOP, conn)
-    calls = _stub(monkeypatch, tmp_path, [
-        _resp(calls=[SimpleNamespace(
-            id="c1",
-            function=SimpleNamespace(
-                name="record_sale",
-                arguments=json.dumps({"product": "Sasko White Bread 700g",
-                                      "qty": 2})))]),
-        _resp("Preview above."),
-    ])
+    calls = _stub(monkeypatch, tmp_path, [_plan_body(
+        [{"kind": "sale",
+          "args": {"items": [{"product": "Sasko White Bread 700g",
+                               "qty": 2}]},
+          "quote": "sell 2 bread"}])])
     agent.handle_text(conn, SHOP, "sell 2 bread then cash up")
-    assert calls["n"] == 2
+    assert calls["n"] == 1
     from app.tools import get_pending
     msg, _ = agent.handle_text(conn, SHOP, "2")
     assert get_pending(conn, SHOP) is None
@@ -224,9 +223,9 @@ def test_stale_options_leave_digit_alone(conn, monkeypatch, tmp_path):
     conn.execute("UPDATE flags SET value = ? WHERE shop_id = ? AND key = 'last-options'",
                  (json.dumps({"options": MENU_ROWS, "ts": old}), SHOP))
     conn.commit()
-    calls = _stub(monkeypatch, tmp_path, [_resp("huh")])
+    calls = _stub(monkeypatch, tmp_path, [_chat_reply("huh")])
     agent.handle_text(conn, SHOP, "3")
-    assert _user_texts(calls)[-1] == "3"
+    assert _user_texts(calls)[-1].split("\n")[1] == "3"
 
 
 def test_digits_stay_data_during_setup(conn):
@@ -406,59 +405,64 @@ def test_every_row_tap_reaches_router_as_typed(conn, monkeypatch, tmp_path):
     _use_english(conn)
     heard = []
 
+    import app.interpreter as interp
+
     def fake(messages):
-        heard.append([m["content"] for m in messages
-                      if isinstance(m, dict) and m.get("role") == "user"][-1])
-        return _resp("ok")
+        user = [m["content"] for m in messages
+                if isinstance(m, dict) and m.get("role") == "user"][-1]
+        heard.append(user.split("\n")[1])
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content=json.dumps(_chat_reply("ok"))))],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1,
+                                  total_tokens=2),
+        )
 
     monkeypatch.setattr(llm, "TOKEN_LOG", tmp_path / "usage.log")
-    monkeypatch.setattr(llm, "_complete", fake)
+    monkeypatch.setattr(interp, "propose_plan", fake)
     agent.handle_text(conn, SHOP, "menu")
     for i, row in enumerate(MENU_ROWS, 1):
         agent.handle_text(conn, SHOP, "menu")
         agent.handle_text(conn, SHOP, str(i))
-    # "Reminders" is a keyword (no LLM call); the rest arrive verbatim.
+    # "Reminders" is a keyword (no planner call); the rest arrive verbatim.
     assert heard == [r for r in MENU_ROWS if r != "Reminders"]
 
 
 def test_unmatched_message_carries_shop_context(conn, monkeypatch, tmp_path):
     seed_demo(SHOP, conn)
     _use_english(conn)
-    calls = _stub(monkeypatch, tmp_path, [_resp("slow day")])
+    calls = _stub(monkeypatch, tmp_path, [_chat_reply("slow day")])
     agent.handle_text(conn, SHOP, "so how is business today")
     assert calls["n"] == 1
-    system = calls["messages"][0]["content"]
-    assert "Sasko White Bread 700g" in system
-    assert "Sipho" in system
+    user = _user_texts(calls)[-1]
+    assert "Sasko White Bread 700g" in user
+    assert "Sipho" in user
 
 
 def test_unmatched_clarify_returns_buttons(conn, monkeypatch, tmp_path):
     seed_demo(SHOP, conn)
     _use_english(conn)
     calls = _stub(monkeypatch, tmp_path, [
-        _resp(calls=[SimpleNamespace(
-            id="c1",
-            function=SimpleNamespace(
-                name="ask_clarify",
-                arguments=json.dumps(
-                    {"question": "Which bread?",
-                     "options": ["White", "Brown"]})))]),
-        _resp("❓ Which bread?\n1) White\n2) Brown"),
+        _plan_body([], question="Which bread?",
+                   options=["White", "Brown"]),
     ])
     msg, buttons = agent.handle_text(conn, SHOP, "sell")
-    assert calls["n"] == 2
+    assert calls["n"] == 1
     assert buttons == ["White", "Brown"]
-    assert "1) White" in msg
+    assert "Which bread?" in msg
 
 
-def test_voice_composite_routes_to_llm(conn, monkeypatch, tmp_path):
+def test_voice_composite_routes_to_planner(conn, monkeypatch, tmp_path):
     seed_demo(SHOP, conn)
     _use_english(conn)
     monkeypatch.setattr(agent, "transcribe_audio",
                         lambda *a, **k: "who owes me most and remind them")
-    calls = _stub(monkeypatch, tmp_path, [_resp("both done")])
+    calls = _stub(monkeypatch, tmp_path, [_plan_body(
+        [{"kind": "debtors", "args": {}, "quote": "who owes me most"},
+         {"kind": "draft", "args": {"customer": "Jabu"},
+          "quote": "remind them"}])])
     transcript, reply, _ = agent.handle_voice(conn, SHOP, b"ogg-bytes")
     assert transcript == "who owes me most and remind them"
     assert calls["n"] == 1
     assert reply.startswith("Heard:")
-    assert "both done" in reply
+    assert "Jabu" in reply and "R120.00" in reply

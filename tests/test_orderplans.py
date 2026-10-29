@@ -101,6 +101,59 @@ def _mock_vision(monkeypatch, doc):
                         lambda image, shop="": doc)
 
 
+@pytest.fixture(autouse=True)
+def _plan_router(monkeypatch, tmp_path):
+    """Script the planner like the old router: orders quote the message."""
+    import json
+    import re
+    from types import SimpleNamespace
+
+    import app.interpreter as interp
+    import app.llm as llm
+    from app.i18n import t as _t
+    monkeypatch.setattr(llm, "TOKEN_LOG", tmp_path / "usage.log")
+
+    def fake(messages):
+        content = messages[-1]["content"]
+        lines = content.split("\n")
+        msg = lines[1].strip() if lines and lines[0].startswith("NEW MESSAGE") \
+            else ""
+        low = msg.lower()
+        named = re.match(r"[a-z']+: ", low) is not None
+        if low.startswith("my order") and not named:
+            if "logo update" in content:
+                body = {"understood": "logo or order?",
+                        "tasks": [], "question": _t("ord_logo_or_task"),
+                        "options": []}
+            else:
+                body = {"understood": "unclear order", "tasks": [],
+                        "question": _t("ord_clarify"), "options": []}
+        elif low.startswith("remind me"):
+            tasks = []
+            if "book page" in content:
+                tasks.append({"kind": "book_page", "args": {}, "quote": ""})
+            tasks.append({"kind": "reminder", "args": {"when": msg},
+                          "quote": msg})
+            body = {"understood": "reminder", "tasks": tasks,
+                    "question": None, "options": []}
+        elif low.startswith("thanks"):
+            body = {"understood": "thanks", "tasks": [
+                {"kind": "chat", "args": {"reply": "You're welcome!"},
+                 "quote": msg}], "question": None, "options": []}
+        else:
+            # single order task: embedded reminders/statements/summaries
+            # stay inside the plan engine, exactly as before
+            tasks = [{"kind": "order", "args": {}, "quote": msg}]
+            body = {"understood": "order", "tasks": tasks,
+                    "question": None, "options": []}
+        return SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content=json.dumps(body)))],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1,
+                                  total_tokens=2))
+    monkeypatch.setattr(interp, "propose_plan", fake)
+
+
 CAPTION = ("Sipho: 2 bread, 5 chappies. Bongani: 1 coke 2l. "
            "Remind me Thursday 06:30 to pack this order. "
            "Summarise for Thursday.")

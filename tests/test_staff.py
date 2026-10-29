@@ -87,14 +87,26 @@ def test_who_recorded_breakdown(conn, shop):
 
 
 def test_staff_sale_via_handle_text(conn, shop, monkeypatch):
-    import app.agent as agent
+    import json
+    from types import SimpleNamespace
+
+    import app.interpreter as interp
     handle_text(conn, OWNER, f"add staff {STAFF} Thandi")
 
-    def fake_llm(c, s, t):
-        assert s == OWNER  # staff act on the owner's shop
-        return record_sale(c, s, "Bread", 1), None
+    def fake(messages):
+        body = {"understood": "staff sale",
+                "tasks": [{"kind": "sale",
+                           "args": {"items": [{"product": "Bread",
+                                               "qty": 1}]},
+                           "quote": "sold 1 bread"}],
+                "question": None, "options": []}
+        return SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content=json.dumps(body)))],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1,
+                                  total_tokens=2))
 
-    monkeypatch.setattr(agent, "llm_chat_full", fake_llm)
+    monkeypatch.setattr(interp, "propose_plan", fake)
     msg, buttons = handle_text(conn, STAFF, "sold 1 bread")
     assert buttons == ["Yes", "No"]
-    assert get_pending(conn, OWNER) is not None
+    assert get_pending(conn, OWNER) is not None  # owner's shop

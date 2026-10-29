@@ -237,16 +237,15 @@ def test_handle_voice_prefixes_heard(voice_env, monkeypatch):
 
     monkeypatch.setattr(agent, "transcribe_audio", lambda *a, **k: "How much does Sipho owe?")
 
-    def fake_complete(messages):
-        if any(isinstance(m, dict) and m.get("role") == "tool" for m in messages):
-            tool = next(m["content"] for m in reversed(messages)
-                        if isinstance(m, dict) and m.get("role") == "tool")
-            return _resp(f"OK: {tool}")
-        return _resp(calls=[SimpleNamespace(
-            id="c1", function=SimpleNamespace(name="get_balance",
-                                              arguments='{"customer":"Sipho"}'))])
+    def fake_plan(messages):
+        return _resp(json.dumps(
+            {"understood": "balance question", "tasks": [
+                {"kind": "balance", "args": {"customer": "Sipho"},
+                 "quote": "How much does Sipho owe?"}],
+             "question": None, "options": []}))
 
-    monkeypatch.setattr(llm, "_complete", fake_complete)
+    import app.interpreter as interp
+    monkeypatch.setattr(interp, "propose_plan", fake_plan)
     import app.db as db
 
     conn = db.connect(str(voice_env / "voice.db"))

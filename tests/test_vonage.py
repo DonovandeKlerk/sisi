@@ -220,21 +220,31 @@ def _resp(content=None, calls=None):
         usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2))
 
 
+def _plan(content):
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1,
+                              total_tokens=2))
+
+
 def _scripted_llm(monkeypatch):
+    import app.interpreter as interp
+
     def fake(messages):
-        if any(isinstance(m, dict) and m.get("role") == "tool" for m in messages):
-            tool = next(m["content"] for m in reversed(messages)
-                        if isinstance(m, dict) and m.get("role") == "tool")
-            return _resp(f"OK: {tool}")
         user_text = next(m["content"] for m in reversed(messages)
                          if isinstance(m, dict) and m.get("role") == "user")
-        if "owe" in user_text:
-            return _resp(calls=[SimpleNamespace(
-                id="c1", function=SimpleNamespace(name="get_balance",
-                                                  arguments='{"customer":"Sipho"}'))])
-        return _resp("huh?")
+        line = user_text.split("\n")[1] if "\n" in user_text else user_text
+        if "PHOTO EVIDENCE" in user_text and "expiry" in user_text:
+            tasks = [{"kind": "expiry_photo", "args": {}, "quote": ""}]
+        elif "owe" in line:
+            tasks = [{"kind": "balance", "args": {"customer": "Sipho"},
+                      "quote": line}]
+        else:
+            tasks = [{"kind": "chat", "args": {"reply": "huh?"}, "quote": ""}]
+        return _plan(json.dumps({"understood": "vonage test", "tasks": tasks,
+                                 "question": None, "options": []}))
 
-    monkeypatch.setattr(llm, "_complete", fake)
+    monkeypatch.setattr(interp, "propose_plan", fake)
 
 
 def _post_vonage(client, message, mid="vg-uuid-1"):
@@ -295,6 +305,7 @@ def test_vonage_voice_note_end_to_end(vg_env, monkeypatch):
 
 
 def test_vonage_image_end_to_end(vg_env, monkeypatch):
+    _scripted_llm(monkeypatch)
     monkeypatch.setenv("SISI_TODAY", "2026-11-01")
     monkeypatch.setattr(main, "download_vonage_media", lambda _url: b"jpg-bytes")
     monkeypatch.setattr(agent, "read_shop_photo", lambda *a, **k: {

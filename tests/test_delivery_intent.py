@@ -41,6 +41,59 @@ def shop(conn):
     return SHOP
 
 
+@pytest.fixture(autouse=True)
+def _plan_router(monkeypatch, tmp_path):
+    """Script the planner like a good reading: reminders split out, the
+    rest answered (cash/affordability) or left as background context."""
+    import json
+    import re
+    from types import SimpleNamespace
+
+    import app.interpreter as interp
+    import app.llm as llm
+    from app.orders import _has_blocker, is_supplier_segment
+    from app.reminders import REMIND_TRIGGERS
+    monkeypatch.setattr(llm, "TOKEN_LOG", tmp_path / "usage.log")
+
+    def fake(messages):
+        content = messages[-1]["content"]
+        lines = content.split("\n")
+        msg = lines[1].strip() if lines and lines[0].startswith("NEW MESSAGE") \
+            else ""
+        from app.reminders import reminder_clause
+        tasks = []
+        rest = []
+        for bit in re.split(r"[.?!]", msg):
+            bit = bit.strip()
+            if not bit:
+                continue
+            if any(t in f" {bit.lower()} " for t in REMIND_TRIGGERS):
+                seg = reminder_clause(bit)
+                tasks.append({"kind": "reminder",
+                              "args": {"when": seg}, "quote": seg})
+            else:
+                rest.append(bit)
+        leftover = " ".join(rest)
+        low = leftover.lower()
+        if "available" in low and "pay" in low:
+            tasks.append({"kind": "affordability", "args": {}, "quote": ""})
+        elif "petty cash" in low or "cash in hand" in low:
+            tasks.append({"kind": "cash", "args": {}, "quote": ""})
+        elif leftover and not is_supplier_segment(leftover) \
+                and not _has_blocker(leftover) \
+                and (":" in leftover or "order" in low):
+            tasks.append({"kind": "order", "args": {}, "quote": leftover})
+        body = {"understood": "delivery test", "tasks": tasks,
+                "question": None, "options": []}
+        return SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content=json.dumps(body)))],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1,
+                                  total_tokens=2))
+
+    monkeypatch.setattr(interp, "propose_plan", fake)
+
+
 @pytest.fixture()
 def sent():
     from app.reminders import now_sast
@@ -146,9 +199,6 @@ def test_transcript_answers_cash_and_schedules(conn, shop, sent):
      "milk delivery"),
 ])
 def test_cash_plus_reminder_paraphrases(conn, shop, sent, text, expected, monkeypatch):
-    monkeypatch.setattr(agent, "route_to_llm",
-                        lambda c, s, t: (_ for _ in ()).throw(
-                            AssertionError("LLM must not be needed")))
     msg, _ = agent.handle_text(conn, SHOP, text, sent)
     assert "R300.00" in msg and "Reminder set" in msg
     row = conn.execute("SELECT due_at, summary FROM reminders WHERE shop_id = ?",
@@ -157,9 +207,7 @@ def test_cash_plus_reminder_paraphrases(conn, shop, sent, text, expected, monkey
     assert row["summary"] == expected
 
 
-def test_cash_rest_falls_back_to_llm(conn, shop, sent, monkeypatch):
-    monkeypatch.setattr(agent, "route_to_llm",
-                        lambda c, s, t: ("Petty cash is R300.00.", None))
+def test_cash_answered_alongside_reminder(conn, shop, sent, monkeypatch):
     msg, _ = agent.handle_text(
         conn, SHOP, "The milk van arrives soon. What is my petty cash?"
         " Remind me in five minutes to count the till.", sent)
@@ -182,11 +230,9 @@ def test_past_due_asks_new_time_keeps_cash(conn, shop):
 
 
 def test_bare_reminder_asks_then_completes(conn, shop, sent, monkeypatch):
-    monkeypatch.setattr(agent, "route_to_llm",
-                        lambda c, s, t: ("Cash in hand is R1,200.00.", None))
     msg, _ = agent.handle_text(
         conn, SHOP, "Cash in hand? Remind me in 5 minutes.", sent)
-    assert "R1,200.00" in msg
+    assert "R1200.00" in msg
     assert "remind you about" in msg
     assert conn.execute("SELECT COUNT(*) n FROM reminders WHERE shop_id = ?",
                         (SHOP,)).fetchone()["n"] == 0
@@ -201,7 +247,6 @@ def test_bare_reminder_asks_then_completes(conn, shop, sent, monkeypatch):
 
 
 def test_reminder_detail_no_drops(conn, shop, sent, monkeypatch):
-    monkeypatch.setattr(agent, "route_to_llm", lambda c, s, t: ("cash.", None))
     agent.handle_text(conn, SHOP, "Cash in hand? Remind me in 5 minutes.", sent)
     msg, _ = agent.handle_text(conn, SHOP, "no")
     assert "dropped" in msg or "lahle" in msg or "gelos" in msg
@@ -228,6 +273,11 @@ def test_draft_reminder_never_scheduled(conn, shop):
 
 
 def test_filler_request_uses_delivery_context(conn, shop, sent):
+    # REPRESENTATIVE, not verbatim: the complete 08:22 transcript exists
+    # only in the live shop DB (unreachable here) and a truncated echo.
+    # This case reconstructs its known shape ("…and can you send me a
+    # reminder in about five minutes" + delivery context + cash question),
+    # matching the delivered "and can you a." fragment.
     msg, _ = agent.handle_text(
         conn, SHOP, "Milk is arriving in fifteen minutes and can you send me "
         "a reminder in about five minutes. How much petty cash is available "
@@ -240,8 +290,6 @@ def test_filler_request_uses_delivery_context(conn, shop, sent):
 
 
 def test_request_before_context(conn, shop, sent, monkeypatch):
-    monkeypatch.setattr(agent, "route_to_llm",
-                        lambda c, s, t: ("Noted the delivery.", None))
     msg, _ = agent.handle_text(
         conn, SHOP, "Remind me in 5 minutes. The milk is arriving.", sent)
     assert "Reminder set" in msg
@@ -251,8 +299,6 @@ def test_request_before_context(conn, shop, sent, monkeypatch):
 
 
 def test_get_ready_merges_with_delivery(conn, shop, sent, monkeypatch):
-    monkeypatch.setattr(agent, "route_to_llm",
-                        lambda c, s, t: ("Noted.", None))
     agent.handle_text(conn, SHOP, "Bread is arriving. Remind me in 5 minutes "
                                   "to get ready.", sent)
     row = conn.execute("SELECT summary FROM reminders WHERE shop_id = ?",
@@ -261,8 +307,6 @@ def test_get_ready_merges_with_delivery(conn, shop, sent, monkeypatch):
 
 
 def test_explicit_topic_never_hijacked(conn, shop, sent, monkeypatch):
-    monkeypatch.setattr(agent, "route_to_llm",
-                        lambda c, s, t: ("Noted.", None))
     agent.handle_text(conn, SHOP, "Milk is arriving. Remind me in 5 minutes "
                                   "to get ready for church.", sent)
     row = conn.execute("SELECT summary FROM reminders WHERE shop_id = ?",
@@ -284,8 +328,6 @@ def test_incomplete_clause_asks_then_completes(conn, shop, sent):
 
 
 def test_disfluent_time_parses(conn, shop, sent, monkeypatch):
-    monkeypatch.setattr(agent, "route_to_llm",
-                        lambda c, s, t: ("Cash is R1,200.00.", None))
     msg, _ = agent.handle_text(
         conn, SHOP, "Cash in hand? Um, remind me in, uh, 5 minutes to check.",
         sent)
@@ -360,9 +402,6 @@ def test_voice_note_end_to_end(conn, tmp_path, monkeypatch, sent):
     _seed_file_db(get_db_path())
     monkeypatch.setattr(main, "_download_msg_media", lambda m, l: b"audio")
     monkeypatch.setattr(agent, "transcribe_audio", lambda a, s, sid, x: TRANSCRIPT)
-    monkeypatch.setattr(agent, "route_to_llm",
-                        lambda c, s, t: (_ for _ in ()).throw(
-                            AssertionError("LLM must not be needed")))
     ts = sent.timestamp()
     before, _ = _file_counts(get_db_path())
     main.process_message(IncomingMessage("mid-e2e-1", SHOP, "media:audio", None,
@@ -390,9 +429,6 @@ def test_voice_note_end_to_end(conn, tmp_path, monkeypatch, sent):
 def test_photo_caption_parity(conn, shop, sent, monkeypatch):
     monkeypatch.setattr(agent, "read_shop_photo",
                         lambda image, shop="": {"doc_type": "other"})
-    monkeypatch.setattr(agent, "route_to_llm",
-                        lambda c, s, t: (_ for _ in ()).throw(
-                            AssertionError("LLM must not be needed")))
     import io
     from PIL import Image
     buf = io.BytesIO()
@@ -414,9 +450,6 @@ def test_text_parity_end_to_end(conn, tmp_path, monkeypatch, sent):
     from app.whatsapp import IncomingMessage, get_sender
     from app.db import get_db_path
     _seed_file_db(get_db_path())
-    monkeypatch.setattr(agent, "route_to_llm",
-                        lambda c, s, t: (_ for _ in ()).throw(
-                            AssertionError("LLM must not be needed")))
     main.process_message(IncomingMessage("mid-e2e-3", SHOP, "text", TRANSCRIPT,
                                          str(int(sent.timestamp()))))
     bodies = " ".join(b["body"] for b in get_sender().pop_shop(SHOP))

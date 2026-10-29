@@ -200,24 +200,36 @@ def _resp(content=None, calls=None):
         usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2))
 
 
+def _plan(body):
+    return SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(content=json.dumps(body)))],
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1,
+                              total_tokens=2))
+
+
 def _scripted_model(monkeypatch):
+    import app.interpreter as interp
+
     def fake(messages):
-        if any(isinstance(m, dict) and m.get("role") == "tool" for m in messages):
-            tool = next(m["content"] for m in reversed(messages)
-                        if isinstance(m, dict) and m.get("role") == "tool")
-            return _resp(f"OK: {tool}")
         user_text = next(m["content"] for m in reversed(messages)
                          if isinstance(m, dict) and m.get("role") == "user")
-        if "took" in user_text:
-            return _resp(calls=[_call("c1", "add_credit", {
-                "customer": "Sipho",
-                "items": [{"product": "Sasko White Bread 700g", "qty": 2},
-                          {"product": "Coke 2L", "qty": 1}]})])
-        if "owe" in user_text:
-            return _resp(calls=[_call("c2", "get_balance", {"customer": "Sipho"})])
-        return _resp("huh?")
+        line = user_text.split("\n")[1] if "\n" in user_text else user_text
+        if "took" in line:
+            tasks = [{"kind": "credit",
+                      "args": {"customer": "Sipho", "items": [
+                          {"product": "Sasko White Bread 700g", "qty": 2},
+                          {"product": "Coke 2L", "qty": 1}]},
+                      "quote": line}]
+        elif "owe" in line:
+            tasks = [{"kind": "balance", "args": {"customer": "Sipho"},
+                      "quote": line}]
+        else:
+            tasks = [{"kind": "chat", "args": {"reply": "huh?"}, "quote": ""}]
+        return _plan({"understood": "webhook test", "tasks": tasks,
+                      "question": None, "options": []})
 
-    monkeypatch.setattr(llm, "_complete", fake)
+    monkeypatch.setattr(interp, "propose_plan", fake)
 
 
 def test_simulated_credit_conversation(sim_env, monkeypatch):
@@ -243,14 +255,15 @@ def test_simulated_credit_conversation(sim_env, monkeypatch):
 
 
 def test_compliance_routing_keeps_official_link(sim_env, monkeypatch):
-    def fake(messages):
-        if any(isinstance(m, dict) and m.get("role") == "tool" for m in messages):
-            tool = next(m["content"] for m in reversed(messages)
-                        if isinstance(m, dict) and m.get("role") == "tool")
-            return _resp(f"Fund info: {tool}")
-        return _resp(calls=[_call("c9", "compliance_guide", {"topic": "fund"})])
+    import app.interpreter as interp
 
-    monkeypatch.setattr(llm, "_complete", fake)
+    def fake(messages):
+        return _plan({"understood": "fund question",
+                      "tasks": [{"kind": "compliance",
+                                 "args": {"topic": "fund"}, "quote": ""}],
+                      "question": None, "options": []})
+
+    monkeypatch.setattr(interp, "propose_plan", fake)
     client = TestClient(app)
     assert _post_text(client, "Can I get the spaza fund?", "wamid.c1").status_code == 200
     out = client.get("/_sim/outbox", params={"shop": SHOP}).json()["messages"]

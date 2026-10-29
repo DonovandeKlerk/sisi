@@ -137,6 +137,30 @@ def parse_relative(text: str, now: datetime) -> datetime | None:
     return None
 
 
+def reminder_clause(text: str) -> str:
+    """The reminder clause: from the last boundary before the trigger.
+
+    'Milk arrives in fifteen minutes and can you remind me in five'
+    -> 'can you remind me in five', so the delivery ETA never leaks
+    into the reminder's own time. Everything after the trigger stays
+    ('remind me to buy bread and milk' is kept whole).
+    """
+    low = f" {(text or '')} "
+    first = -1
+    for trig in REMIND_TRIGGERS:
+        idx = low.lower().find(trig)
+        if idx != -1 and (first == -1 or idx < first):
+            first = idx
+    if first == -1:
+        return (text or "").strip()
+    head = low[:first]
+    cuts = [m.end() for m in
+            re.finditer(r",|;|&|\band\b|\bplus\b|\bthen\b|\bso\b",
+                        head, flags=re.IGNORECASE)]
+    cut = max(cuts) if cuts else 0
+    return low[cut:].strip(" ,;:&")
+
+
 def has_explicit_time(text: str) -> bool:
     """True when the text names its own time (relative, clock, day)."""
     now = now_sast(None)
@@ -241,7 +265,7 @@ def _strip_request_bits(text: str) -> str:
     low = re.sub(r"\b(please|kindly|also|just)\b", " ", low)
     low = re.sub(r"\b(send|give)\s+me\b", " ", low)
     low = re.sub(r"\b(can|could|will|would)\s+you\b", " ", low)
-    low = re.sub(r"\b(\w+)\s+\1\b", r"\1", low)
+    low = re.sub(r"\b(\w+)\s+\1\b", r"\1", low, flags=re.IGNORECASE)
     for _ in range(3):
         new = re.sub(r"^(and|plus|also|so|then|well)\b[\s,]*", " ", low).strip()
         if new == low:

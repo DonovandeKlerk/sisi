@@ -96,19 +96,38 @@ def test_two_prices_in_one_reply_asks_for_one(conn):
     assert msg == "One price at a time — reply with just the Stoney 2L price, e.g. 'Stoney 2L R18'."
 
 
-def test_unrelated_question_falls_through_to_llm(conn, monkeypatch):
+def _stub_chat(monkeypatch, reply="LLM-REPLY"):
+    import json
+    from types import SimpleNamespace
+
+    import app.interpreter as interp
+
+    def fake(messages):
+        body = {"understood": "test", "tasks": [
+            {"kind": "chat", "args": {"reply": reply}, "quote": ""}],
+            "question": None, "options": []}
+        return SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content=json.dumps(body)))],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1,
+                                  total_tokens=2))
+
+    monkeypatch.setattr(interp, "propose_plan", fake)
+
+
+def test_unrelated_question_falls_through_to_planner(conn, monkeypatch):
     _seed(conn)
     record_sale(conn, SHOP, "Stoney 2L", 1)
-    monkeypatch.setattr("app.agent.route_to_llm", lambda c, s, t: "LLM-REPLY")
+    _stub_chat(monkeypatch)
     msg, _ = handle_text(conn, SHOP, "how much did I make today?")
     assert msg == "LLM-REPLY"
     assert get_await_price(conn, SHOP) is not None  # still waiting
 
 
-def test_price_for_another_product_falls_through(conn, monkeypatch):
+def test_price_for_another_product_falls_through_to_planner(conn, monkeypatch):
     _seed(conn)
     record_sale(conn, SHOP, "Stoney 2L", 1)
-    monkeypatch.setattr("app.agent.route_to_llm", lambda c, s, t: "LLM-REPLY")
+    _stub_chat(monkeypatch)
     msg, _ = handle_text(conn, SHOP, "milk costs R22")
     assert msg == "LLM-REPLY"
 
@@ -133,7 +152,7 @@ def test_stale_await_is_ignored(conn, monkeypatch):
     record_sale(conn, SHOP, "Stoney 2L", 1)
     conn.execute("UPDATE await_price SET created_at = '2020-01-01T00:00:00.000Z'")
     conn.commit()
-    monkeypatch.setattr("app.agent.route_to_llm", lambda c, s, t: "LLM-REPLY")
+    _stub_chat(monkeypatch)
     assert handle_text(conn, SHOP, "R25")[0] == "LLM-REPLY"
     assert get_await_price(conn, SHOP) is None
 
@@ -146,6 +165,6 @@ def test_price_reply_waits_when_normal_preview_pending(conn, monkeypatch):
         " VALUES ('s1', 'add_stock', '{}', 'Save: ...')"
     )
     conn.commit()
-    monkeypatch.setattr("app.agent.route_to_llm", lambda c, s, t: "LLM-REPLY")
+    _stub_chat(monkeypatch)
     assert handle_text(conn, SHOP, "stoney R25")[0] == "LLM-REPLY"
     assert get_pending(conn, SHOP) is not None

@@ -29,11 +29,43 @@ def _setup(conn):
     set_float(conn, SHOP, {"cash": 100000, "petty": 20000})
 
 
-@pytest.fixture()
-def _mock_llm(monkeypatch):
-    import app.agent as agent
-    monkeypatch.setattr(agent, "route_to_llm",
-                        lambda c, s, t: ("[reads] " + t[:80], None))
+def _script(monkeypatch, tmp_path, plans):
+    """Stub the planner with fixed plans."""
+    import json
+    from types import SimpleNamespace
+
+    import app.interpreter as interp
+    import app.llm as llm
+    monkeypatch.setattr(llm, "TOKEN_LOG", tmp_path / "usage.log")
+    calls = {"n": 0}
+
+    def fake(messages):
+        calls["n"] += 1
+        body = plans[min(calls["n"] - 1, len(plans) - 1)]
+        return SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content=json.dumps(body)))],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1,
+                                  total_tokens=2))
+
+    monkeypatch.setattr(interp, "propose_plan", fake)
+    return calls
+
+
+def _plan(tasks, understood="ok", question=None):
+    return {"understood": understood, "tasks": tasks, "question": question,
+            "options": []}
+
+
+def _t(kind, args=None, quote=""):
+    return {"kind": kind, "args": args or {}, "quote": quote}
+
+
+def _milk_plan():
+    return _plan(
+        [_t("cash"),
+         _t("reminder", {"when": "in 5 minutes", "topic": "check the till"})],
+        understood="cash plus reminder")
 
 
 def _tables(conn):
@@ -43,13 +75,14 @@ def _tables(conn):
                       "credit_entries", "payments")}
 
 
-def test_voice_cash_plus_reminder(conn, _mock_llm, monkeypatch):
+def test_voice_cash_plus_reminder(conn, monkeypatch, tmp_path):
     import app.agent as agent
     monkeypatch.setattr(agent, "transcribe_audio", lambda *a, **k: TRANSCRIPT)
+    _script(monkeypatch, tmp_path, [_milk_plan()])
     sent = now_sast()
     heard, reply, _b = handle_voice(conn, SHOP, b"fake-audio", ".ogg", sent)
     assert "check the till" in heard
-    assert "[reads]" in reply and "Reminder set" in reply
+    assert "R200.00" in reply and "Reminder set" in reply
     assert "can't ping" not in reply and "keep" not in reply.lower()
     rows = conn.execute("SELECT due_at, summary, status FROM reminders"
                         " WHERE shop_id = ?", (SHOP,)).fetchall()
@@ -60,7 +93,9 @@ def test_voice_cash_plus_reminder(conn, _mock_llm, monkeypatch):
     assert _tables(conn) == {k: 0 for k in _tables(conn)}  # milk untouched
 
 
-def test_relative_resolves_from_sent_timestamp(conn):
+def test_relative_resolves_from_sent_timestamp(conn, monkeypatch, tmp_path):
+    _script(monkeypatch, tmp_path, [_plan(
+        [_t("reminder", {"when": "in 5 minutes to check"})])])
     sent = now_sast().replace(second=0, microsecond=0)
     handle_text(conn, SHOP, "remind me in 5 minutes to check", sent)
     row = conn.execute("SELECT due_at FROM reminders WHERE shop_id = ?",
@@ -91,8 +126,9 @@ def test_parse_msg_ts_formats():
     assert parse_msg_ts("") is None and parse_msg_ts("junk") is None
 
 
-def test_text_and_caption_parity(conn, _mock_llm, monkeypatch):
+def test_text_and_caption_parity(conn, monkeypatch, tmp_path):
     import app.agent as agent
+    _script(monkeypatch, tmp_path, [_milk_plan()])
     sent = now_sast()
     msg, _b = handle_text(conn, SHOP, TRANSCRIPT, sent)
     assert "Reminder set" in msg
@@ -109,22 +145,28 @@ def test_text_and_caption_parity(conn, _mock_llm, monkeypatch):
                         (SHOP,)).fetchone()["n"] == 2
 
 
-def test_partial_transcription_asks_for_content(conn, _mock_llm, monkeypatch):
-    import app.agent as agent
-    monkeypatch.setattr(agent, "llm_chat_full",
-                        lambda c, s, t: ("What should I remind you about?", None))
+def test_partial_transcription_asks_for_content(conn, monkeypatch, tmp_path):
+    _script(monkeypatch, tmp_path, [_plan(
+        [_t("cash"), _t("reminder", {"when": "And remind me"})],
+        understood="cash plus reminder")])
     msg, _b = handle_text(conn, SHOP,
                           "How much petty cash do we have? And remind me")
-    # no time and no topic: the model asks; nothing is persisted
-    assert "remind you about" in msg
+    # no time and no topic: cash answered, time asked, nothing persisted
+    assert "R200.00" in msg
+    assert "When should I remind you" in msg
     assert conn.execute("SELECT COUNT(*) n FROM reminders WHERE shop_id = ?",
                         (SHOP,)).fetchone()["n"] == 0
     assert conn.execute("SELECT COUNT(*) n FROM await_reminder WHERE shop_id = ?",
                         (SHOP,)).fetchone()["n"] == 0
 
 
-def test_clarification_preserves_other_tasks(conn, _mock_llm):
+def test_clarification_preserves_other_tasks(conn, monkeypatch, tmp_path):
     from app.tools import get_pending
+    _script(monkeypatch, tmp_path, [_plan(
+        [_t("reminder_offer", {"when": "Thursday",
+                               "topic": "take this to the shop"}),
+         _t("reminder", {"when": "in 5 minutes", "topic": "pack"})],
+        understood="offer plus reminder")])
     msg, _b = handle_text(
         conn, SHOP, "I need to take this to the shop on Thursday. "
         "Remind me in 5 minutes to pack.")
@@ -134,7 +176,8 @@ def test_clarification_preserves_other_tasks(conn, _mock_llm):
                         (SHOP,)).fetchone()["n"] == 1
 
 
-def test_repeated_yes_creates_nothing(conn, _mock_llm):
+def test_repeated_yes_creates_nothing(conn, monkeypatch, tmp_path):
+    _script(monkeypatch, tmp_path, [_milk_plan()])
     handle_text(conn, SHOP, TRANSCRIPT)
     msg, _b = handle_text(conn, SHOP, "Yes")
     assert "nothing waiting" in msg
@@ -142,8 +185,11 @@ def test_repeated_yes_creates_nothing(conn, _mock_llm):
                         (SHOP,)).fetchone()["n"] == 1
 
 
-def test_stale_relative_time_asks_again(conn, _mock_llm):
+def test_stale_relative_time_asks_again(conn, monkeypatch, tmp_path):
     from app.reminders import now_sast as _now
+    _script(monkeypatch, tmp_path, [
+        _plan([_t("reminder", {"when": "in 5 minutes to check"})]),
+        _plan([_t("cash"), _t("reminder", {"when": "in 5 minutes"})])])
     sent = _now() - timedelta(minutes=10)
     msg, _b = handle_text(conn, SHOP, "remind me in 5 minutes to check",
                           sent)
@@ -153,11 +199,13 @@ def test_stale_relative_time_asks_again(conn, _mock_llm):
     msg, _b = handle_text(conn, SHOP,
                           "How much petty cash? Remind me in 5 minutes x",
                           sent)
-    assert "[reads]" in msg and "already passed" in msg
+    assert "R200.00" in msg and "already passed" in msg
 
 
-def test_reminder_delivery_states(conn, _mock_llm):
+def test_reminder_delivery_states(conn, monkeypatch, tmp_path):
     from app.reminders import record_dlr, send_due
+    _script(monkeypatch, tmp_path, [_plan(
+        [_t("reminder", {"when": "in 5 minutes to check"})])])
     from app.sendqueue import drain
     sent = now_sast()
     handle_text(conn, SHOP, "remind me in 5 minutes to check", sent)
@@ -180,7 +228,10 @@ def test_reminder_delivery_states(conn, _mock_llm):
     assert row["status"] == "delivered"
 
 
-def test_names_never_split(conn):
+def test_names_never_split(conn, monkeypatch, tmp_path):
+    _script(monkeypatch, tmp_path, [_plan(
+        [_t("reminder",
+            {"when": "remind me Thursday 6:30 to collect from Sipho and Thandi"})])])
     handle_text(conn, SHOP,
                 "remind me Thursday 6:30 to collect from Sipho and Thandi")
     rows = conn.execute("SELECT summary FROM reminders WHERE shop_id = ?",
@@ -189,14 +240,20 @@ def test_names_never_split(conn):
     assert "sipho and thandi" in rows[0]["summary"]
 
 
-def test_milk_words_never_record(conn, _mock_llm):
+def test_milk_words_never_record(conn, monkeypatch, tmp_path):
+    _script(monkeypatch, tmp_path, [_plan(
+        [_t("chat", {"reply": "Noted, thanks."})])])
     handle_text(conn, SHOP, "Milk delivery arriving in about 15 minutes")
     assert conn.execute("SELECT COUNT(*) n FROM reminders WHERE shop_id = ?",
                         (SHOP,)).fetchone()["n"] == 0
     assert _tables(conn) == {k: 0 for k in _tables(conn)}
 
 
-def test_affordability_needs_amount_first(conn):
+def test_affordability_needs_amount_first(conn, monkeypatch, tmp_path):
+    _script(monkeypatch, tmp_path, [
+        _plan([_t("affordability", {})]),
+        _plan([_t("affordability", {"amount_cents": 20000})]),
+        _plan([_t("affordability", {"amount_cents": 200000})])])
     msg, _b = handle_text(conn, SHOP, "can we afford to pay the supplier")
     assert "How much is the payment" in msg
     msg, _b = handle_text(conn, SHOP, "can we afford R200")

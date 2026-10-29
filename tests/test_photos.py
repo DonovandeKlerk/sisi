@@ -54,11 +54,30 @@ def test_read_shop_photo_bad_json(monkeypatch):
         raise AssertionError("expected VisionError")
 
 
+def _stub_plan(monkeypatch, body):
+    import json
+    from types import SimpleNamespace
+
+    import app.interpreter as interp
+
+    def fake(messages):
+        return SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content=json.dumps(body)))],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1,
+                                  total_tokens=2))
+
+    monkeypatch.setattr(interp, "propose_plan", fake)
+
+
 def test_handle_photo_other_helps(conn, monkeypatch):
     seed_demo(SHOP, conn)
     conn.execute("UPDATE shops SET language = 'en' WHERE shop_id = ?", (SHOP,))
     conn.commit()
     monkeypatch.setattr(agent, "read_shop_photo", lambda image, shop="": _doc("other"))
+    _stub_plan(monkeypatch, {"understood": "unrecognized photo", "tasks": [],
+                             "question": "Is this a book page, till slip, shelf or stock photo?",
+                             "options": []})
     _, reply, buttons = handle_photo(conn, SHOP, b"photo-1")
     assert buttons is None
     assert "book page" in reply and "till slip" in reply
@@ -78,6 +97,10 @@ def test_duplicate_photo_detected_after_save(conn, monkeypatch):
             {"product": "Milk 1L", "qty": 2, "expiry_date": "2020-01-01"}]})
 
     monkeypatch.setattr(agent, "read_shop_photo", fake_read)
+    _stub_plan(monkeypatch, {"understood": "expiry photo",
+                             "tasks": [{"kind": "expiry_photo", "args": {},
+                                        "quote": ""}],
+                             "question": None, "options": []})
     _, first, buttons = handle_photo(conn, SHOP, b"same-bytes")
     assert buttons == ["Yes", "No"]
     handle_text(conn, SHOP, "Yes")
