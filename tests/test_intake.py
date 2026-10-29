@@ -16,8 +16,7 @@ import app.interpreter as interp
 from app import agent
 from app.db import init_db
 from app.setup import skip_setup
-from app.tools import (account_balance, get_pending, propose_stock_intake,
-                       record_photo)
+from app.tools import (account_balance, get_pending, propose_stock_intake)
 from seed.seed_demo import DEMO_SHOP_ID, seed_demo
 
 SHOP = DEMO_SHOP_ID
@@ -77,6 +76,12 @@ def _photo(monkeypatch, products, caption=CAPTION):
     return caption
 
 
+def _seed_oneshot(conn, products, names):
+    """One-shot preview seeded directly (photos now route to guided)."""
+    return propose_stock_intake(
+        conn, SHOP, products, [{"product": n} for n in names], None, "h")
+
+
 # vision evidence ------------------------------------------------------------
 
 def test_vision_schema_requests_products():
@@ -133,72 +138,62 @@ def test_brief_carries_products_and_caption():
 
 # intake preview -------------------------------------------------------------
 
-def test_photo_intake_preview_not_rejection(conn, shop, monkeypatch):
-    caption = _photo(monkeypatch, [_prod("Sasko", "White Bread", "700g", 2)])
-    _stub(monkeypatch, _stock_add("Sasko White Bread 700g"))
-    _, reply, buttons = agent.handle_photo(conn, SHOP, b"pic", caption)
+def test_oneshot_preview_not_rejection(conn, shop):
+    reply = _seed_oneshot(conn, [_prod("Sasko", "White Bread", "700g", 2)],
+                          ["Sasko White Bread 700g"])
     assert "can't tell what this is" not in reply
     assert "📦 *Stock intake*" in reply
     assert "×2 seen" in reply
     assert "sells R" in reply and "(list)" in reply
-    assert buttons == ["Yes", "No"]
     assert get_pending(conn, SHOP)["action_type"] == "stock_intake"
 
 
-def test_unseen_caption_reaches_intake(conn, shop, monkeypatch):
-    caption = _photo(monkeypatch, [_prod("Sasko", "White Bread", "700g", 1)],
-                     "we bought groceries, capture them for the shop")
-    _stub(monkeypatch, _stock_add("Sasko White Bread 700g"))
-    _, reply, _ = agent.handle_photo(conn, SHOP, b"pic", caption)
+def test_seen_product_reaches_oneshot(conn, shop):
+    reply = _seed_oneshot(conn, [_prod("Sasko", "White Bread", "700g", 1)],
+                          ["Sasko White Bread 700g"])
     assert "📦 *Stock intake*" in reply
 
 
-def test_new_product_asks_price_not_guess(conn, shop, monkeypatch):
-    caption = _photo(monkeypatch, [_prod("Whey", "Protein", "2kg", 1)])
-    _stub(monkeypatch, _stock_add("Whey Protein 2kg"))
-    _, reply, _ = agent.handle_photo(conn, SHOP, b"pic", caption)
+def test_new_product_asks_price_not_guess(conn, shop):
+    reply = _seed_oneshot(conn, [_prod("Whey", "Protein", "2kg", 1)],
+                          ["Whey Protein 2kg"])
     assert "NEW" in reply
     assert "sells ?" in reply
     assert "selling price" in reply
 
 
-def test_size_mismatch_never_substitutes(conn, shop, monkeypatch):
+def test_size_mismatch_never_substitutes(conn, shop):
     # Marie 200g stocked; a multipack must not merge into it.
-    caption = _photo(monkeypatch, [_prod("Marie", "", "Multipack", 1)])
-    _stub(monkeypatch, _stock_add("Marie Multipack"))
-    _, reply, _ = agent.handle_photo(conn, SHOP, b"pic", caption)
+    reply = _seed_oneshot(conn, [_prod("Marie", "", "Multipack", 1)],
+                          ["Marie Multipack"])
     assert "NEW" in reply
     assert "singles per pack?" in reply
 
 
-def test_obscured_label_asks_name(conn, shop, monkeypatch):
-    caption = _photo(monkeypatch,
-                     [_prod("", "", "", 1, False, "label turned away")])
-    _stub(monkeypatch, _stock_add())
-    _, reply, _ = agent.handle_photo(conn, SHOP, b"pic", caption)
+def test_obscured_label_asks_name(conn, shop):
+    reply = _seed_oneshot(
+        conn, [_prod("", "", "", 1, False, "label turned away")], [])
     assert "line 1 name" in reply
     msg, _ = agent.handle_text(conn, SHOP, "line 1 is Albany White Bread 700g")
     assert "Albany White Bread 700g" in msg
 
 
-def test_unclear_count_asks_qty(conn, shop, monkeypatch):
-    caption = _photo(monkeypatch,
-                     [_prod("Sasko", "White Bread", "700g", None, True,
-                            "stacked, can't count")])
-    _stub(monkeypatch, _stock_add("Sasko White Bread 700g"))
-    _, reply, _ = agent.handle_photo(conn, SHOP, b"pic", caption)
+def test_unclear_count_asks_qty(conn, shop):
+    reply = _seed_oneshot(
+        conn, [_prod("Sasko", "White Bread", "700g", None, True,
+                     "stacked, can't count")],
+        ["Sasko White Bread 700g"])
     assert "line 1 qty" in reply
     msg, _ = agent.handle_text(conn, SHOP, "4")
     assert "×4" in msg
 
 
-def test_ambiguous_match_asks_which(conn, shop, monkeypatch):
+def test_ambiguous_match_asks_which(conn, shop):
     conn.execute("INSERT INTO products (shop_id, name, price_cents, stock_qty)"
                  " VALUES (?, 'Sasko Brown Bread 700g', 2000, 5)", (SHOP,))
     conn.commit()
-    caption = _photo(monkeypatch, [_prod("Sasko", "Bread", "", 2)])
-    _stub(monkeypatch, _stock_add("Sasko Bread"))
-    _, reply, _ = agent.handle_photo(conn, SHOP, b"pic", caption)
+    reply = _seed_oneshot(conn, [_prod("Sasko", "Bread", "", 2)],
+                          ["Sasko Bread"])
     assert "which:" in reply
     msg, _ = agent.handle_text(conn, SHOP, "yes")
     assert "Still need" in msg  # never guesses between alternatives
@@ -206,10 +201,8 @@ def test_ambiguous_match_asks_which(conn, shop, monkeypatch):
     assert "which:" not in msg
 
 
-def test_no_products_asks_text_alternative(conn, shop, monkeypatch):
-    caption = _photo(monkeypatch, [])
-    _stub(monkeypatch, _stock_add("Sasko White Bread 700g"))
-    _, reply, buttons = agent.handle_photo(conn, SHOP, b"pic", caption)
+def test_no_products_asks_text_alternative(conn, shop):
+    reply = _seed_oneshot(conn, [], ["Sasko White Bread 700g"])
     assert "can't tell what this is" not in reply
     # planner named an item but vision saw none: intake still proposes it
     assert "📦 *Stock intake*" in reply
@@ -224,31 +217,29 @@ def test_empty_intake_offers_text_alternative(conn, shop):
 
 # answers, corrections, confirmation -----------------------------------------
 
-def _seed_intake(conn, monkeypatch):
-    caption = _photo(monkeypatch, [_prod("Sasko", "White Bread", "700g", 2),
-                                   _prod("Marie", "", "Multipack", 1)])
-    _stub(monkeypatch, _stock_add("Sasko White Bread 700g",
-                                  "Marie Multipack"))
-    agent.handle_photo(conn, SHOP, b"pic", caption)
+def _seed_intake(conn):
+    _seed_oneshot(conn, [_prod("Sasko", "White Bread", "700g", 2),
+                         _prod("Marie", "", "Multipack", 1)],
+                  ["Sasko White Bread 700g", "Marie Multipack"])
 
 
-def test_yes_blocked_until_qty_resolved(conn, shop, monkeypatch):
-    _seed_intake(conn, monkeypatch)
+def test_yes_blocked_until_qty_resolved(conn, shop):
+    _seed_intake(conn)
     msg, _ = agent.handle_text(conn, SHOP, "yes")
     assert "Still need" in msg
     assert "singles-per-pack" in msg
     assert get_pending(conn, SHOP) is not None  # nothing saved
 
 
-def test_per_pack_answer_resolves_multipack(conn, shop, monkeypatch):
-    _seed_intake(conn, monkeypatch)
+def test_per_pack_answer_resolves_multipack(conn, shop):
+    _seed_intake(conn)
     msg, _ = agent.handle_text(conn, SHOP, "line 2: 12 per pack")
     assert "singles-per-pack" not in msg
     assert "×12" in msg
 
 
-def test_price_answers_and_cost_sell_clarify(conn, shop, monkeypatch):
-    _seed_intake(conn, monkeypatch)
+def test_price_answers_and_cost_sell_clarify(conn, shop):
+    _seed_intake(conn)
     msg, _ = agent.handle_text(conn, SHOP, "line 1: cost R18, sell R21")
     assert "cost R18.00" in msg and "sells R21.00 (you said)" in msg
     msg, _ = agent.handle_text(conn, SHOP, "line 2: 12 per pack, cost R30")
@@ -257,35 +248,33 @@ def test_price_answers_and_cost_sell_clarify(conn, shop, monkeypatch):
     assert "sells R45.00 (you said)" in msg  # only sell was missing
 
 
-def test_bare_amount_asks_cost_vs_sell(conn, shop, monkeypatch):
-    caption = _photo(monkeypatch, [_prod("Whey", "Protein", "2kg", 1)])
-    _stub(monkeypatch, _stock_add("Whey Protein 2kg"))
-    agent.handle_photo(conn, SHOP, b"pic", caption)
+def test_bare_amount_asks_cost_vs_sell(conn, shop):
+    _seed_oneshot(conn, [_prod("Whey", "Protein", "2kg", 1)],
+                  ["Whey Protein 2kg"])
     msg, _ = agent.handle_text(conn, SHOP, "R450")
     assert "cost" in msg and "selling price" in msg
     msg, _ = agent.handle_text(conn, SHOP, "cost")
     assert "cost R450.00" in msg
 
 
-def test_bulk_answer_by_name(conn, shop, monkeypatch):
-    _seed_intake(conn, monkeypatch)
+def test_bulk_answer_by_name(conn, shop):
+    _seed_intake(conn)
     msg, _ = agent.handle_text(conn, SHOP, "marie 12 per pack")
     assert "×12" in msg
 
 
-def test_correction_and_unknown_line(conn, shop, monkeypatch):
-    _seed_intake(conn, monkeypatch)
+def test_correction_and_unknown_line(conn, shop):
+    _seed_intake(conn)
     msg, _ = agent.handle_text(conn, SHOP, "line 1 is 3 loaves")
     assert "×3" in msg
     msg, _ = agent.handle_text(conn, SHOP, "line 9 is 2")
     assert "no line 9" in msg
 
 
-def test_save_posts_no_payment_without_cost(conn, shop, monkeypatch):
+def test_save_posts_no_payment_without_cost(conn, shop):
     cash_before = account_balance(conn, SHOP, "cash")
-    caption = _photo(monkeypatch, [_prod("Sasko", "White Bread", "700g", 2)])
-    _stub(monkeypatch, _stock_add("Sasko White Bread 700g"))
-    agent.handle_photo(conn, SHOP, b"pic", caption)
+    _seed_oneshot(conn, [_prod("Sasko", "White Bread", "700g", 2)],
+                  ["Sasko White Bread 700g"])
     msg, _ = agent.handle_text(conn, SHOP, "yes")
     assert "Stock saved" in msg
     assert account_balance(conn, SHOP, "cash") == cash_before
@@ -293,10 +282,9 @@ def test_save_posts_no_payment_without_cost(conn, shop, monkeypatch):
                         " WHERE shop_id = ?", (SHOP,)).fetchone()["n"] == 0
 
 
-def test_repeated_yes_is_idempotent(conn, shop, monkeypatch):
-    caption = _photo(monkeypatch, [_prod("Sasko", "White Bread", "700g", 2)])
-    _stub(monkeypatch, _stock_add("Sasko White Bread 700g"))
-    agent.handle_photo(conn, SHOP, b"pic", caption)
+def test_repeated_yes_is_idempotent(conn, shop):
+    _seed_oneshot(conn, [_prod("Sasko", "White Bread", "700g", 2)],
+                  ["Sasko White Bread 700g"])
     agent.handle_text(conn, SHOP, "yes")
     before = conn.execute("SELECT stock_qty FROM products"
                           " WHERE shop_id = ? AND name = ?",
@@ -309,12 +297,10 @@ def test_repeated_yes_is_idempotent(conn, shop, monkeypatch):
     assert after == before
 
 
-def test_undo_reverses_whole_intake(conn, shop, monkeypatch):
-    caption = _photo(monkeypatch, [_prod("Sasko", "White Bread", "700g", 2),
-                                   _prod("Whey", "Protein", "2kg", 1,
-                                         notes="new")])
-    _stub(monkeypatch, _stock_add("Sasko White Bread 700g", "Whey Protein 2kg"))
-    agent.handle_photo(conn, SHOP, b"pic", caption)
+def test_undo_reverses_whole_intake(conn, shop):
+    _seed_oneshot(conn, [_prod("Sasko", "White Bread", "700g", 2),
+                         _prod("Whey", "Protein", "2kg", 1, notes="new")],
+                  ["Sasko White Bread 700g", "Whey Protein 2kg"])
     agent.handle_text(conn, SHOP, "line 2: sell R500")
     agent.handle_text(conn, SHOP, "yes")
     assert conn.execute("SELECT COUNT(*) n FROM products WHERE shop_id = ?"
@@ -327,12 +313,17 @@ def test_undo_reverses_whole_intake(conn, shop, monkeypatch):
                         ).fetchone()["n"] == 0
 
 
-def test_duplicate_photo_detected_after_intake(conn, shop, monkeypatch):
-    from app.tools import get_intake_session
+def test_duplicate_photo_detected_after_guided_intake(conn, shop,
+                                                     monkeypatch):
+    import hashlib
+
+    from app.tools import get_intake_session, record_photo
     caption = _photo(monkeypatch, [_prod("Sasko", "White Bread", "700g", 2)])
     _stub(monkeypatch, _stock_add("Sasko White Bread 700g"))
     agent.handle_photo(conn, SHOP, b"same-pic", caption)
-    agent.handle_text(conn, SHOP, "yes")
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+    # Task 6 owns the item applier; its confirm records the photo as saved.
+    record_photo(conn, SHOP, hashlib.sha256(b"same-pic").hexdigest(), "stock")
     _, reply, _ = agent.handle_photo(conn, SHOP, b"same-pic", caption)
     assert "already saved" in reply and "restock" in reply  # ask first
     agent.handle_text(conn, SHOP, "restock")  # starts a guided session
@@ -356,11 +347,9 @@ def test_restart_keeps_intake_answerable(tmp_path, monkeypatch):
     conn.execute("UPDATE shops SET language = 'en' WHERE shop_id = ?",
                  (SHOP,))
     conn.commit()
-    monkeypatch.setattr(agent, "read_shop_photo",
-                        lambda image, shop="": _doc(
-                            [_prod("Sasko", "White Bread", "700g", 2)]))
-    _stub(monkeypatch, _stock_add("Sasko White Bread 700g"))
-    agent.handle_photo(conn, SHOP, b"pic", CAPTION)
+    propose_stock_intake(
+        conn, SHOP, [_prod("Sasko", "White Bread", "700g", 2)],
+        [{"product": "Sasko White Bread 700g"}], None, "h")
     conn.close()  # worker restart: new connection, same shop DB
     conn2 = connect(str(db_path))
     try:
@@ -370,19 +359,18 @@ def test_restart_keeps_intake_answerable(tmp_path, monkeypatch):
         conn2.close()
 
 
-def test_shop_isolation(conn, shop, monkeypatch):
+def test_shop_isolation(conn, shop):
     other = "27710000099"
     skip_setup(conn, other)
-    caption = _photo(monkeypatch, [_prod("Sasko", "White Bread", "700g", 2)])
-    _stub(monkeypatch, _stock_add("Sasko White Bread 700g"))
-    agent.handle_photo(conn, SHOP, b"pic", caption)
+    _seed_oneshot(conn, [_prod("Sasko", "White Bread", "700g", 2)],
+                  ["Sasko White Bread 700g"])
     msg, _ = agent.handle_text(conn, other, "line 1: cost R18")
     assert "cost R18.00" not in msg  # other's shop has no intake
     assert get_pending(conn, SHOP) is not None  # ours waits untouched
 
 
 def test_unrelated_question_passes_planner(conn, shop, monkeypatch):
-    _seed_intake(conn, monkeypatch)
+    _seed_intake(conn)
     _stub(monkeypatch, [{"kind": "cash", "args": {}, "quote": ""}])
     msg, _ = agent.handle_text(conn, SHOP, "how much is in the till?")
     assert "Cash" in msg

@@ -554,14 +554,33 @@ def _exec_payment(conn, shop_id, args, bundle):
 
 
 def _exec_stock_add(conn, shop_id, args, bundle):
-    from app.tools import add_stock, propose_stock_intake
+    from app.tools import (add_stock, get_pending, propose_stock_intake,
+                           start_guided_intake)
     raw_items = [e for e in args.get("items") or [] if isinstance(e, dict)]
     doc = bundle.get("doc") or {}
     is_photo = "digest" in bundle or (
         isinstance(doc, dict) and bool(doc.get("products")))
-    if is_photo or len(raw_items) > 1:
-        # photo intake or multi-item: one editable preview, one confirm
-        from app.tools import get_pending
+    if is_photo:
+        # photo intake: guided one-product-at-a-time session (grounding
+        # happens inside start_guided_intake). Text multi-item keeps the
+        # one-shot preview below.
+        from app.db import now_iso
+        if get_pending(conn, shop_id) is not None:
+            # _propose used to supersede this; a fresh photo intake still
+            # replaces any live preview so Yes can't confirm stale lines.
+            conn.execute(
+                "UPDATE pending_actions SET status = 'superseded',"
+                " resolved_at = ? WHERE shop_id = ? AND status = 'pending'",
+                (now_iso(), shop_id))
+            conn.commit()
+        caption = bundle.get("caption") or bundle.get("cap") \
+            or bundle.get("text") or bundle.get("quote") or ""
+        products = doc.get("products", []) if isinstance(doc, dict) else []
+        return start_guided_intake(
+            conn, shop_id, products, raw_items, caption,
+            bundle.get("digest") or "", args.get("supplier")), None
+    if len(raw_items) > 1:
+        # text multi-item: one editable preview, one confirm
         prior = None
         pend = get_pending(conn, shop_id)
         if pend is not None and pend["action_type"] == "stock_intake" \

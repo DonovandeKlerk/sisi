@@ -646,3 +646,82 @@ def test_same_photo_resend_reasks(conn, shop, monkeypatch):
     assert "cost" in reply.lower()  # current question re-asked
     assert not get_intake_session(conn, SHOP)["stash"].get("kind")  # no stash
     assert len(get_intake_session(conn, SHOP)["items_json"]) == 1
+
+
+# Task 5 fix: first-photo routing ------------------------------------------
+
+
+def _stub_plan(monkeypatch, tasks):
+    import json
+    from types import SimpleNamespace
+
+    import app.interpreter as interp
+
+    def fake(messages):
+        body = {"understood": "photo fix test", "tasks": tasks,
+                "question": None, "options": []}
+        return SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content=json.dumps(body)))],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1,
+                                  total_tokens=2))
+
+    monkeypatch.setattr(interp, "propose_plan", fake)
+
+
+def test_first_photo_starts_guided_session(conn, shop, monkeypatch):
+    from app import agent as agent_mod
+    monkeypatch.setattr(
+        agent_mod, "read_shop_photo",
+        lambda image, shop="": {"doc_type": "other",
+                                "products": [_vprod("Whey Protein 2kg", 1)]})
+    _stub_plan(monkeypatch, [{"kind": "stock_add",
+                              "args": {"items": [{"product":
+                                                  "Whey Protein 2kg"}]},
+                              "quote": "add to stock"}])
+    _, reply, _ = agent_mod.handle_photo(conn, SHOP, b"first-pic",
+                                         "add to stock")
+    assert "📦 *Stock intake*" not in reply  # guided, not one-shot
+    assert "Found 1 items: Whey Protein 2kg." in reply  # overview
+    assert "Item 1 of 1" in reply
+    assert "cost" in reply.lower()  # first guided question
+    session = get_intake_session(conn, SHOP)
+    assert session is not None and session["field"] == "cost"
+    assert get_pending(conn, SHOP) is None  # question asked, nothing pending
+    msg, _ = agent_mod.handle_text(conn, SHOP, "R16")  # answer advances
+    assert "selling price" in msg
+    assert get_intake_session(conn, SHOP)["field"] == "sell"
+
+
+def test_text_multi_item_keeps_oneshot(conn, shop, monkeypatch):
+    from app import agent as agent_mod
+    _stub_plan(monkeypatch, [{"kind": "stock_add",
+                              "args": {"items": [{"product": "Bread"},
+                                                 {"product": "Milk"}]},
+                              "quote": "add bread and milk"}])
+    msg, _ = agent_mod.handle_text(conn, SHOP,
+                                   "add 2 bread and 3 milk to stock")
+    assert "📦 *Stock intake*" in msg  # one-shot preview kept
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake"
+    assert get_intake_session(conn, SHOP) is None  # no guided session
+
+
+def test_photo_supersedes_live_oneshot(conn, shop, monkeypatch):
+    from app import agent as agent_mod
+    _stub_plan(monkeypatch, [{"kind": "stock_add",
+                              "args": {"items": [{"product": "Bread"},
+                                                 {"product": "Milk"}]},
+                              "quote": "add bread and milk"}])
+    agent_mod.handle_text(conn, SHOP, "add 2 bread and 3 milk to stock")
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake"
+    monkeypatch.setattr(
+        agent_mod, "read_shop_photo",
+        lambda image, shop="": {"doc_type": "other",
+                                "products": [_vprod("Whey Protein 2kg", 1)]})
+    _stub_plan(monkeypatch, [{"kind": "stock_add",
+                              "args": {"items": [{"product":
+                                                  "Whey Protein 2kg"}]},
+                              "quote": "add to stock"}])
+    agent_mod.handle_photo(conn, SHOP, b"fresh-pic", "add to stock")
+    assert get_intake_session(conn, SHOP)["field"] == "cost"
+    assert get_pending(conn, SHOP) is None  # stale one-shot can't catch Yes
