@@ -211,7 +211,8 @@ def get_pending(conn: sqlite3.Connection, shop_id: str) -> sqlite3.Row | None:
     ).fetchone()
 
 
-def _propose(conn: sqlite3.Connection, shop_id: str, action_type: str, payload: dict, preview: str) -> str:
+def _propose(conn: sqlite3.Connection, shop_id: str, action_type: str, payload: dict, preview: str,
+             *, commit: bool = True) -> str:
     conn.execute(
         "UPDATE pending_actions SET status = 'superseded', resolved_at = ?"
         " WHERE shop_id = ? AND status = 'pending'",
@@ -222,7 +223,8 @@ def _propose(conn: sqlite3.Connection, shop_id: str, action_type: str, payload: 
         " created_at) VALUES (?, ?, ?, ?, ?)",
         (shop_id, action_type, json.dumps(payload), preview, now_iso()),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return preview
 
 
@@ -248,7 +250,8 @@ def confirm_pending(conn: sqlite3.Connection, shop_id: str) -> str:
                       "receipt": "receipt",
                       "stock_intake": "stock",
                       "stock_intake_item": "stock"}.get(row["action_type"], "")
-        record_photo(conn, shop_id, payload["photo_hash"], photo_kind)
+        record_photo(conn, shop_id, payload["photo_hash"], photo_kind,
+                     commit=False)
     conn.execute(
         "INSERT INTO actions (action_id, shop_id, kind, summary, data_json) VALUES (?, ?, ?, ?, ?)",
         (action_id, shop_id, kind, summary, json.dumps(undo)),
@@ -1334,7 +1337,7 @@ def _load_intake_json(raw: str | None, default):
 
 
 def save_intake_session(conn: sqlite3.Connection, shop_id: str,
-                        session: dict) -> None:
+                        session: dict, *, commit: bool = True) -> None:
     """Upsert the active guided-intake session for a shop (24h expiry)."""
     ensure_shop(conn, shop_id)
     now = now_iso()
@@ -1362,7 +1365,8 @@ def save_intake_session(conn: sqlite3.Connection, shop_id: str,
          _dump_intake_json(session.get("stash"), "{}"),
          now, expires),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def get_intake_session(conn: sqlite3.Connection, shop_id: str) -> dict | None:
@@ -1390,10 +1394,12 @@ def get_intake_session(conn: sqlite3.Connection, shop_id: str) -> dict | None:
     }
 
 
-def clear_intake_session(conn: sqlite3.Connection, shop_id: str) -> None:
+def clear_intake_session(conn: sqlite3.Connection, shop_id: str,
+                         *, commit: bool = True) -> None:
     conn.execute("DELETE FROM intake_sessions WHERE shop_id = ?",
                  (shop_id,))
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -2471,7 +2477,7 @@ def _guided_line_detail(item: dict) -> str:
 
 
 def propose_intake_item(conn: sqlite3.Connection, shop_id: str,
-                        idx: int) -> str:
+                        idx: int, *, commit: bool = True) -> str:
     """Propose the per-item Yes/No preview for items[idx]."""
     session = get_intake_session(conn, shop_id)
     items = (session or {}).get("items_json") or []
@@ -2494,7 +2500,7 @@ def propose_intake_item(conn: sqlite3.Connection, shop_id: str,
         item["cost_normalized"] = True
     session["current"] = idx
     session["field"] = None
-    save_intake_session(conn, shop_id, session)
+    save_intake_session(conn, shop_id, session, commit=commit)
     head = _t("g_item", i=idx + 1, n=len(items),
               name=item.get("name") or "?")
     payload = {"idx": idx, "item": item,
@@ -2502,7 +2508,7 @@ def propose_intake_item(conn: sqlite3.Connection, shop_id: str,
                "photo_hash": session.get("photo_digest") or ""}
     return _propose(conn, shop_id, "stock_intake_item", payload,
                     f"{head}\n{_guided_line_detail(item)}\n"
-                    f"{_t('g_preview_ask')}")
+                    f"{_t('g_preview_ask')}", commit=commit)
 
 
 def _guided_qty_bit(item: dict, totals: dict, stock) -> str:
@@ -2539,6 +2545,33 @@ def _guided_summary(items: list) -> str:
     return "\n".join(lines)
 
 
+def _guided_noop_undo(conn: sqlite3.Connection, shop_id: str,
+                      item: dict, name: str) -> dict:
+    """No-op "stock" undo for a stale done-state re-entry (never re-saves).
+
+    Restores the product row's current values with qty 0, so undoing the
+    duplicate confirm changes nothing.
+    """
+    row = None
+    if item.get("product_id") is not None:
+        row = conn.execute("SELECT id, wholesaler, cost_cents, price_cents,"
+                           " pack_price_cents FROM products WHERE id = ?",
+                           (item["product_id"],)).fetchone()
+    if row is None:
+        row = conn.execute("SELECT id, wholesaler, cost_cents, price_cents,"
+                           " pack_price_cents FROM products"
+                           " WHERE shop_id = ? AND name = ?"
+                           " ORDER BY id DESC LIMIT 1",
+                           (shop_id, name)).fetchone()
+    if row is None:  # product deleted between save and retry; nothing to undo
+        return {"product_id": item.get("product_id"), "qty": 0,
+                "created": False}
+    return {"product_id": row["id"], "qty": 0, "created": False,
+            "old_wholesaler": row["wholesaler"],
+            "old_cost": row["cost_cents"], "old_price": row["price_cents"],
+            "old_pack": row["pack_price_cents"]}
+
+
 def _apply_stock_intake_item(conn: sqlite3.Connection, shop_id: str,
                              payload: dict, action_id: str):
     """Save one guided item atomically, then advance or summarize.
@@ -2548,6 +2581,10 @@ def _apply_stock_intake_item(conn: sqlite3.Connection, shop_id: str,
     marks the item done, and appends the next prompt or the final
     summary. Kind "stock" so undo names the product. Own action_id per
     item keeps saves and undos per-item and atomic.
+
+    Never commits: confirm_pending's single commit covers the stock
+    writes, session advance, next-item propose, photo record, and
+    actions row atomically.
     """
     item = dict(payload.get("item") or {})
     try:
@@ -2562,6 +2599,19 @@ def _apply_stock_intake_item(conn: sqlite3.Connection, shop_id: str,
     unit = (item.get("sell_unit") or "").strip().lower()
     if unit == "whole":
         unit = "pack"
+    # Read the session BEFORE any writes: get_intake_session may commit
+    # (lazy expiry cleanup), which must never flush half an apply.
+    session = get_intake_session(conn, shop_id)
+    items = (session or {}).get("items_json") or []
+    summary = f"stock {name} +{_fmt_qty(stock)}"
+    saved_line = _t("g_item_saved", name=name,
+                    qty=_guided_qty_bit(item, totals, stock))
+    if session is not None and 0 <= idx < len(items) \
+            and items[idx].get("state") == "done":
+        # Stale re-entry (retry-Yes after this item already saved):
+        # acknowledge without writing stock twice.
+        return (f"{saved_line}\n{_t('g_no_preview')}", "stock",
+                summary, _guided_noop_undo(conn, shop_id, item, name))
     # Shoplist prices are display-only; only stated prices are written.
     if unit == "pack":
         stated = item.get("pack_sell_source") == "stated" \
@@ -2603,11 +2653,6 @@ def _apply_stock_intake_item(conn: sqlite3.Connection, shop_id: str,
         cols = ", ".join(f"{col} = ?" for col in row_fix)
         conn.execute(f"UPDATE products SET {cols} WHERE id = ?",
                      (*row_fix.values(), undo["product_id"]))
-    summary = f"stock {name} +{_fmt_qty(stock)}"
-    saved_line = _t("g_item_saved", name=name,
-                    qty=_guided_qty_bit(item, totals, stock))
-    session = get_intake_session(conn, shop_id)
-    items = (session or {}).get("items_json") or []
     if session is None or idx != session.get("current") \
             or idx < 0 or idx >= len(items):
         # The Yes still stands (this item is saved); only the guided
@@ -2621,15 +2666,15 @@ def _apply_stock_intake_item(conn: sqlite3.Connection, shop_id: str,
         nxt_idx += 1
     if nxt_idx >= len(items):
         done = _guided_summary(items)
-        clear_intake_session(conn, shop_id)
+        clear_intake_session(conn, shop_id, commit=False)
         return (f"{saved_line}\n{done}", "stock", summary, undo)
     session["current"] = nxt_idx
     nxt = _guided_next_field(items[nxt_idx])
     session["field"] = nxt
-    save_intake_session(conn, shop_id, session)
+    save_intake_session(conn, shop_id, session, commit=False)
     if nxt is None:
         return (f"{saved_line}\n"
-                f"{propose_intake_item(conn, shop_id, nxt_idx)}",
+                f"{propose_intake_item(conn, shop_id, nxt_idx, commit=False)}",
                 "stock", summary, undo)
     head = _t("g_item", i=nxt_idx + 1, n=len(items),
               name=items[nxt_idx].get("name") or "?")
@@ -4415,10 +4460,11 @@ def photo_seen(conn: sqlite3.Connection, shop_id: str, digest: str):
 
 
 def record_photo(conn: sqlite3.Connection, shop_id: str, digest: str, kind: str,
-                 note: str = "") -> None:
+                 note: str = "", *, commit: bool = True) -> None:
     conn.execute("INSERT OR IGNORE INTO photo_hashes (shop_id, hash, kind, note)"
                  " VALUES (?, ?, ?, ?)", (shop_id, digest, kind, note))
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 BOOK_ALIASES = {

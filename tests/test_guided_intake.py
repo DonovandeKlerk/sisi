@@ -746,6 +746,17 @@ def _drive_new_to_preview(conn, cost_answer, sell_answer):
     return msg
 
 
+def _shop_counts(conn):
+    """Row counts per shop-scoped table (atomicity snapshots)."""
+    return {
+        table: conn.execute(f"SELECT COUNT(*) n FROM {table}"
+                            " WHERE shop_id = ?", (SHOP,)).fetchone()["n"]
+        for table in ("products", "stock_moves", "cash_moves",
+                      "supplier_moves", "actions", "photo_hashes",
+                      "intake_sessions", "pending_actions")
+    }
+
+
 def test_item_save_advances_and_summary_ends(conn, shop):
     from app import agent as agent_mod
     start_guided_intake(
@@ -913,3 +924,98 @@ def test_guided_confirm_records_photo(conn, shop):
                        " WHERE shop_id = ? AND hash = ?",
                        (SHOP, "t6h")).fetchone()
     assert row is not None and row["kind"] == "stock"
+
+
+# Task 6 fix: single-commit atomicity -------------------------------------
+
+
+def test_item_apply_rollback_leaves_zero_writes(conn, shop):
+    import json
+
+    from app import agent as agent_mod
+    from app.tools import _apply_stock_intake_item
+    start_guided_intake(
+        conn, SHOP,
+        [_vprod("Whey Protein 2kg", 1),
+         _vprod("Sasko White Bread 700g", 2, readable=True)],
+        [{"product": "Whey Protein 2kg"}],
+        "add to stock", "t6x1")
+    _drive_new_to_preview(conn, "R16", "sell R21")
+    before_session = json.dumps(get_intake_session(conn, SHOP),
+                                sort_keys=True)
+    before_pending = [dict(r) for r in conn.execute(
+        "SELECT * FROM pending_actions WHERE shop_id = ? ORDER BY id",
+        (SHOP,))]
+    before_products = [dict(r) for r in conn.execute(
+        "SELECT * FROM products WHERE shop_id = ? ORDER BY id", (SHOP,))]
+    before_counts = _shop_counts(conn)
+    payload = json.loads(get_pending(conn, SHOP)["payload_json"])
+    _apply_stock_intake_item(conn, SHOP, payload, "t6x1-action")
+    conn.rollback()  # crash before confirm_pending's single commit
+    assert _stock(conn, "Whey Protein 2kg") is None  # no stock write
+    assert json.dumps(get_intake_session(conn, SHOP),
+                      sort_keys=True) == before_session  # no advance
+    assert [dict(r) for r in conn.execute(
+        "SELECT * FROM pending_actions WHERE shop_id = ? ORDER BY id",
+        (SHOP,))] == before_pending  # no next-propose
+    assert [dict(r) for r in conn.execute(
+        "SELECT * FROM products WHERE shop_id = ? ORDER BY id",
+        (SHOP,))] == before_products
+    assert _shop_counts(conn) == before_counts
+    # Retry-Yes after the crash saves exactly once, then previews item 2.
+    msg, _ = agent_mod.handle_text(conn, SHOP, "yes")
+    assert "Saved" in msg and "Whey Protein 2kg" in msg
+    assert _stock(conn, "Whey Protein 2kg") == 1
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+
+
+def test_item_apply_rollback_on_final_close_keeps_session(conn, shop):
+    import json
+
+    from app import agent as agent_mod
+    from app.tools import _apply_stock_intake_item
+    start_guided_intake(conn, SHOP, [_vprod("Whey Protein 2kg", 1)], [],
+                        "add to stock", "t6x2")
+    _drive_new_to_preview(conn, "R16", "sell R21")
+    before = json.dumps(get_intake_session(conn, SHOP), sort_keys=True)
+    before_counts = _shop_counts(conn)
+    payload = json.loads(get_pending(conn, SHOP)["payload_json"])
+    _apply_stock_intake_item(conn, SHOP, payload, "t6x2-action")
+    conn.rollback()  # crash before confirm_pending's single commit
+    assert _stock(conn, "Whey Protein 2kg") is None
+    assert get_intake_session(conn, SHOP) is not None  # session not cleared
+    assert json.dumps(get_intake_session(conn, SHOP),
+                      sort_keys=True) == before
+    assert _shop_counts(conn) == before_counts
+    msg, _ = agent_mod.handle_text(conn, SHOP, "yes")
+    assert "Intake done" in msg
+    assert _stock(conn, "Whey Protein 2kg") == 1
+    assert get_intake_session(conn, SHOP) is None
+
+
+def test_stale_done_reentry_does_not_resave(conn, shop):
+    import json
+
+    from app import agent as agent_mod
+    from app.tools import _propose
+    start_guided_intake(
+        conn, SHOP,
+        [_vprod("Whey Protein 2kg", 1), _vprod("Oreo Cookies 200g", 2)],
+        [], "add to stock", "t6x3")
+    _drive_new_to_preview(conn, "R16", "sell R21")
+    stale_payload = json.loads(get_pending(conn, SHOP)["payload_json"])
+    agent_mod.handle_text(conn, SHOP, "yes")  # item 0 genuinely saved
+    assert _stock(conn, "Whey Protein 2kg") == 1
+    # Retry-Yes of the already-saved item (stale pending, item done).
+    _propose(conn, SHOP, "stock_intake_item", stale_payload, "stale retry")
+    msg, _ = agent_mod.handle_text(conn, SHOP, "yes")
+    assert "Saved" in msg and "already closed" in msg  # line + g_no_preview
+    assert _stock(conn, "Whey Protein 2kg") == 1  # not duplicated
+    assert get_intake_session(conn, SHOP)["current"] == 1  # no advance
+    # Undoing the duplicate confirm is a no-op.
+    agent_mod.handle_text(conn, SHOP, "undo")
+    row = conn.execute("SELECT stock_qty, cost_cents, price_cents"
+                       " FROM products WHERE shop_id = ? AND name = ?",
+                       (SHOP, "Whey Protein 2kg")).fetchone()
+    assert (row["stock_qty"], row["cost_cents"],
+            row["price_cents"]) == (1, 1600, 2100)
