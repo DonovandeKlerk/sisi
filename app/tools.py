@@ -1395,6 +1395,420 @@ def clear_intake_session(conn: sqlite3.Connection, shop_id: str) -> None:
     conn.commit()
 
 
+# ---------------------------------------------------------------------------
+# Guided new-product flow: one question per message, per-item preview.
+# ---------------------------------------------------------------------------
+
+# Number words 1-100 for guided answers (_NUMBER_WORDS only covers 1-10).
+_GUIDED_NUMBER_WORDS = {w: int(v) for w, v in _NUMBER_WORDS.items()}
+_GUIDED_NUMBER_WORDS.update({
+    "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+    "nineteen": 19, "twenty": 20, "thirty": 30, "forty": 40,
+    "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80,
+    "ninety": 90, "hundred": 100,
+})
+
+_GUIDED_MONEY_RES = (
+    re.compile(r"[Rr]\s*(\d+(?:\.\d{1,2})?)"),
+    re.compile(r"(\d+\.\d{1,2})"),
+    re.compile(r"(\d+(?:\.\d{1,2})?)\s*rand\b", re.IGNORECASE),
+    re.compile(r"(\d+(?:\.\d{1,2})?)"),
+)
+_GUIDED_COST_RE = re.compile(r"\bcosts?\b", re.IGNORECASE)
+_GUIDED_SELL_RE = re.compile(r"\bsells?\b|\bselling\b|\bprice\b",
+                             re.IGNORECASE)
+_GUIDED_SKIP = {"skip", "don't know", "dont know"}
+_GUIDED_MONEY_WORDS = {"rand", "rands", "cost", "costs", "sell", "sells",
+                       "selling", "price", "prices"}
+_GUIDED_SINGLES_WORDS = {"single", "singles", "loose", "each",
+                         "individual", "individually", "packet", "packets"}
+_GUIDED_WHOLE_WORDS = {"whole", "pack", "packs", "entire", "box", "boxes"}
+
+
+def _guided_word_number(text: str) -> int | None:
+    """First number-word value (1-100) in text; tens compounds included."""
+    toks = re.findall(r"[a-z]+", (text or "").lower())
+    for i, tok in enumerate(toks):
+        val = _GUIDED_NUMBER_WORDS.get(tok)
+        if val is None:
+            continue
+        if tok == "one" and toks[i + 1:i + 2] == ["hundred"]:
+            return 100
+        if val < 100 and val % 10 == 0 and i + 1 < len(toks):
+            low = _GUIDED_NUMBER_WORDS.get(toks[i + 1])
+            if low is not None and 1 <= low <= 9:
+                return val + low
+        return val
+    return None
+
+
+def _guided_amount_cents(text: str) -> int | None:
+    """Money in text as cents: R-prefix, decimal, 'N rand', bare, words."""
+    msg = text or ""
+    for rx in _GUIDED_MONEY_RES:
+        m = rx.search(msg)
+        if m:
+            return int(round(float(m.group(1)) * 100))
+    num = _guided_word_number(msg)
+    return num * 100 if num is not None else None
+
+
+def _guided_qty(text: str) -> float | None:
+    m = re.search(r"(\d+(?:\.\d+)?)", text or "")
+    if m:
+        qty = float(m.group(1))
+        return qty if qty > 0 else None
+    num = _guided_word_number(text)
+    return float(num) if num else None
+
+
+def _guided_is_skip(text: str) -> bool:
+    norm = re.sub(r"\s+", " ", (text or "").strip().lower().strip(" .!?"))
+    return norm in _GUIDED_SKIP
+
+
+def _guided_attempted(text: str) -> bool:
+    """True when the text looks like an intake answer (not new business)."""
+    msg = text or ""
+    if re.search(r"\d", msg):
+        return True
+    toks = set(re.findall(r"[a-z']+", msg.lower()))
+    return bool(toks & _GUIDED_MONEY_WORDS
+                or toks & set(_GUIDED_NUMBER_WORDS)
+                or toks & _SINGLE_WORDS or toks & _PACK_WORDS)
+
+
+def _guided_price_target(text: str, field: str) -> str:
+    """Which price field an answer names; defaults to the open field."""
+    has_cost = bool(_GUIDED_COST_RE.search(text or ""))
+    has_sell = bool(_GUIDED_SELL_RE.search(text or ""))
+    if has_cost and not has_sell:
+        return "cost"
+    if has_sell and not has_cost:
+        return "sell"
+    return field
+
+
+def _guided_pack_word(text: str) -> str | None:
+    for tok in re.findall(r"[a-z-]+", (text or "").lower()):
+        if tok in _PACK_WORDS or tok.endswith("-pack"):
+            return tok
+    return None
+
+
+def _guided_sell_unit(text: str) -> str | None:
+    toks = set(re.findall(r"[a-z]+", (text or "").lower()))
+    if "both" in toks:
+        return "both"
+    if toks & _GUIDED_SINGLES_WORDS:
+        return "singles"
+    if toks & _GUIDED_WHOLE_WORDS:
+        return "pack"
+    return None
+
+
+def _guided_pack_context(item: dict) -> bool:
+    if _is_pack_unit(item.get("unit")):
+        return True
+    if _MULTIPACK_RE.search(item.get("name") or ""):
+        return True
+    return bool(item.get("per_pack") or item.get("packs"))
+
+
+def _guided_next_field(item: dict) -> str | None:
+    """First still-open field: name -> which -> qty -> cost -> sell -> unit."""
+    if not (item.get("name") or "").strip() or item.get("name") == "?":
+        return "name"
+    if item.get("ambiguous"):
+        return "which"
+    if item.get("qty") is None:
+        return "qty"
+    if item.get("cost_cents") is None \
+            and item.get("cost_source") != "skipped":
+        return "cost"
+    if item.get("sell_cents") is None \
+            and item.get("sell_source") != "skipped":
+        return "sell"
+    if item.get("sell_unit") is None and _guided_pack_context(item):
+        return "sell_unit"
+    return None
+
+
+def ask_intake_field(item: dict, field: str) -> str:
+    """Render the one question for an open guided-intake field."""
+    name = (item.get("name") or "").strip() or "?"
+    if field == "which":
+        return _t("g_ask_which",
+                  names=" / ".join(item.get("ambiguous") or []))
+    if field == "qty":
+        return _t("g_ask_qty", name=name,
+                  seen=item.get("seen_label") or "?")
+    if field == "cost":
+        return _t("g_ask_cost", name=name)
+    if field == "sell":
+        return _t("g_ask_sell", name=name)
+    if field == "sell_unit":
+        return _t("g_ask_unit", name=name)
+    return _t("g_ask_name")
+
+
+def _guided_line(conn: sqlite3.Connection, shop_id: str, name: str,
+                 entry: dict, seen: dict | None,
+                 supplier: str | None) -> dict:
+    line = _intake_line(conn, shop_id, name, entry, seen, supplier)
+    seen_label = ""
+    if isinstance(seen, dict):
+        count = seen.get("visible_count")
+        if count:
+            try:
+                seen_label = _fmt_qty(float(count))
+            except (TypeError, ValueError):
+                seen_label = str(count)
+        elif str(seen.get("notes") or "").strip():
+            seen_label = str(seen["notes"]).strip()[:40]
+        else:
+            seen_label = "?"
+    qty = line.get("qty")
+    line.update({
+        "cost_basis": None, "sell_unit": None, "per_pack": None,
+        "packs": None, "state": "pending", "seen_label": seen_label,
+        "stock_units": float(qty) if qty is not None else None,
+        "supplier": (supplier or "").strip(),
+    })
+    return line
+
+
+def _guided_build_items(conn: sqlite3.Connection, shop_id: str,
+                        products: list, items: list, caption: str,
+                        supplier: str | None) -> list:
+    normed = []
+    for entry in items or []:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("product") or entry.get("name") or "").strip()
+        if not name:
+            continue
+        merged = dict(entry)
+        merged["product"] = " ".join(name.split())
+        normed.append(merged)
+    planned = ground_intake_items(normed, products, caption)
+    products = [p for p in products or [] if isinstance(p, dict)]
+    used: set[int] = set()
+    out = []
+    singles = len(planned) == 1 and len(products) == 1
+    for entry in planned:
+        name = " ".join(str(entry.get("product")).split())
+        seen = None
+        words = set(name.lower().split())
+        for i, prod in enumerate(products):
+            if i in used:
+                continue
+            if words & set(_intake_label(prod).lower().split()):
+                seen, used = prod, used | {i}
+                break
+        if seen is None and singles:
+            seen, used = products[0], {0}
+        out.append(_guided_line(conn, shop_id, name, entry, seen, supplier))
+    for i, prod in enumerate(products):
+        if i in used:
+            continue
+        label = _intake_label(prod)
+        out.append(_guided_line(conn, shop_id, label or "?", {}, prod,
+                                supplier))
+    return out
+
+
+def start_guided_intake(conn: sqlite3.Connection, shop_id: str,
+                        products: list, items: list, caption: str,
+                        photo_hash: str,
+                        supplier: str | None = None) -> str:
+    """Begin (replacing any active session): overview + first prompt."""
+    ensure_shop(conn, shop_id)
+    built = _guided_build_items(conn, shop_id, products, items, caption,
+                                supplier)
+    if not built:
+        return _t("intake_noproducts")
+    session = {
+        "photo_digest": photo_hash or "",
+        "caption": caption or "",
+        "vision_json": [p for p in products or [] if isinstance(p, dict)],
+        "items_json": built,
+        "current": 0,
+        "field": _guided_next_field(built[0]),
+        "status": "active",
+        "stash": {},
+    }
+    save_intake_session(conn, shop_id, session)
+    head = _t("g_head", done=0, total=len(built))
+    names = ", ".join(line.get("name") or "?" for line in built)
+    found = _t("g_found", n=len(built), names=names)
+    if session["field"] is None:
+        return f"{head}\n{found}\n" + propose_intake_item(conn, shop_id, 0)
+    first = _t("g_item", i=1, n=len(built),
+               name=built[0].get("name") or "?")
+    return (f"{head}\n{found}\n{first}\n"
+            f"{ask_intake_field(built[0], session['field'])}")
+
+
+def _guided_line_detail(item: dict) -> str:
+    qty = item.get("qty")
+    if qty is None:
+        qtybit = _t("intake_qty_q")
+    elif item.get("qty_source") == "seen":
+        qtybit = _t("intake_seen", n=_fmt_qty(qty))
+    else:
+        qtybit = f"×{_fmt_qty(qty)}"
+    if item.get("unit"):
+        qtybit += f" {item['unit']}"
+    if item.get("sell_cents") is not None:
+        key = "intake_sell_said" if item.get("sell_source") == "stated" \
+            else "intake_sell_list"
+        sellbit = _t(key, amt=cents_to_rand(item["sell_cents"]))
+    else:
+        sellbit = _t("intake_sell_q")
+    costbit = _t("intake_cost", amt=cents_to_rand(item["cost_cents"])) \
+        if item.get("cost_cents") is not None else _t("intake_cost_q")
+    tags = f" {_t('g_new_tag')}" if item.get("new") else ""
+    return f"• {qtybit} · {sellbit} · {costbit}{tags}"
+
+
+def propose_intake_item(conn: sqlite3.Connection, shop_id: str,
+                        idx: int) -> str:
+    """Propose the per-item Yes/No preview for items[idx]."""
+    session = get_intake_session(conn, shop_id)
+    items = (session or {}).get("items_json") or []
+    if session is None or idx < 0 or idx >= len(items):
+        return _t("intake_no_preview")
+    item = items[idx]
+    qty = item.get("qty")
+    item["stock_units"] = float(qty) if qty is not None else None
+    session["current"] = idx
+    session["field"] = None
+    save_intake_session(conn, shop_id, session)
+    head = _t("g_item", i=idx + 1, n=len(items),
+              name=item.get("name") or "?")
+    payload = {"idx": idx, "item": item,
+               "supplier": item.get("supplier") or "",
+               "photo_hash": session.get("photo_digest") or ""}
+    return _propose(conn, shop_id, "stock_intake_item", payload,
+                    f"{head}\n{_guided_line_detail(item)}\n"
+                    f"{_t('g_preview_ask')}")
+
+
+def _guided_set_name(conn: sqlite3.Connection, shop_id: str, item: dict,
+                     text: str) -> None:
+    name = " ".join(text.split())
+    item["name"] = name
+    pid, ambiguous, new = _intake_match(conn, shop_id, name)
+    item["product_id"], item["ambiguous"], item["new"] = pid, ambiguous, new
+    if pid is not None and item.get("sell_cents") is None:
+        row = conn.execute("SELECT price_cents FROM products WHERE id = ?",
+                           (pid,)).fetchone()
+        if row and row["price_cents"]:
+            item["sell_cents"], item["sell_source"] = row["price_cents"], \
+                "shoplist"
+
+
+def _guided_pick_which(conn: sqlite3.Connection, shop_id: str, item: dict,
+                       text: str) -> bool:
+    options = item.get("ambiguous") or []
+    if not options:
+        return True
+    msg = (text or "").strip().lower()
+    pick = None
+    if re.fullmatch(r"\d+", msg):
+        num = int(msg)
+        if 1 <= num <= len(options):
+            pick = options[num - 1]
+    if pick is None:
+        for name in options:
+            low = name.lower()
+            if msg == low or msg in low or low in msg:
+                pick = name
+                break
+    if pick is None:
+        return False
+    prod, _ = _find_products(conn, shop_id, pick)
+    item["name"] = pick
+    item["product_id"] = prod["id"] if prod else None
+    item["ambiguous"] = []
+    item["new"] = prod is None
+    if prod is not None and prod["price_cents"] \
+            and item.get("sell_cents") is None:
+        item["sell_cents"], item["sell_source"] = prod["price_cents"], \
+            "shoplist"
+    return True
+
+
+def answer_intake_session(conn: sqlite3.Connection, shop_id: str,
+                          text: str) -> str | None:
+    """Answer the session's open question. None when no session/unrelated."""
+    session = get_intake_session(conn, shop_id)
+    if session is None:
+        return None
+    items = session.get("items_json") or []
+    idx = session.get("current") or 0
+    field = session.get("field")
+    if field is None or idx < 0 or idx >= len(items):
+        return None
+    item = items[idx]
+    msg = (text or "").strip()
+    if not msg:
+        return _t("g_invalid", hint=ask_intake_field(item, field))
+    if field == "name":
+        if "?" in msg:
+            return None
+        _guided_set_name(conn, shop_id, item, msg)
+    elif field == "which":
+        if not _guided_pick_which(conn, shop_id, item, msg):
+            if _guided_attempted(msg):
+                return _t("g_invalid", hint=ask_intake_field(item, field))
+            return None
+    elif field == "qty":
+        qty = _guided_qty(msg)
+        if qty is None:
+            if _guided_is_skip(msg) or _guided_attempted(msg):
+                return _t("g_invalid", hint=ask_intake_field(item, field))
+            return None
+        item["qty"] = qty
+        item["qty_source"] = "stated"
+        pack_word = _guided_pack_word(msg)
+        if pack_word:
+            item["unit"] = pack_word
+        item["stock_units"] = float(qty)
+    elif field in ("cost", "sell"):
+        if _guided_is_skip(msg):
+            item[f"{field}_source"] = "skipped"  # stays None, never re-asked
+        else:
+            target = _guided_price_target(msg, field)
+            cents = _coerce_pos_int(_guided_amount_cents(msg))
+            if cents is None:
+                if _guided_attempted(msg):
+                    return _t("g_invalid",
+                              hint=ask_intake_field(item, field))
+                return None
+            if target != field and item.get(f"{target}_cents") is not None:
+                target = field
+            item[f"{target}_cents"] = cents
+            item[f"{target}_source"] = "stated"
+    elif field == "sell_unit":
+        unit = _guided_sell_unit(msg)
+        if unit is None:
+            if _guided_attempted(msg):
+                return _t("g_invalid", hint=ask_intake_field(item, field))
+            return None
+        item["sell_unit"] = unit
+    else:
+        return None
+    nxt = _guided_next_field(item)
+    session["field"] = nxt
+    save_intake_session(conn, shop_id, session)
+    if nxt is None:
+        return propose_intake_item(conn, shop_id, idx)
+    return ask_intake_field(item, nxt)
+
+
 _INTAKE_AMT_RE = re.compile(r"[Rr]?\s*(\d+(?:\.\d{1,2})?)")
 _INTAKE_PER_PACK_RE = re.compile(
     r"(\d+(?:\.\d+)?)\s*(?:per|in(?:side)?(?:\s+of)?(?:\s+a)?|/)\s*pack", re.IGNORECASE)
