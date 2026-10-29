@@ -1509,10 +1509,183 @@ def _guided_sell_unit(text: str) -> str | None:
     return None
 
 
+_GUIDED_PACK_NOUNS = {"pack", "packs", "whole", "entire", "box", "boxes"}
+_GUIDED_SINGLE_NOUNS = {"packet", "packets", "single", "singles", "loose",
+                        "each", "individual", "individually"}
+_GUIDED_TOTAL_WORDS = {"both", "total", "totals", "altogether", "together",
+                       "all"}
+_GUIDED_TOTAL_RES = (
+    re.compile(r"\bfor\s+both\b", re.IGNORECASE),
+    re.compile(r"\bfor\s+all\b", re.IGNORECASE),
+    re.compile(r"\bfor\s+\d+\s*packs?\b", re.IGNORECASE),
+    re.compile(r"\btotals?\b", re.IGNORECASE),
+    re.compile(r"\baltogether\b", re.IGNORECASE),
+    re.compile(r"\bin\s+total\b", re.IGNORECASE),
+)
+_GUIDED_FOR_N_PACKS_RE = re.compile(r"\bfor\s+(\d+)\s*packs?\b", re.IGNORECASE)
+_GUIDED_N_PACKS_RE = re.compile(r"\b\d+(?:\.\d+)?\s*packs?\b", re.IGNORECASE)
+_GUIDED_PER_PACK_RES = (
+    re.compile(r"(\d+(?:\.\d+)?)\s*(?:per|/)\s*packs?\b", re.IGNORECASE),
+    re.compile(r"(\d+(?:\.\d+)?)\s*in\s+(?:each|every|a|one)\s+packs?\b",
+               re.IGNORECASE),
+    re.compile(r"packs?\s+of\s+(\d+(?:\.\d+)?)", re.IGNORECASE),
+    re.compile(r"(?:each|every|both|all)\s+packs?\s+(?:has|have|holds?|"
+               r"contains?)\s*(\d+(?:\.\d+)?)", re.IGNORECASE),
+    re.compile(r"\b(\d+(?:\.\d+)?)\s*-\s*packs?\b", re.IGNORECASE),
+)
+
+
+def _guided_cost_total(text: str) -> bool:
+    """True when a stated amount covers several packs ("R20 for both packs").
+
+    Never fires on plain amounts ("R32") or non-pack counts ("sell for
+    eighteen"): a total needs total words or an explicit pack count.
+    """
+    msg = text or ""
+    if any(rx.search(msg) for rx in _GUIDED_TOTAL_RES):
+        return True
+    words = "|".join(sorted(_GUIDED_NUMBER_WORDS, key=len, reverse=True))
+    return bool(re.search(rf"\bfor\s+(?:{words})\s+packs?\b", msg,
+                          re.IGNORECASE))
+
+
+def _guided_cost_total_words(text: str) -> bool:
+    """True when a cost-basis answer confirms the total ("both together")."""
+    toks = set(re.findall(r"[a-z]+", (text or "").lower()))
+    return bool(toks & _GUIDED_TOTAL_WORDS)
+
+
+def _guided_cost_basis(text: str) -> str | None:
+    """Which unit a cost amount names: pack ("per pack") or single ("each").
+
+    A pack noun wins ("each pack" is per-pack); bare "each" is per-single,
+    matching the sell_unit synonyms.
+    """
+    toks = set(re.findall(r"[a-z]+", (text or "").lower()))
+    if toks & _GUIDED_PACK_NOUNS:
+        return "pack"
+    if toks & _GUIDED_SINGLE_NOUNS:
+        return "single"
+    return None
+
+
+def _guided_pack_noun(text: str) -> bool:
+    return bool(set(re.findall(r"[a-z]+", (text or "").lower()))
+                & _GUIDED_PACK_NOUNS)
+
+
+def _guided_number_words_to_digits(text: str) -> str:
+    out = text or ""
+    for word in sorted(_GUIDED_NUMBER_WORDS, key=len, reverse=True):
+        out = re.sub(rf"\b{word}\b", str(_GUIDED_NUMBER_WORDS[word]), out,
+                     flags=re.IGNORECASE)
+    return out
+
+
+def _guided_per_pack(text: str, bare_ok: bool = True) -> float | None:
+    """Singles-per-pack count in text ("five in each pack" -> 5).
+
+    Explicit per-pack phrasing wins; a bare lone number counts only when
+    bare_ok (the per_pack field itself, never as a packs-field cross-fill).
+    A bare pack count ("2 packs") never fills per_pack.
+    """
+    if re.search(r"[Rr]\s*\d", text or ""):
+        return None  # money is not a count; the caller clarifies
+    norm = _guided_number_words_to_digits(text)
+    for rx in _GUIDED_PER_PACK_RES:
+        m = rx.search(norm)
+        if m:
+            try:
+                val = float(m.group(1))
+            except ValueError:
+                continue
+            return val if val > 0 else None
+    if _GUIDED_N_PACKS_RE.search(norm):
+        return None
+    if "both" in set(re.findall(r"[a-z]+", norm.lower())):
+        return None
+    if not bare_ok:
+        return None
+    m = re.search(r"(\d+(?:\.\d+)?)", norm)
+    if m:
+        val = float(m.group(1))
+        return val if val > 0 else None
+    return None
+
+
+def _guided_packs_count(text: str) -> float | None:
+    """Outer-pack count in text ("2 packs", "both" -> 2, bare "2")."""
+    if re.search(r"[Rr]\s*\d", text or ""):
+        return None  # money is not a count; the caller clarifies
+    qty = _guided_qty(text)
+    if qty is not None:
+        return qty
+    if "both" in set(re.findall(r"[a-z]+", (text or "").lower())):
+        return 2.0
+    return None
+
+
+def _guided_cross_fill_packs(item: dict, text: str) -> None:
+    """Fill pack count/unit from explicit phrasing ("for 3 packs", "per pack").
+
+    Only fills what is still unknown; stated answers are never overwritten.
+    """
+    if item.get("packs") is None:
+        count = None
+        m = _GUIDED_FOR_N_PACKS_RE.search(text or "")
+        if m:
+            count = float(m.group(1))
+        else:
+            for word, val in _GUIDED_NUMBER_WORDS.items():
+                if re.search(rf"\bfor\s+{word}\s+packs?\b", text or "",
+                             re.IGNORECASE):
+                    count = float(val)
+                    break
+            else:
+                toks = set(re.findall(r"[a-z]+", (text or "").lower()))
+                if "both" in toks and _guided_pack_word(text):
+                    count = 2.0
+        if count:
+            item["packs"] = count
+    if not item.get("unit"):
+        pack_word = _guided_pack_word(text)
+        if pack_word:
+            item["unit"] = pack_word
+
+
+def _guided_stash_cost(item: dict, cents: int, text: str) -> None:
+    """Hold a totalled cost for the basis question (assigns nothing yet)."""
+    item["cost_stash"] = cents
+    item["cost_total"] = True
+    _guided_cross_fill_packs(item, text)
+
+
+def _guided_fill_packs_from_count(item: dict, text: str) -> bool:
+    """Fill packs from an explicit pack count ("2 packs", "both packs")."""
+    norm = _guided_number_words_to_digits(text)
+    m = re.search(r"(\d+(?:\.\d+)?)\s*packs?\b", norm)
+    if m:
+        try:
+            val = float(m.group(1))
+        except ValueError:
+            return False
+        if val > 0:
+            item["packs"] = val
+            return True
+        return False
+    toks = set(re.findall(r"[a-z]+", norm.lower()))
+    if "both" in toks and _guided_pack_word(text):
+        item["packs"] = 2.0
+        return True
+    return False
+
+
 def _guided_pack_context(item: dict) -> bool:
     if _is_pack_unit(item.get("unit")):
         return True
     if _MULTIPACK_RE.search(item.get("name") or ""):
+        return True
+    if item.get("pack_q") or item.get("cost_stash") is not None:
         return True
     return bool(item.get("per_pack") or item.get("packs"))
 
@@ -1548,28 +1721,53 @@ def _guided_seen_qty(item: dict) -> float | None:
 
 
 def _guided_next_field(item: dict) -> str | None:
-    """First still-open field: name -> which -> qty -> cost -> sell -> unit.
+    """First still-open field for a guided item (None = ready for preview).
 
-    Existing products take the fast path: once identity and qty are
-    confident, the shoplist price is reused and cost/sell/unit are
-    never asked — the item goes straight to preview.
+    New items: name -> which -> packs/qty -> cost -> sell -> sell_unit ->
+    per_pack -> packs -> cost_basis -> pack_sell -> sell(single) -> preview.
+    Existing products fast-path to preview, except pack-context items,
+    which still go through the sell_unit/per_pack/basis questions.
     """
     if not (item.get("name") or "").strip() or item.get("name") == "?":
         return "name"
     if item.get("ambiguous"):
         return "which"
-    if item.get("qty") is None:
+    if item.get("pack_q") and item.get("packs") is None:
+        return "packs"
+    if item.get("qty") is None and not item.get("pack_q"):
         return "qty"
-    if _guided_is_existing(item):
+    if item.get("cost_stash") is not None:
+        return "cost_basis"
+    if _guided_is_existing(item) and not _guided_pack_context(item):
         return None
-    if item.get("cost_cents") is None \
-            and item.get("cost_source") != "skipped":
-        return "cost"
-    if item.get("sell_cents") is None \
-            and item.get("sell_source") != "skipped":
-        return "sell"
+    if not _guided_is_existing(item):
+        if item.get("cost_cents") is None \
+                and item.get("cost_source") != "skipped":
+            return "cost"
+        if item.get("sell_cents") is None \
+                and item.get("sell_source") != "skipped":
+            return "sell"
     if item.get("sell_unit") is None and _guided_pack_context(item):
         return "sell_unit"
+    if item.get("sell_unit") in ("singles", "both") \
+            and item.get("per_pack") is None:
+        return "per_pack"
+    if item.get("packs") is None and _guided_pack_context(item):
+        return "packs"
+    if item.get("cost_cents") is not None and item.get("cost_basis") is None \
+            and item.get("cost_source") == "stated" \
+            and item.get("sell_unit") in ("singles", "both") \
+            and _guided_pack_context(item):
+        return "cost_basis"
+    if item.get("sell_unit") == "both" \
+            and item.get("pack_sell_cents") is None \
+            and item.get("pack_sell_source") != "skipped":
+        return "pack_sell"
+    if item.get("sell_unit") == "both" \
+            and item.get("pack_sell_cents") is not None \
+            and item.get("sell_cents") is None \
+            and not item.get("sell_both_asked"):
+        return "sell"
     return None
 
 
@@ -1588,9 +1786,27 @@ def ask_intake_field(item: dict, field: str) -> str:
     if field == "cost":
         return _t("g_ask_cost", name=name)
     if field == "sell":
-        return _t("g_ask_sell", name=name)
+        per = ""
+        if item.get("sell_unit") == "both" \
+                and item.get("pack_sell_cents") is not None:
+            per = _t("g_per_single")  # re-asked as the single price
+        return _t("g_ask_sell", name=name, per=per)
+    if field == "pack_sell":
+        return _t("g_ask_sell", name=name, per=_t("g_per_pack"))
     if field == "sell_unit":
+        if item.get("per_pack") is not None \
+                or _MULTIPACK_RE.search(name or ""):
+            return _t("g_ask_unit_pack", name=name)
         return _t("g_ask_unit", name=name)
+    if field == "per_pack":
+        return _t("g_ask_perpack", name=name)
+    if field == "packs":
+        return _t("g_ask_packs", name=name)
+    if field == "cost_basis":
+        amt = item.get("cost_stash")
+        if amt is None:
+            amt = item.get("cost_cents") or 0
+        return _t("g_ask_costbasis", amt=cents_to_rand(int(amt)))
     return _t("g_ask_name")
 
 
@@ -1611,13 +1827,160 @@ def _guided_line(conn: sqlite3.Connection, shop_id: str, name: str,
         else:
             seen_label = "?"
     qty = line.get("qty")
+    packs = None
+    if line.get("packs_seen"):
+        try:
+            packs = float(line["packs_seen"])
+        except (TypeError, ValueError):
+            packs = None
+    if packs is None and qty is not None \
+            and _is_pack_unit(line.get("unit")):
+        packs = float(qty)
     line.update({
-        "cost_basis": None, "sell_unit": None, "per_pack": None,
-        "packs": None, "state": "pending", "seen_label": seen_label,
+        "cost_basis": None, "cost_total": None, "cost_stash": None,
+        "cost_normalized": False,
+        "sell_unit": None, "per_pack": None, "packs": packs,
+        "pack_sell_cents": None, "pack_sell_source": None,
+        "sell_both_asked": False, "state": "pending",
+        "seen_label": seen_label,
         "stock_units": float(qty) if qty is not None else None,
         "supplier": (supplier or "").strip(),
     })
+    _guided_fill_pack_knowns(conn, line)
     return line
+
+
+def _guided_fill_pack_knowns(conn: sqlite3.Connection, item: dict) -> None:
+    """Pre-fill pack structure from a matched product row (never overwrite).
+
+    A known pack_size answers per_pack and a known pack price answers
+    pack_sell, so restocks never re-ask what the shelf list already knows.
+    """
+    pid = item.get("product_id")
+    if pid is None:
+        return
+    row = conn.execute("SELECT pack_size, pack_price_cents FROM products"
+                       " WHERE id = ?", (pid,)).fetchone()
+    if row is None:
+        return
+    if item.get("per_pack") is None and row["pack_size"]:
+        try:
+            item["per_pack"] = float(row["pack_size"])
+        except (TypeError, ValueError):
+            pass
+    if item.get("pack_sell_cents") is None and row["pack_price_cents"]:
+        item["pack_sell_cents"] = row["pack_price_cents"]
+        item["pack_sell_source"] = "shoplist"
+
+
+def _guided_restock(item: dict) -> None:
+    """Best-effort live stock_units update as pack answers arrive."""
+    totals = guided_pack_totals(item)
+    if totals["stock_units"] is not None:
+        item["stock_units"] = totals["stock_units"]
+
+
+def guided_pack_totals(item: dict) -> dict:
+    """Normalize a guided item's pack answers to stock/price totals.
+
+    Pure helper (no session writes); Task 6's applier calls this to build
+    the add_stock payload. Mirrors `_apply_add_stock` costing: per-single
+    cost is pack cost / pack_size as a float, rounded only in totals
+    (integral results come back as int).
+
+    Returns {stock_units, cost_cents, price_cents, pack_price_cents,
+    pack_name, pack_size, complete}:
+    - stock_units: singles (singles/both) or packs (whole) or qty.
+    - cost_cents: per stock unit (per-single for singles/both, per-pack
+      for whole). A total ("R20 for both packs") is split across packs.
+    - price_cents: single sell price (None when selling whole packs with
+      a stated price — that price is the pack price instead).
+    - pack_price_cents: pack sell price (both, or whole with stated sell).
+    - pack_name/pack_size: for the product row ("both" writes all four).
+    - complete: all needed pack answers are known.
+    """
+    packs = item.get("packs")
+    per_pack = item.get("per_pack")
+    try:
+        packs = float(packs) if packs is not None else None
+        per_pack = float(per_pack) if per_pack is not None else None
+    except (TypeError, ValueError):
+        packs, per_pack = None, None
+    if packs is not None and packs <= 0:
+        packs = None
+    if per_pack is not None and per_pack <= 0:
+        per_pack = None
+    qty = item.get("qty")
+    try:
+        qty = float(qty) if qty is not None else None
+    except (TypeError, ValueError):
+        qty = None
+    unit = (item.get("sell_unit") or "").strip().lower()
+    if unit == "whole":
+        unit = "pack"
+    cost = item.get("cost_cents")
+    basis = item.get("cost_basis")
+    total = bool(item.get("cost_total"))
+    sell = item.get("sell_cents")
+    pack_sell = item.get("pack_sell_cents")
+
+    if unit in ("singles", "both"):
+        stock = packs * per_pack if packs and per_pack else qty
+        complete = bool(packs and per_pack)
+    elif unit == "pack":
+        stock = packs if packs is not None else qty
+        complete = stock is not None
+    else:
+        stock = qty
+        complete = stock is not None
+
+    per_pack_cost = cost
+    if total and cost is not None and packs:
+        per_pack_cost = cost / packs
+        complete = complete and packs is not None
+    norm_cost: int | float | None = None
+    if cost is not None and item.get("cost_normalized"):
+        norm_cost = cost  # propose already normalized this line: idempotent
+    elif cost is not None:
+        if unit in ("singles", "both"):
+            if basis == "pack" and per_pack_cost is not None and per_pack:
+                norm_cost = per_pack_cost / per_pack
+            elif basis == "single":
+                norm_cost = per_pack_cost
+            else:
+                norm_cost = per_pack_cost
+                complete = False
+        elif unit == "pack":
+            norm_cost = per_pack_cost
+        else:
+            norm_cost = cost
+        if isinstance(norm_cost, float) and norm_cost.is_integer():
+            norm_cost = int(norm_cost)
+
+    if unit == "pack":
+        if pack_sell is not None:
+            price, pack_price = None, pack_sell
+            if sell is not None and item.get("sell_source") == "shoplist":
+                price = sell  # row keeps its single price; packs are sold
+        elif sell is not None and item.get("sell_source") == "stated":
+            price, pack_price = None, sell  # the one stated price is per-pack
+        else:
+            price, pack_price = sell, None
+    elif unit == "both":
+        price, pack_price = sell, pack_sell
+    else:
+        price, pack_price = sell, None
+
+    if _guided_pack_context(item):
+        pack_name = _pack_echo(item.get("unit")) or "pack"
+    else:
+        pack_name = ""
+    return {
+        "stock_units": stock, "cost_cents": norm_cost,
+        "price_cents": price, "pack_price_cents": pack_price,
+        "pack_name": pack_name, "pack_size": per_pack,
+        "complete": bool(complete),
+    }
 
 
 def _guided_build_items(conn: sqlite3.Connection, shop_id: str,
@@ -1694,15 +2057,37 @@ def start_guided_intake(conn: sqlite3.Connection, shop_id: str,
 
 def _guided_line_detail(item: dict) -> str:
     qty = item.get("qty")
-    if qty is None:
+    totals = guided_pack_totals(item)
+    stock = totals["stock_units"]
+    packs = item.get("packs")
+    pack_qty = bool(item.get("sell_unit") in ("singles", "both")
+                    and packs and stock)
+    if pack_qty:
+        qtybit = _t("g_pack_qty", p=_fmt_qty(packs),
+                    unit=item.get("unit") or "packs",
+                    s=_fmt_qty(stock))
+    elif qty is None:
         qtybit = _t("intake_qty_q")
     elif item.get("qty_source") == "seen":
         qtybit = _t("intake_seen", n=_fmt_qty(qty))
     else:
         qtybit = f"×{_fmt_qty(qty)}"
-    if item.get("unit"):
+    if not pack_qty and item.get("unit"):
         qtybit += f" {item['unit']}"
-    if item.get("sell_cents") is not None:
+    if item.get("sell_unit") == "both" and item.get("sell_cents") is not None \
+            and item.get("pack_sell_cents") is not None:
+        sellbit = _t("g_both_sell",
+                     single=cents_to_rand(item["sell_cents"]),
+                     pack=cents_to_rand(item["pack_sell_cents"]))
+    elif item.get("sell_unit") == "both" \
+            and item.get("pack_sell_cents") is not None:
+        sellbit = _t("g_pack_sell",
+                     amt=cents_to_rand(item["pack_sell_cents"]))
+    elif totals["pack_price_cents"] is not None \
+            and item.get("sell_unit") == "pack":
+        sellbit = _t("g_pack_sell",
+                     amt=cents_to_rand(totals["pack_price_cents"]))
+    elif item.get("sell_cents") is not None:
         if item.get("sell_source") == "shoplist":
             sellbit = _t("g_reuse_price",
                          amt=cents_to_rand(item["sell_cents"]))
@@ -1727,8 +2112,20 @@ def propose_intake_item(conn: sqlite3.Connection, shop_id: str,
     if session is None or idx < 0 or idx >= len(items):
         return _t("intake_no_preview")
     item = items[idx]
-    qty = item.get("qty")
-    item["stock_units"] = float(qty) if qty is not None else None
+    if item.get("pack_q") and item.get("qty") is None \
+            and item.get("packs") is not None:
+        item["qty"] = item["packs"]
+        item["qty_source"] = item.get("qty_source") or "stated"
+        item["unit"] = item.get("unit") or "packs"
+        item["pack_q"] = False
+    totals = guided_pack_totals(item)
+    if totals["stock_units"] is not None:
+        item["stock_units"] = totals["stock_units"]
+    if item.get("cost_cents") is not None and totals["cost_cents"] is not None:
+        if totals["cost_cents"] != item["cost_cents"]:
+            item["cost_stated_cents"] = item["cost_cents"]
+            item["cost_cents"] = totals["cost_cents"]
+        item["cost_normalized"] = True
     session["current"] = idx
     session["field"] = None
     save_intake_session(conn, shop_id, session)
@@ -1754,6 +2151,7 @@ def _guided_set_name(conn: sqlite3.Connection, shop_id: str, item: dict,
         if row and row["price_cents"]:
             item["sell_cents"], item["sell_source"] = row["price_cents"], \
                 "shoplist"
+    _guided_fill_pack_knowns(conn, item)
 
 
 def _guided_pick_which(conn: sqlite3.Connection, shop_id: str, item: dict,
@@ -1784,6 +2182,7 @@ def _guided_pick_which(conn: sqlite3.Connection, shop_id: str, item: dict,
             and item.get("sell_cents") is None:
         item["sell_cents"], item["sell_source"] = prod["price_cents"], \
             "shoplist"
+    _guided_fill_pack_knowns(conn, item)
     return True
 
 
@@ -1817,46 +2216,95 @@ def answer_intake_session(conn: sqlite3.Connection, shop_id: str,
             # Named price wins (correction); qty itself is re-asked.
             cents = _coerce_pos_int(_guided_amount_cents(msg))
             if cents is not None:
-                item[f"{target}_cents"] = cents
-                item[f"{target}_source"] = "stated"
+                if target == "cost" and _guided_cost_total(msg) \
+                        and (_guided_pack_context(item)
+                             or _guided_pack_word(msg)):
+                    _guided_stash_cost(item, cents, msg)
+                else:
+                    item[f"{target}_cents"] = cents
+                    item[f"{target}_source"] = "stated"
+                    _guided_cross_fill_packs(item, msg)
                 save_intake_session(conn, shop_id, session)
                 return ask_intake_field(item, field)
-        qty = _guided_qty(msg)
-        if qty is None:
-            if _guided_is_yes(msg):
-                seen_qty = _guided_seen_qty(item)
-                if seen_qty is not None:
-                    item["qty"] = seen_qty
-                    item["qty_source"] = "seen"
-                    item["stock_units"] = float(seen_qty)
-                else:
+        pp = _guided_per_pack(msg, bare_ok=False)
+        norm = _guided_number_words_to_digits(msg)
+        qtoks = set(re.findall(r"[a-z]+", norm.lower()))
+        if pp is not None and not _GUIDED_N_PACKS_RE.search(norm) \
+                and "both" not in qtoks:
+            # "five in each pack": fills per_pack; packs still asked.
+            item["per_pack"] = pp
+            if item.get("packs") is not None and item.get("qty") is None:
+                item["qty"] = item["packs"]
+                item["qty_source"] = "stated"
+                item["unit"] = item.get("unit") or "packs"
+                item["pack_q"] = False
+            _guided_restock(item)
+        else:
+            qty = _guided_qty(msg)
+            if qty is None:
+                if _guided_is_yes(msg):
+                    seen_qty = _guided_seen_qty(item)
+                    if seen_qty is not None:
+                        item["qty"] = seen_qty
+                        item["qty_source"] = "seen"
+                        item["stock_units"] = float(seen_qty)
+                    else:
+                        return _t("g_invalid",
+                                  hint=ask_intake_field(item, field))
+                elif _guided_is_skip(msg) or _guided_attempted(msg):
                     return _t("g_invalid",
                               hint=ask_intake_field(item, field))
-            elif _guided_is_skip(msg) or _guided_attempted(msg):
-                return _t("g_invalid", hint=ask_intake_field(item, field))
+                else:
+                    return None
             else:
-                return None
-        else:
-            item["qty"] = qty
-            item["qty_source"] = "stated"
-            pack_word = _guided_pack_word(msg)
-            if pack_word:
-                item["unit"] = pack_word
-            item["stock_units"] = float(qty)
+                item["qty"] = qty
+                item["qty_source"] = "stated"
+                pack_word = _guided_pack_word(msg)
+                if pack_word:
+                    item["unit"] = pack_word
+                if pack_word or _is_pack_unit(item.get("unit")):
+                    item["packs"] = qty
+                    item["pack_q"] = False
+                if pp is not None:
+                    item["per_pack"] = pp  # "2 packs of 5" fills both
+                _guided_restock(item)
     elif field in ("cost", "sell"):
         if _guided_is_skip(msg):
             item[f"{field}_source"] = "skipped"  # stays None, never re-asked
+            if field == "sell" and item.get("sell_unit") == "both":
+                item["sell_both_asked"] = True  # re-ask declined; no loop
         else:
             target = _guided_price_target(msg, field)
+            if target == "sell" and field == "sell" \
+                    and item.get("sell_unit") == "both" \
+                    and _guided_pack_noun(msg):
+                target = "pack_sell"  # "pack price R30" corrects pack price
             cents = _coerce_pos_int(_guided_amount_cents(msg))
             if cents is None:
                 if _guided_attempted(msg):
                     return _t("g_invalid",
                               hint=ask_intake_field(item, field))
                 return None
-            # Named field wins even when filled (correction); open field re-asked.
-            item[f"{target}_cents"] = cents
-            item[f"{target}_source"] = "stated"
+            if target == "cost" and _guided_cost_total(msg) \
+                    and (_guided_pack_context(item)
+                         or _guided_pack_word(msg)):
+                _guided_stash_cost(item, cents, msg)
+            else:
+                # Named field wins even when filled (correction); open re-asked.
+                item[f"{target}_cents"] = cents
+                item[f"{target}_source"] = "stated"
+                _guided_cross_fill_packs(item, msg)
+                if target == "cost" and item.get("cost_basis") is None:
+                    basis = _guided_cost_basis(msg)
+                    if basis is not None:
+                        item["cost_basis"] = basis
+                if target == "sell" and item.get("sell_unit") is None \
+                        and _guided_pack_context(item):
+                    preset = _guided_sell_unit(msg)
+                    if preset is not None:
+                        item["sell_unit"] = preset
+                if target == "sell" and item.get("sell_unit") == "both":
+                    item["sell_both_asked"] = True
     elif field == "sell_unit":
         unit = _guided_sell_unit(msg)
         if unit is None:
@@ -1864,6 +2312,87 @@ def answer_intake_session(conn: sqlite3.Connection, shop_id: str,
                 return _t("g_invalid", hint=ask_intake_field(item, field))
             return None
         item["sell_unit"] = unit
+        _guided_restock(item)
+    elif field == "per_pack":
+        filled_packs = _guided_fill_packs_from_count(item, msg)
+        pp = _guided_per_pack(msg)
+        if pp is None:
+            if not filled_packs:
+                if _guided_is_skip(msg) or _guided_attempted(msg):
+                    return _t("g_invalid",
+                              hint=ask_intake_field(item, field))
+                return None
+            # packs corrected; per_pack itself is re-asked below.
+        else:
+            item["per_pack"] = pp
+        _guided_restock(item)
+    elif field == "packs":
+        pp = _guided_per_pack(msg, bare_ok=False)
+        norm = _guided_number_words_to_digits(msg)
+        ptoks = set(re.findall(r"[a-z]+", norm.lower()))
+        if pp is not None:
+            item["per_pack"] = pp
+        count = None
+        if pp is None or _GUIDED_N_PACKS_RE.search(norm) or "both" in ptoks:
+            count = _guided_packs_count(msg)
+        if count is None:
+            if pp is not None:
+                pass  # per_pack filled; packs itself is re-asked below.
+            elif _guided_is_skip(msg) or _guided_attempted(msg):
+                return _t("g_invalid", hint=ask_intake_field(item, field))
+            else:
+                return None
+        else:
+            item["packs"] = count
+            if item.get("qty") is None:
+                item["qty"] = count
+                item["qty_source"] = "stated"
+                item["pack_q"] = False
+            pack_word = _guided_pack_word(msg)
+            item["unit"] = pack_word or item.get("unit") or "packs"
+        _guided_restock(item)
+    elif field == "cost_basis":
+        basis = _guided_cost_basis(msg)
+        total_words = _guided_cost_total_words(msg)
+        if basis is None and not total_words:
+            if _guided_is_skip(msg) or _guided_attempted(msg):
+                return _t("g_invalid", hint=ask_intake_field(item, field))
+            return None
+        if basis is None:
+            item["cost_basis"] = "pack"  # total confirmed: split over packs
+        else:
+            item["cost_basis"] = basis
+            if basis == "single":
+                # Per-single overrides a total; pack words only pick the
+                # pack horn (an explicit "for N packs" total stands).
+                item["cost_total"] = None
+        if item.get("cost_stash") is not None:
+            item["cost_cents"] = item["cost_stash"]
+            item["cost_source"] = "stated"
+            item["cost_stash"] = None
+        _guided_cross_fill_packs(item, msg)
+    elif field == "pack_sell":
+        if _guided_is_skip(msg):
+            item["pack_sell_source"] = "skipped"
+        else:
+            has_cost = bool(_GUIDED_COST_RE.search(msg))
+            has_sell = bool(_GUIDED_SELL_RE.search(msg))
+            if has_cost and not has_sell:
+                target = "cost"
+            elif has_sell and not has_cost and not _guided_pack_noun(msg):
+                target = "sell"
+            else:
+                target = "pack_sell"
+            cents = _coerce_pos_int(_guided_amount_cents(msg))
+            if cents is None:
+                if _guided_attempted(msg):
+                    return _t("g_invalid",
+                              hint=ask_intake_field(item, field))
+                return None
+            item[f"{target}_cents"] = cents
+            item[f"{target}_source"] = "stated"
+            if target == "sell" and item.get("sell_unit") == "both":
+                item["sell_both_asked"] = True
     else:
         return None
     nxt = _guided_next_field(item)
