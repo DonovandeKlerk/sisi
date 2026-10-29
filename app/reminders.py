@@ -88,6 +88,30 @@ def _parse_time(text: str) -> tuple[int, int] | None:
     return None
 
 
+_RELATIVE_RES = (
+    re.compile(r"\bin\s+(\d+)\s*(?:minutes?|mins?)\b"),
+    re.compile(r"\bin\s+(\d+)\s*(?:hours?|hrs?|h)\b"),
+    re.compile(r"\bin\s+(?:an?\s+)?hour\b"),
+    re.compile(r"\bin\s+(?:a\s+)?half\s*(?:an?\s+)?hour\b"),
+)
+
+
+def parse_relative(text: str, now: datetime) -> datetime | None:
+    """'in 5 minutes' / 'in 2 hours' resolved from the message time."""
+    low = f" {(text or '').lower()} "
+    m = _RELATIVE_RES[0].search(low)
+    if m:
+        return now + timedelta(minutes=int(m.group(1)))
+    m = _RELATIVE_RES[1].search(low)
+    if m:
+        return now + timedelta(hours=int(m.group(1)))
+    if _RELATIVE_RES[2].search(low):
+        return now + timedelta(hours=1)
+    if _RELATIVE_RES[3].search(low):
+        return now + timedelta(minutes=30)
+    return None
+
+
 def parse_bare_time(text: str) -> tuple[int, int] | None:
     """A reply that is only a time ('6am', '17:30'). None otherwise."""
     m = _BARE_TIME_RE.match(text or "")
@@ -163,6 +187,9 @@ def _strip_request_bits(text: str) -> str:
     low = text
     for trig in REMIND_TRIGGERS:
         low = re.sub(rf"\b{re.escape(trig)}\b", " ", low)
+    low = re.sub(r"\bin\s+\d+\s*(?:minutes?|mins?|hours?|hrs?|h)\b", " ", low)
+    low = re.sub(r"\bin\s+(?:an?\s+)?hour\b", " ", low)
+    low = re.sub(r"\bin\s+(?:a\s+)?half\s*(?:an?\s+)?hour\b", " ", low)
     low = _TIME_RE.sub(" ", low)
     low = re.sub(r"\b(today|tomorrow|namhlanje|namhla|kusasa|vandag|more"
                  r"|m\u00f4re|ngomso)\b", " ", low)
@@ -182,14 +209,18 @@ def parse_request(text: str, now: datetime | None = None):
     if not any(t in low for t in REMIND_TRIGGERS):
         return None
     recurrence = _parse_recurrence(low)
-    day, source = _parse_day(low, now)
-    hm = _parse_time(low) or _default_hm(low)
-    due = datetime.combine(datetime.fromisoformat(day).date(),
-                           datetime.min.time().replace(hour=hm[0],
-                                                       minute=hm[1]),
-                           tzinfo=SAST)
-    if due <= now:
-        due += timedelta(days=7 if source == "weekday" else 1)
+    relative = parse_relative(low, now)
+    if relative is not None:
+        due = relative
+    else:
+        day, source = _parse_day(low, now)
+        hm = _parse_time(low) or _default_hm(low)
+        due = datetime.combine(datetime.fromisoformat(day).date(),
+                               datetime.min.time().replace(hour=hm[0],
+                                                           minute=hm[1]),
+                               tzinfo=SAST)
+        if due <= now:
+            due += timedelta(days=7 if source == "weekday" else 1)
     summary = _strip_request_bits(low).strip() or t("rem_default_summary")
     if len(summary) > 120:
         summary = summary[:117].rstrip() + "…"
@@ -546,6 +577,40 @@ def window_open(conn: sqlite3.Connection, shop_id: str, channel: str,
     if last is None:
         return False
     return now - last <= timedelta(hours=WINDOW_HOURS)
+
+
+PAST_GATE_LAG = timedelta(hours=1)
+"""Ask for a new time only when processing lag ate the requested one."""
+
+
+def due_passed(due: datetime, sent_at, wall=None) -> bool:
+    """True when a requested time passed during processing.
+
+    Compares against the wall clock, but only shortly after the message
+    was sent: slow voice transcription turning 'in 5 minutes' stale asks
+    for a new time, while hours-late ticks keep the delayed-fire path.
+    """
+    if sent_at is None:
+        return False
+    wall = now_sast(wall)
+    sent = now_sast(sent_at)
+    return due <= wall and wall - sent <= PAST_GATE_LAG
+
+
+def parse_msg_ts(value) -> datetime | None:
+    """A provider timestamp (unix seconds or ISO) as an aware datetime."""
+    s = str(value or "").strip()
+    if not s:
+        return None
+    try:
+        return datetime.fromtimestamp(float(s), tz=SAST)
+    except (ValueError, OSError, OverflowError):
+        pass
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
 def reminder_template() -> tuple[str, str] | None:

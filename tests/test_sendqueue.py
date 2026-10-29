@@ -288,7 +288,7 @@ def test_handle_message_vonage_goes_through_queue(conn, monkeypatch):
     import app.main as main
     from app.main import _handle_message
     from app.whatsapp import IncomingMessage
-    monkeypatch.setattr(main, "handle_text", lambda c, s, t: ("cash reply", None))
+    monkeypatch.setattr(main, "handle_text", lambda c, s, t, sent_at=None: ("cash reply", None))
     sender = FakeSender()
     _handle_message(sender, IncomingMessage("mid-q1", SHOP, "text",
                                             "cash up", "", channel="vonage"))

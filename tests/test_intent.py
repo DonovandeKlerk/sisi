@@ -187,8 +187,10 @@ def test_13_statement_plus_reminder_beats_keyword(conn, monkeypatch, tmp_path):
     calls = _stub(monkeypatch, tmp_path, [_resp("Both queued.")])
     msg, _ = agent.handle_text(
         conn, SHOP, "statement for Sipho and remind me Friday to collect")
-    assert calls["n"] >= 1
-    assert msg == "Both queued."
+    assert calls["n"] == 0  # deterministic multi-intent, no model needed
+    assert "Reminder set" in msg
+    assert conn.execute("SELECT COUNT(*) n FROM reminders WHERE shop_id = ?",
+                        (SHOP,)).fetchone()["n"] == 1
 
 
 def test_14_sale_then_cash_up_creates_pending(conn, monkeypatch, tmp_path):

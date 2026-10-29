@@ -46,7 +46,7 @@ def test_process_message_never_goes_silent(conn, monkeypatch, tmp_path):
     import app.main as main
     monkeypatch.setenv("SISI_DB", str(tmp_path / "t.db"))
 
-    def boom(conn, shop_id, text):
+    def boom(conn, shop_id, text, sent_at=None):
         raise RuntimeError("kaboom")
 
     monkeypatch.setattr(main, "handle_text", boom)
@@ -61,7 +61,7 @@ def test_photo_gets_status_line_first(conn, monkeypatch, tmp_path):
     monkeypatch.setenv("SISI_DB", str(tmp_path / "t.db"))
     monkeypatch.setattr(main, "_download_msg_media", lambda m, l: b"img")
     monkeypatch.setattr(main, "handle_photo",
-                        lambda c, s, b, cap="": (None, "photo reply", None))
+                        lambda c, s, b, cap="", sent_at=None: (None, "photo reply", None))
     process_message(IncomingMessage("mid-2", SHOP, "media:image", None, "",
                                     media_id="m1"))
     sent = get_sender().pop_shop(SHOP)
@@ -74,7 +74,7 @@ def test_voice_gets_status_line_first(conn, monkeypatch, tmp_path):
     monkeypatch.setenv("SISI_DB", str(tmp_path / "t.db"))
     monkeypatch.setattr(main, "_download_msg_media", lambda m, l: b"aud")
     monkeypatch.setattr(main, "handle_voice",
-                        lambda c, s, b, suf: ("t", "voice reply", None))
+                        lambda c, s, b, suf, sent_at=None: ("t", "voice reply", None))
     process_message(IncomingMessage("mid-3", SHOP, "media:audio", None, "",
                                     media_id="m1"))
     sent = get_sender().pop_shop(SHOP)
@@ -86,7 +86,7 @@ def test_slow_text_gets_status_line_first(conn, monkeypatch, tmp_path):
     import app.main as main
     monkeypatch.setenv("SISI_DB", str(tmp_path / "t.db"))
     monkeypatch.setattr(main, "handle_text",
-                        lambda c, s, t: ("month-end reply", None))
+                        lambda c, s, t, sent_at=None: ("month-end reply", None))
     process_message(IncomingMessage("mid-4", SHOP, "text", "month-end report", ""))
     sent = get_sender().pop_shop(SHOP)
     assert sent[0]["body"].startswith("⏳")
@@ -96,7 +96,7 @@ def test_slow_text_gets_status_line_first(conn, monkeypatch, tmp_path):
 def test_fast_text_has_no_status_line(conn, monkeypatch, tmp_path):
     import app.main as main
     monkeypatch.setenv("SISI_DB", str(tmp_path / "t.db"))
-    monkeypatch.setattr(main, "handle_text", lambda c, s, t: ("hi there", None))
+    monkeypatch.setattr(main, "handle_text", lambda c, s, t, sent_at=None: ("hi there", None))
     process_message(IncomingMessage("mid-5", SHOP, "text", "hi", ""))
     sent = get_sender().pop_shop(SHOP)
     assert len(sent) == 1 and sent[0]["body"].startswith("hi there")

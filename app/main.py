@@ -406,6 +406,8 @@ def _handle_message(sender, msg: IncomingMessage) -> None:
                 out.flush()
         except Exception:
             log.warning("status line failed", exc_info=True)
+        from app.reminders import parse_msg_ts
+        sent_at = parse_msg_ts(msg.timestamp)
         if msg.kind == "media:audio":
             try:
                 audio = _download_msg_media(msg, "voice note")
@@ -413,7 +415,8 @@ def _handle_message(sender, msg: IncomingMessage) -> None:
                     out.send_text(msg.shop_id, _t("empty_voice"))
                     out.flush()
                     return
-                _, reply, buttons = handle_voice(conn, msg.shop_id, audio, ".ogg")
+                _, reply, buttons = handle_voice(conn, msg.shop_id, audio,
+                                                 ".ogg", sent_at)
             except VoiceError as e:
                 out.send_text(msg.shop_id, str(e))
                 out.flush()
@@ -426,7 +429,7 @@ def _handle_message(sender, msg: IncomingMessage) -> None:
                     out.flush()
                     return
                 _, reply, buttons = handle_photo(conn, msg.shop_id, image,
-                                                 msg.caption or "")
+                                                 msg.caption or "", sent_at)
             except (VisionError, VoiceError) as e:
                 out.send_text(msg.shop_id, str(e))
                 out.flush()
@@ -438,7 +441,8 @@ def _handle_message(sender, msg: IncomingMessage) -> None:
         elif msg.text is None:
             reply, buttons = _t("unsupported"), None
         else:
-            reply, buttons = handle_text(conn, msg.shop_id, msg.text)
+            reply, buttons = handle_text(conn, msg.shop_id, msg.text,
+                                         sent_at)
         items = take_media(msg.shop_id)
         from app.mediasend import with_media_links
 

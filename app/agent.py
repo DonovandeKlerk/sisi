@@ -481,13 +481,13 @@ _QUESTION_STARTS = ("how ", "what ", "when ", "who ", "which ", "why ",
                     "yintoni", "kutheni", "yimalini", "ndinga")
 
 
-def try_reminder_command(conn: sqlite3.Connection, shop_id: str,
-                         text: str) -> str | None:
+def try_reminder_command(conn: sqlite3.Connection, shop_id: str, text: str,
+                         sent_at=None) -> str | None:
     """Reminder commands and direct 'remind me' requests. None otherwise."""
     from app.reminders import (cancel_numbered, confirm_text, detect_context,
-                               list_reminders, move_numbered, parse_request,
-                               parse_snooze_minutes, retry_stuck,
-                               save_reminder, snooze_last)
+                               list_reminders, move_numbered, now_sast,
+                               parse_request, parse_snooze_minutes,
+                               retry_stuck, save_reminder, snooze_last)
     word = _normalize(text or "")
     if word in ("retry reminders", "retry reminder",
                 "probeer herinneringe weer", "zama izikhumbuzo futhi",
@@ -509,14 +509,21 @@ def try_reminder_command(conn: sqlite3.Connection, shop_id: str,
         return snooze_last(conn, shop_id, mins)
     if "?" in word:
         return None
-    parsed = parse_request(text)
+    parsed = parse_request(text, sent_at)
     if parsed is None:
         return None
     if parsed["summary"].lower().startswith(_QUESTION_STARTS):
         return None  # 'remind me how much…' is a question for the books
+    from app.reminders import due_passed
+    if due_passed(parsed["due"], sent_at):
+        return _t("rem_past", when=parsed["due"].strftime("%H:%M"))
     context = detect_context(conn, shop_id, text)
-    save_reminder(conn, shop_id, parsed["due"], parsed["summary"], context,
-                  parsed["recurrence"])
+    try:
+        save_reminder(conn, shop_id, parsed["due"], parsed["summary"],
+                      context, parsed["recurrence"])
+    except Exception as e:
+        log.warning("reminder save failed", exc_info=True)
+        return _t("rem_save_failed", err=type(e).__name__)
     return confirm_text(parsed["due"], parsed["summary"],
                         parsed["recurrence"])
 
@@ -747,12 +754,13 @@ def cancel_newest(conn: sqlite3.Connection, shop_id: str) -> str:
     return cancel_pending(conn, shop_id)
 
 
-def try_order_plan(conn: sqlite3.Connection, shop_id: str,
-                   text: str) -> str | None:
+def try_order_plan(conn: sqlite3.Connection, shop_id: str, text: str,
+                   sent_at=None) -> str | None:
     """Order-bearing texts become one combined plan preview. None otherwise."""
     plan, from_ctx = resume_plan_from_clarify(conn, shop_id, text or "")
     if plan is None:
-        plan, _question = build_plan(conn, shop_id, text or "", None, "")
+        plan, _question = build_plan(conn, shop_id, text or "", None, "",
+                                     now=sent_at)
     if plan is None:
         return None
     existing = get_plan_by_key(conn, shop_id, plan["message_key"])
@@ -766,7 +774,8 @@ def try_order_plan(conn: sqlite3.Connection, shop_id: str,
     return render_preview(conn, shop_id, saved)
 
 
-def _caption_action(conn: sqlite3.Connection, shop_id: str, caption: str):
+def _caption_action(conn: sqlite3.Connection, shop_id: str, caption: str,
+                    sent_at=None):
     """Route a photo caption through deterministic handlers (never the LLM).
 
     Returns (message, buttons) or None. Control words (Yes/No/Undo,
@@ -781,7 +790,7 @@ def _caption_action(conn: sqlite3.Connection, shop_id: str, caption: str):
             or word in HELP_WORDS or word in RESET_WORDS \
             or word in DELETE_WORDS or word == "undo book":
         return None
-    return try_deterministic(conn, shop_id, caption)
+    return try_deterministic(conn, shop_id, caption, sent_at)
 
 
 def _store_evidence(digest: str, image: bytes) -> None:
@@ -793,8 +802,118 @@ def _store_evidence(digest: str, image: bytes) -> None:
         log.warning("evidence store failed", exc_info=True)
 
 
-def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
-    """Returns (message, buttons_or_None), or None if the LLM should handle it."""
+def _split_bits(text: str) -> list[str]:
+    """Split a message into candidate intent bits.
+
+    Sentences first, then joins (and/plus/&/,) — but a join-split only
+    stands when every bit is substantial, so "Sipho and Thandi" never
+    tears a name apart, and commas inside amounts (R1,240) never split.
+    """
+    bits: list[str] = []
+    for seg in re.split(r"[.?!;\n]+", text or ""):
+        seg = seg.strip()
+        if not seg:
+            continue
+        subs = [b.strip() for b in re.split(
+            r"\s+and\s+|\s+plus\s+|\+|&|(?<!\d)\s*,\s*|\s*,\s*(?!\d)",
+            seg) if b.strip()]
+        if len(subs) > 1 and all(len(b.split()) >= 2 for b in subs):
+            bits.extend(subs)
+        else:
+            bits.append(seg)
+    return bits
+
+
+def try_multi_task(conn: sqlite3.Connection, shop_id: str, text: str,
+                   sent_at=None):
+    """Save parseable reminders, then route the rest normally.
+
+    Only true multi-intent texts (a saved reminder plus something else)
+    are handled here; anything else returns None for the normal path.
+    Calls try_deterministic once on strictly smaller text (no recursion).
+    """
+    from app.reminders import (REMIND_TRIGGERS, confirm_text, detect_context,
+                               due_passed, parse_request, save_reminder)
+    bits = _split_bits(text)
+    if len(bits) < 2 and not any(
+            t in f" {(text or '').lower()} " for t in REMIND_TRIGGERS):
+        return None
+    specs: list[tuple[str, dict]] = []
+    rest: list[str] = []
+    for bit in bits:
+        low = f" {bit.lower()} "
+        if not any(t in low for t in REMIND_TRIGGERS):
+            rest.append(bit)
+            continue
+        parsed = parse_request(bit, sent_at)
+        if parsed is None or parsed["summary"].lower().startswith(
+                _QUESTION_STARTS):
+            rest.append(bit)
+            continue
+        specs.append((bit, parsed))
+    rest_text = " ".join(rest).strip()
+    if not specs or not rest_text:
+        return None
+    parts: list[str] = []
+    res = try_deterministic(conn, shop_id, rest_text, sent_at, _multi=False)
+    if res is None:
+        res = route_to_llm(conn, shop_id, rest_text)
+    rest_msg, buttons = res
+    parts.append(rest_msg)
+    for bit, parsed in specs:
+        due = parsed["due"]
+        if due_passed(due, sent_at):
+            parts.append(_t("rem_past", when=due.strftime("%H:%M")))
+            continue
+        try:
+            context = detect_context(conn, shop_id, bit)
+            save_reminder(conn, shop_id, due, parsed["summary"], context,
+                          parsed["recurrence"])
+        except Exception as e:
+            log.warning("multi reminder save failed", exc_info=True)
+            parts.append(_t("rem_save_failed", err=type(e).__name__))
+            continue
+        parts.append(confirm_text(due, parsed["summary"],
+                                  parsed["recurrence"]))
+    return "\n\n".join(parts), buttons
+
+
+def try_affordability(conn: sqlite3.Connection, shop_id: str,
+                      text: str) -> str | None:
+    """'Can we afford R200?' from live balances. Amount first, no guessing."""
+    from app.db import cents_to_rand
+    from app.tools import account_balance
+    word = _normalize(text or "")
+    amounts = _price_amounts(text or "")
+    triggered = ("afford" in word or "bekostig" in word
+                 or "kwanele" in word
+                 or ("cover" in word and ("pay" in word or "cost" in word
+                                          or bool(amounts)))
+                 or ("enough" in word and "pay" in word))
+    if not triggered:
+        return None
+    if not amounts:
+        return _t("afford_ask")
+    need = amounts[0]
+    cash = account_balance(conn, shop_id, "cash")
+    petty = account_balance(conn, shop_id, "petty")
+    have = cash + petty
+    if have >= need:
+        return _t("afford_yes", have=cents_to_rand(have),
+                  cash=cents_to_rand(cash), petty=cents_to_rand(petty),
+                  need=cents_to_rand(need))
+    return _t("afford_no", have=cents_to_rand(have),
+              cash=cents_to_rand(cash), petty=cents_to_rand(petty),
+              need=cents_to_rand(need))
+
+
+def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str,
+                      sent_at=None, _multi: bool = True):
+    """Returns (message, buttons_or_None), or None if the LLM should handle it.
+
+    sent_at is the provider timestamp (relative times resolve from it);
+    _multi=False disables the multi-intent extractor (recursion guard).
+    """
     ensure_shop(conn, shop_id)
     text = _resolve_numbered(conn, shop_id, text)
     word = _normalize(text or "")
@@ -809,9 +928,16 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
                    re.IGNORECASE)
     if m and _STAFF_NAME.get() is None:
         return add_staff(conn, shop_id, m.group(1), m.group(2).strip()), None
-    planned = try_order_plan(conn, shop_id, text)
+    planned = try_order_plan(conn, shop_id, text, sent_at)
     if planned is not None:
         return planned, ["Yes", "No"]
+    if _multi:
+        multi = try_multi_task(conn, shop_id, text, sent_at)
+        if multi is not None:
+            return multi
+    afford = try_affordability(conn, shop_id, text)
+    if afford is not None:
+        return afford, None
     if _composite_route(conn, shop_id, word):
         return route_composite(conn, shop_id, text)
     if word in MENU_WORDS:
@@ -826,7 +952,7 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str):
     statement = try_statement_request(conn, shop_id, text)
     if statement is not None:
         return statement, _AFTER_STATEMENT
-    reminder = try_reminder_command(conn, shop_id, text)
+    reminder = try_reminder_command(conn, shop_id, text, sent_at)
     if reminder is not None:
         return reminder, _AFTER_REMINDERS
     if word in ORDER_WORDS:
@@ -1027,7 +1153,7 @@ def try_price_reply(conn: sqlite3.Connection, shop_id: str, text: str) -> str | 
 
 
 def handle_voice(conn: sqlite3.Connection, shop_id: str, audio: bytes,
-               suffix: str = ".ogg"):
+               suffix: str = ".ogg", sent_at=None):
     """Transcribe a voice note and handle it like text.
 
     Returns (transcript_or_None, reply, buttons). The owner always sees what
@@ -1046,7 +1172,7 @@ def handle_voice(conn: sqlite3.Connection, shop_id: str, audio: bytes,
         return None, str(e), None
     if not transcript:
         return None, _t("ag_voice_empty"), None
-    reply, buttons = handle_text(conn, shop_id, transcript)
+    reply, buttons = handle_text(conn, shop_id, transcript, sent_at)
     shown = transcript if len(transcript) <= 100 else transcript[:97] + "…"
     return transcript, _t("ag_heard", shown=shown, reply=reply), buttons
 
@@ -1056,7 +1182,7 @@ _PHOTO_EMOJI = {"expiry": "📸", "book_page": "📒", "receipt": "🧾",
 
 
 def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
-                 caption: str = ""):
+                 caption: str = "", sent_at=None):
     """Route a photo by THIS message's intent (caption + vision), then propose.
 
     An explicit caption ("logo", an order, a reminder) always beats a stale
@@ -1117,7 +1243,8 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
         doc, vision_error = None, str(e)
     save_turn(conn, shop_id, "user", "[photo]")
     plan, question = build_plan(conn, shop_id, caption, doc, digest,
-                                message_key=digest, from_photo=True)
+                                message_key=digest, from_photo=True,
+                                now=sent_at)
     if plan is not None:
         clear_clarify_context(conn, shop_id)
         existing = get_plan_by_key(conn, shop_id, plan["message_key"])
@@ -1151,7 +1278,8 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
         return None, reply, buttons
     if doc is None:
         return None, vision_error, None
-    cap = _caption_action(conn, shop_id, caption) if caption else None
+    cap = _caption_action(conn, shop_id, caption, sent_at) \
+        if caption else None
     cap_after = get_pending(conn, shop_id)
     cap_after_id = cap_after["id"] if cap_after is not None else None
     cap_made_pending = cap is not None and cap_after is not None \
@@ -1186,7 +1314,8 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
     return doc, reply, buttons
 
 
-def handle_text(conn: sqlite3.Connection, shop_id: str, text: str):
+def handle_text(conn: sqlite3.Connection, shop_id: str, text: str,
+                sent_at=None):
     shop_id, staff = _enter(conn, shop_id)
     ensure_shop(conn, shop_id)
     if staff is None and needs_setup(conn, shop_id):
@@ -1240,7 +1369,7 @@ def handle_text(conn: sqlite3.Connection, shop_id: str, text: str):
     before_plan = get_plan(conn, shop_id)
     before_plan_id = before_plan["plan_id"] if before_plan else None
     text = _resolve_numbered(conn, shop_id, text)
-    direct = try_deterministic(conn, shop_id, text)
+    direct = try_deterministic(conn, shop_id, text, sent_at)
     det_buttons = None
     if direct is not None:
         message, det_buttons = direct

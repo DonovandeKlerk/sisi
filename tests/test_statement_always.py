@@ -98,7 +98,7 @@ def test_image_sent_before_text(conn, monkeypatch):
     from app.main import _handle_message
     from app.whatsapp import FakeSender, IncomingMessage
     monkeypatch.setattr(main, "handle_text",
-                        lambda c, s, t: ("the total is R50.00", None))
+                        lambda c, s, t, sent_at=None: ("the total is R50.00", None))
     MEDIA_OUTBOX[SHOP] = [
         {"kind": "image", "url": "https://x.example/media/a?f=png",
          "caption": "Forward this to Sipho 👆", "filename": "",
