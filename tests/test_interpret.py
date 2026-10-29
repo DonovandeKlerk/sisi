@@ -264,6 +264,7 @@ def test_unknown_product_asks_price(conn, shop, sent, monkeypatch):
 
 
 def test_split_order_and_statement_fire_once(conn, shop, sent, monkeypatch):
+    monkeypatch.setenv("SISI_PUBLIC_URL", "https://x.example")
     from app.agent import take_media
     _script(monkeypatch, [_plan(
         [_t("order", {"customer": "Sipho",
