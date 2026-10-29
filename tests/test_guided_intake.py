@@ -117,3 +117,73 @@ def test_answer_unrelated_returns_none(conn, shop):
                         "add to stock", "h6")
     assert answer_intake_session(conn, SHOP, "thank you very much") is None
     assert get_intake_session(conn, SHOP)["field"] == "cost"  # progress kept
+
+
+def test_guided_skip_rejected_at_name(conn, shop):
+    start_guided_intake(conn, SHOP,
+                        [_vprod("", None, readable=False, notes="x")],
+                        [], "add to stock", "hf1")
+    assert get_intake_session(conn, SHOP)["field"] == "name"
+    for dodge in ("skip", "don't know"):
+        msg = answer_intake_session(conn, SHOP, dodge)
+        assert "didn't catch that" in msg
+        session = get_intake_session(conn, SHOP)
+        assert session["field"] == "name"
+        assert session["items_json"][0]["name"] == "?"  # never stored
+
+
+def test_guided_question_at_name_clarifies(conn, shop):
+    start_guided_intake(conn, SHOP,
+                        [_vprod("", None, readable=False, notes="x")],
+                        [], "add to stock", "hf3")
+    msg = answer_intake_session(conn, SHOP, "what is this?")
+    assert "didn't catch that" in msg
+    assert get_intake_session(conn, SHOP)["field"] == "name"
+
+
+def test_guided_skip_clarifies_at_which(conn, shop):
+    start_guided_intake(conn, SHOP,
+                        [_vprod("", None, readable=False, notes="x")],
+                        [], "add to stock", "hf2a")
+    answer_intake_session(conn, SHOP, "Bread")  # matches both demo breads
+    assert get_intake_session(conn, SHOP)["field"] == "which"
+    msg = answer_intake_session(conn, SHOP, "skip")
+    assert "didn't catch that" in msg
+    assert get_intake_session(conn, SHOP)["field"] == "which"
+
+
+def test_guided_skip_clarifies_at_sell_unit(conn, shop):
+    start_guided_intake(conn, SHOP, [_vprod("Whey Protein 2kg", None)],
+                        [], "add to stock", "hf2b")
+    answer_intake_session(conn, SHOP, "2 packs")
+    answer_intake_session(conn, SHOP, "R32")
+    answer_intake_session(conn, SHOP, "sell R45")
+    assert get_intake_session(conn, SHOP)["field"] == "sell_unit"
+    msg = answer_intake_session(conn, SHOP, "skip")
+    assert "didn't catch that" in msg
+    assert get_intake_session(conn, SHOP)["field"] == "sell_unit"
+
+
+def test_guided_named_price_corrects_filled_field(conn, shop):
+    start_guided_intake(conn, SHOP, [],
+                        [{"product": "Sugar 2kg", "qty": 3,
+                          "sell_cents": 6000}],
+                        "sugar 3 sell price", "hf4")
+    assert get_intake_session(conn, SHOP)["field"] == "cost"
+    msg = answer_intake_session(conn, SHOP, "sell R25")
+    item = get_intake_session(conn, SHOP)["items_json"][0]
+    assert item["sell_cents"] == 2500  # named field corrected...
+    assert item["cost_cents"] is None  # ...open field untouched
+    assert get_intake_session(conn, SHOP)["field"] == "cost"  # re-asked
+    assert "cost" in msg
+
+
+def test_guided_skip_phrases_at_cost_sell(conn, shop):
+    start_guided_intake(conn, SHOP, [_vprod("Whey Protein 2kg", 1)], [],
+                        "add to stock", "hf5")
+    msg = answer_intake_session(conn, SHOP, "I don't know")
+    assert "selling price" in msg  # cost skipped, sell asked
+    msg = answer_intake_session(conn, SHOP, "skip it")
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+    item = get_intake_session(conn, SHOP)["items_json"][0]
+    assert item["cost_cents"] is None and item["sell_cents"] is None

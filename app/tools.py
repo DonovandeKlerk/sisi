@@ -1418,7 +1418,6 @@ _GUIDED_MONEY_RES = (
 _GUIDED_COST_RE = re.compile(r"\bcosts?\b", re.IGNORECASE)
 _GUIDED_SELL_RE = re.compile(r"\bsells?\b|\bselling\b|\bprice\b",
                              re.IGNORECASE)
-_GUIDED_SKIP = {"skip", "don't know", "dont know"}
 _GUIDED_MONEY_WORDS = {"rand", "rands", "cost", "costs", "sell", "sells",
                        "selling", "price", "prices"}
 _GUIDED_SINGLES_WORDS = {"single", "singles", "loose", "each",
@@ -1465,7 +1464,9 @@ def _guided_qty(text: str) -> float | None:
 
 def _guided_is_skip(text: str) -> bool:
     norm = re.sub(r"\s+", " ", (text or "").strip().lower().strip(" .!?"))
-    return norm in _GUIDED_SKIP
+    if "don't know" in norm or "dont know" in norm:
+        return True
+    return bool(re.search(r"\bskip\b", norm))
 
 
 def _guided_attempted(text: str) -> bool:
@@ -1757,12 +1758,12 @@ def answer_intake_session(conn: sqlite3.Connection, shop_id: str,
     if not msg:
         return _t("g_invalid", hint=ask_intake_field(item, field))
     if field == "name":
-        if "?" in msg:
-            return None
+        if _guided_is_skip(msg) or "?" in msg:
+            return _t("g_invalid", hint=ask_intake_field(item, field))
         _guided_set_name(conn, shop_id, item, msg)
     elif field == "which":
         if not _guided_pick_which(conn, shop_id, item, msg):
-            if _guided_attempted(msg):
+            if _guided_is_skip(msg) or _guided_attempted(msg):
                 return _t("g_invalid", hint=ask_intake_field(item, field))
             return None
     elif field == "qty":
@@ -1788,14 +1789,13 @@ def answer_intake_session(conn: sqlite3.Connection, shop_id: str,
                     return _t("g_invalid",
                               hint=ask_intake_field(item, field))
                 return None
-            if target != field and item.get(f"{target}_cents") is not None:
-                target = field
+            # Named field wins even when filled (correction); open field re-asked.
             item[f"{target}_cents"] = cents
             item[f"{target}_source"] = "stated"
     elif field == "sell_unit":
         unit = _guided_sell_unit(msg)
         if unit is None:
-            if _guided_attempted(msg):
+            if _guided_is_skip(msg) or _guided_attempted(msg):
                 return _t("g_invalid", hint=ask_intake_field(item, field))
             return None
         item["sell_unit"] = unit
