@@ -57,6 +57,7 @@ from app.tools import (
     clear_await_reminder,
     confirm_pending,
     correct_book_line,
+    correct_intake_line,
     correct_receipt_account,
     correct_receipt_line,
     delete_my_data,
@@ -1070,6 +1071,8 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str,
     corrected = try_line_correction(conn, shop_id, text)
     if corrected is None:
         corrected = try_account_correction(conn, shop_id, text)
+    if corrected is None:
+        corrected = try_intake_reply(conn, shop_id, text)
     if corrected is not None:
         return corrected, None
     from app.orders import get_clarify_context
@@ -1448,11 +1451,28 @@ def try_line_correction(conn: sqlite3.Connection, shop_id: str, text: str) -> st
         return correct_plan_line(conn, shop_id, int(m.group(1)),
                                  m.group(2).strip())
     pend = get_pending(conn, shop_id)
-    if pend is None or pend["action_type"] not in ("book_page", "receipt"):
+    if pend is None or pend["action_type"] not in ("book_page", "receipt",
+                                                  "stock_intake"):
         return None
     if pend["action_type"] == "receipt":
         return correct_receipt_line(conn, shop_id, int(m.group(1)), m.group(2).strip())
+    if pend["action_type"] == "stock_intake":
+        return correct_intake_line(conn, shop_id, int(m.group(1)),
+                                   m.group(2).strip())
     return correct_book_line(conn, shop_id, int(m.group(1)), m.group(2).strip())
+
+
+def try_intake_reply(conn: sqlite3.Connection, shop_id: str,
+                     text: str) -> str | None:
+    """Fill the pending stock intake from a free-form answer."""
+    from app.tools import answer_intake, get_pending
+    pend = get_pending(conn, shop_id)
+    if pend is None or pend["action_type"] != "stock_intake":
+        return None
+    probe = re.sub(r"(?i)\bline\s+\d+\s*:", " ", text or "")
+    if _looks_multi(probe):
+        return None  # new business goes to the planner, intake waits
+    return answer_intake(conn, shop_id, text)
 
 
 def try_account_correction(conn: sqlite3.Connection, shop_id: str, text: str) -> str | None:

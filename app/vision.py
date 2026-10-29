@@ -159,8 +159,25 @@ SHOP_PHOTO_SCHEMA = {
                              "vat_cents", "total_cents", "payment"],
                 "additionalProperties": False,
             },
+            "products": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "brand": {"type": "string"},
+                        "variant": {"type": "string"},
+                        "size": {"type": "string"},
+                        "visible_count": {"type": ["integer", "null"]},
+                        "readable": {"type": "boolean"},
+                        "notes": {"type": "string"},
+                    },
+                    "required": ["brand", "variant", "size",
+                                 "visible_count", "readable", "notes"],
+                    "additionalProperties": False,
+                },
+            },
         },
-        "required": ["doc_type", "expiry", "book", "receipt"],
+        "required": ["doc_type", "expiry", "book", "receipt", "products"],
         "additionalProperties": False,
     },
 }
@@ -186,7 +203,14 @@ SHOP_PHOTO_PROMPT = (
     "units when you can tell, unit cost and line total in cents, null when not "
     "shown), VAT in cents or null, receipt total in cents or null, and the payment "
     "word as printed (cash, card, account, or ''). Use only values you can actually "
-    "read; never invent a number."
+    "read; never invent a number. "
+    "PRODUCTS: whenever packaged goods are visible (whatever the doc type), "
+    "list each distinct product once: brand as printed ('' when the label is "
+    "hidden), variant/flavour, package size as printed ('' when unreadable), "
+    "how many identical packages you can actually count (null when unsure), "
+    "readable true only when the brand and size are both legible, and a short "
+    "note for anything uncertain ('label turned away', 'only part visible'). "
+    "A multipack's contents are not a count: report the packs you see."
 )
 
 
@@ -354,6 +378,23 @@ def read_shop_photo(image: bytes, shop_id: str = "") -> dict:
             "total_cents": _sane_cents(receipt.get("total_cents")),
             "payment": str(receipt.get("payment") or "").strip().lower(),
         }
+        products = []
+        for p in doc.get("products", []) or []:
+            if not isinstance(p, dict):
+                continue
+            try:
+                count = int(p.get("visible_count") or 0)
+            except (TypeError, ValueError):
+                count = 0
+            products.append({
+                "brand": str(p.get("brand") or "").strip(),
+                "variant": str(p.get("variant") or "").strip(),
+                "size": str(p.get("size") or "").strip(),
+                "visible_count": count if count > 0 else None,
+                "readable": bool(p.get("readable")),
+                "notes": str(p.get("notes") or "").strip()[:120],
+            })
+        doc["products"] = products
         if doc.get("doc_type") not in ("expiry", "book_page", "receipt", "other"):
             doc["doc_type"] = "other"
         return doc

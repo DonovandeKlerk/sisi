@@ -238,10 +238,15 @@ def confirm_pending(conn: sqlite3.Connection, shop_id: str) -> str:
         return _t("preview_expired")
     action_id = _action_id()
     payload = json.loads(row["payload_json"])
+    if row["action_type"] == "stock_intake":
+        blockers = _intake_blockers(payload)
+        if blockers:
+            return _t("intake_still", items="; ".join(blockers))
     message, kind, summary, undo = apply(conn, shop_id, payload, action_id)
     if payload.get("photo_hash"):
         photo_kind = {"expiry_note": "expiry", "book_page": "book_page",
-                      "receipt": "receipt"}.get(row["action_type"], "")
+                      "receipt": "receipt",
+                      "stock_intake": "stock"}.get(row["action_type"], "")
         record_photo(conn, shop_id, payload["photo_hash"], photo_kind)
     conn.execute(
         "INSERT INTO actions (action_id, shop_id, kind, summary, data_json) VALUES (?, ?, ?, ?, ?)",
@@ -945,6 +950,571 @@ def _apply_add_stock(conn: sqlite3.Connection, shop_id: str, payload: dict, acti
          "old_wholesaler": old_wholesaler, "old_cost": old_cost, "old_price": old_price,
          "old_pack": old_pack},
     )
+
+
+_MULTIPACK_RE = re.compile(
+    r"multi[\s-]?pack|\b\d+\s*[x×]\s*\d+|\bx\s*\d+\b|\d+\s*-\s*pack",
+    re.IGNORECASE)
+
+
+def _intake_label(prod: dict) -> str:
+    return " ".join(str(prod.get(k) or "") for k in
+                    ("brand", "variant", "size")).strip()
+
+
+def _intake_match(conn, shop_id, name):
+    """Careful inventory match: unique row, ambiguous names, or new."""
+    prod, ambiguous = _find_products(conn, shop_id, name)
+    if prod is not None:
+        return prod["id"], [], False
+    return None, [p["name"] for p in ambiguous[:3]], not ambiguous
+
+
+def _intake_line(conn, shop_id, name, entry, seen, supplier):
+    qty = None
+    source = None
+    try:
+        q = float((entry or {}).get("qty", 0))
+    except (TypeError, ValueError):
+        q = 0
+    if q > 0:
+        qty, source = q, "stated"
+    elif isinstance(seen, dict) and (seen.get("visible_count") or 0) > 0:
+        qty, source = float(seen["visible_count"]), "seen"
+    unit = str((entry or {}).get("unit") or "").strip() or None
+    size_txt = " ".join(str((seen or {}).get(k) or "") for k in
+                        ("brand", "variant", "size"))
+    multi = bool(_MULTIPACK_RE.search(size_txt)) or _is_pack_unit(unit)
+    pid, ambiguous, new = _intake_match(
+        conn, shop_id, name) if name and name != "?" else (None, [], False)
+    pack_size = None
+    if pid is not None:
+        row = conn.execute("SELECT pack_size, price_cents FROM products"
+                           " WHERE id = ?", (pid,)).fetchone()
+        pack_size = row["pack_size"] if row else None
+        sell = row["price_cents"] if row else None
+        sell_source = "shoplist" if sell else None
+    else:
+        sell, sell_source = None, None
+    if _coerce_pos_int((entry or {}).get("sell_cents")):
+        sell = _coerce_pos_int(entry["sell_cents"])
+        sell_source = "stated"
+    cost = _coerce_pos_int((entry or {}).get("cost_cents"))
+    pack_q = bool(multi and (pid is None or not pack_size))
+    if pack_q:
+        packs_seen = qty
+        qty, source = None, None
+    else:
+        packs_seen = None
+    if pid is not None and pack_size and unit is None and multi:
+        unit = conn.execute("SELECT pack_name FROM products WHERE id = ?",
+                            (pid,)).fetchone()["pack_name"]
+    return {"name": name, "qty": qty, "qty_source": source, "unit": unit,
+            "cost_cents": cost, "cost_source": "stated" if cost else None,
+            "sell_cents": sell, "sell_source": sell_source,
+            "product_id": pid, "ambiguous": ambiguous, "new": new,
+            "pack_q": pack_q, "packs_seen": packs_seen,
+            "note": str((seen or {}).get("notes") or "")[:80]}
+
+
+def _intake_needs(payload):
+    """Everything still missing (asked). Confirm blocks on qty/product."""
+    needs = []
+    for i, ln in enumerate(payload.get("lines", []), 1):
+        tag = f"line {i}"
+        if not ln.get("name") or ln["name"] == "?":
+            needs.append(f"{tag} name")
+        elif ln.get("ambiguous"):
+            needs.append(f"{tag} which")
+        if ln.get("pack_q"):
+            needs.append(f"{tag} singles-per-pack")
+        elif ln.get("qty") is None:
+            needs.append(f"{tag} qty")
+        if ln.get("sell_cents") is None:
+            needs.append(f"{tag} selling price")
+        if ln.get("cost_cents") is None:
+            needs.append(f"{tag} cost")
+    return needs
+
+
+def _intake_blockers(payload):
+    """Missing product identity or quantity: Yes waits for these."""
+    out = []
+    for i, ln in enumerate(payload.get("lines", []), 1):
+        tag = f"line {i}"
+        if not ln.get("name") or ln["name"] == "?":
+            out.append(f"{tag} name")
+        elif ln.get("ambiguous"):
+            out.append(f"{tag} which ({' / '.join(ln['ambiguous'])})")
+        if ln.get("pack_q"):
+            out.append(f"{tag} singles-per-pack")
+        elif ln.get("qty") is None:
+            out.append(f"{tag} qty")
+    return out
+
+
+def _render_intake(conn, shop_id, payload):
+    from app.db import cents_to_rand
+    parts = [_t("intake_head",
+                photo=_t("intake_from_photo") if payload.get("photo_hash")
+                else "")]
+    for i, ln in enumerate(payload.get("lines", []), 1):
+        if ln.get("qty") is None:
+            qtybit = _t("intake_qty_q")
+        else:
+            qtybit = f"×{_fmt_qty(ln['qty'])}"
+            if ln.get("qty_source") == "seen":
+                qtybit = _t("intake_seen", n=_fmt_qty(ln["qty"]))
+            if ln.get("unit"):
+                qtybit += f" {ln['unit']}"
+        if ln.get("sell_cents") is not None:
+            key = "intake_sell_said" if ln.get("sell_source") == "stated" \
+                else "intake_sell_list"
+            sellbit = _t(key, amt=cents_to_rand(ln["sell_cents"]))
+        else:
+            sellbit = _t("intake_sell_q")
+        costbit = _t("intake_cost", amt=cents_to_rand(ln["cost_cents"])) \
+            if ln.get("cost_cents") is not None else _t("intake_cost_q")
+        tags = ""
+        if ln.get("new"):
+            tags += " " + _t("intake_new")
+        if ln.get("ambiguous"):
+            tags += " ❓" + _t("intake_which",
+                              names=" / ".join(ln["ambiguous"]))
+        if ln.get("pack_q"):
+            tags += " ❓" + _t("intake_packq")
+        name = ln.get("name") or _t("intake_noname")
+        parts.append(f"• {i}. {name} — {qtybit} · {sellbit} · {costbit}"
+                     + tags)
+    needs = _intake_needs(payload)
+    if needs:
+        parts.append(_t("intake_ask", needs="; ".join(needs)))
+    else:
+        parts.append(_t("intake_ready"))
+    return "\n".join(parts)
+
+
+def propose_stock_intake(conn: sqlite3.Connection, shop_id: str,
+                         products: list, items: list,
+                         supplier: str | None = None,
+                         photo_hash: str | None = None,
+                         prior: dict | None = None) -> str:
+    """One editable intake preview for photo (or multi-item) stock adds.
+
+    Vision products and planner items merge into lines with explicit
+    sources; nothing is invented. Unresolved lines block Yes until the
+    owner answers. No payment is recorded: cost stays None (no posting)
+    until the owner states it and confirms. A prior pending payload
+    keeps its stated answers when the planner re-enters mid-intake.
+    """
+    ensure_shop(conn, shop_id)
+    products = [p for p in products or [] if isinstance(p, dict)]
+    planned = [e for e in items or []
+               if isinstance(e, dict) and str(e.get("product") or "").strip()]
+    old_lines = (prior or {}).get("lines") or []
+    old_by_name = {}
+    for ln in old_lines:
+        if isinstance(ln, dict) and ln.get("name"):
+            old_by_name.setdefault(ln["name"].lower(), ln)
+    used: set[int] = set()
+    lines = []
+    singles = len(planned) == 1 and len(products) == 1
+    for e in planned:
+        name = " ".join(str(e.get("product")).split())
+        seen = None
+        words = set(name.lower().split())
+        for i, p in enumerate(products):
+            if i in used:
+                continue
+            label = _intake_label(p).lower()
+            if words & set(label.split()):
+                seen, used = p, used | {i}
+                break
+        if seen is None and singles:
+            # one named item, one seen product: same referent
+            seen, used = products[0], {0}
+        line = _intake_line(conn, shop_id, name, e, seen, supplier)
+        old = old_by_name.pop(name.lower(), None)
+        if old is not None:
+            _intake_carry(line, old)
+        lines.append(line)
+    for i, p in enumerate(products):
+        if i in used:
+            continue
+        label = _intake_label(p)
+        lines.append(_intake_line(conn, shop_id, label or "?", {}, p,
+                                  supplier))
+    for ln in old_by_name.values():
+        lines.append(ln)  # earlier lines survive planner re-entry
+    if not lines:
+        return _t("intake_noproducts")
+    payload = {"lines": lines, "supplier": (supplier or "").strip()
+               or (prior or {}).get("supplier", ""),
+               "photo_hash": photo_hash or (prior or {}).get("photo_hash",
+                                                             "")}
+    return _propose(conn, shop_id, "stock_intake", payload,
+                    _render_intake(conn, shop_id, payload))
+
+
+def _intake_carry(line, old):
+    """Keep stated answers (and seen evidence) across re-proposals.
+
+    Precedence per field: newly stated > previously stated > newly
+    seen/derived > previously seen. A resolved pack answer is never
+    re-derived into a question.
+    """
+    if line.get("qty_source") != "stated" and old.get("qty") is not None:
+        if old.get("qty_source") == "stated" or line.get("qty") is None:
+            line["qty"] = old["qty"]
+            line["qty_source"] = old.get("qty_source")
+            line["unit"] = old.get("unit")
+    for amount, source in (("cost_cents", "cost_source"),
+                           ("sell_cents", "sell_source")):
+        if old.get(amount) is not None and (
+                old.get(source) == "stated"
+                or line.get(amount) is None):
+            line[amount] = old[amount]
+            line[source] = old.get(source)
+    if old.get("product_id") is not None:
+        line["product_id"] = old["product_id"]
+        line["ambiguous"] = []
+        line["new"] = False
+    if not old.get("pack_q") and old.get("qty") is not None:
+        line["pack_q"] = False
+        line["packs_seen"] = None
+        if line.get("qty") is None:
+            line["qty"] = old["qty"]
+            line["qty_source"] = old.get("qty_source")
+            line["unit"] = old.get("unit")
+
+
+def _apply_stock_intake(conn, shop_id, payload, action_id):
+    msgs = []
+    undone = []
+    for ln in payload.get("lines", []):
+        if ln.get("qty") is None or (
+                ln.get("product_id") is None and not ln.get("new")):
+            continue  # gated at confirm; never half-saved
+        units, _, _ = _resolve_units(
+            _pack_of(conn, ln.get("product_id")),
+            _pack_size_of(conn, ln), ln["qty"], ln.get("unit"))
+        # shoplist prices are display-only; only a stated price is written
+        sell = ln.get("sell_cents") \
+            if ln.get("sell_source") == "stated" else None
+        msg, _k, _s, undo = _apply_add_stock(conn, shop_id, {
+            "product_id": ln.get("product_id"), "name": ln["name"],
+            "qty": units, "wholesaler": payload.get("supplier") or "",
+            "cost_cents": ln.get("cost_cents"), "price_cents": sell,
+            "pack_price_cents": None, "pack_name": "",
+            "account": "cash"}, action_id)
+        undo["name"] = ln["name"]
+        msgs.append(msg)
+        undone.append(undo)
+    return ("\n".join(msgs), "stock_intake",
+            f"stock intake ({len(undone)} lines)", {"lines": undone})
+
+
+def _pack_of(conn, pid):
+    if pid is None:
+        return None
+    row = conn.execute("SELECT pack_name FROM products WHERE id = ?",
+                       (pid,)).fetchone()
+    return row["pack_name"] if row else None
+
+
+def _pack_size_of(conn, ln=None, pid=None):
+    pid = pid if pid is not None else (ln or {}).get("product_id")
+    if pid is None:
+        return None
+    row = conn.execute("SELECT pack_size FROM products WHERE id = ?",
+                       (pid,)).fetchone()
+    return row["pack_size"] if row else None
+
+
+def _undo_stock_intake(conn, shop_id, undo, action_id):
+    names = []
+    for one in undo.get("lines", []):
+        pid = one["product_id"]
+        name = conn.execute("SELECT name FROM products WHERE id = ?",
+                            (pid,)).fetchone()["name"]
+        _restore_stock(conn, shop_id, pid, -one["qty"], action_id)
+        if not one.get("created"):
+            sets, params = ["wholesaler = ?"], [one.get("old_wholesaler", "")]
+            for col, key in (("cost_cents", "old_cost"),
+                             ("price_cents", "old_price"),
+                             ("pack_price_cents", "old_pack")):
+                if key in one:
+                    sets.append(f"{col} = ?")
+                    params.append(one[key])
+            conn.execute(f"UPDATE products SET {', '.join(sets)} WHERE id = ?",
+                         (*params, pid))
+        else:
+            conn.execute("DELETE FROM stock_moves WHERE product_id = ?",
+                         (pid,))
+            conn.execute("DELETE FROM products WHERE id = ?", (pid,))
+        names.append(name)
+    _reverse_moves(conn, shop_id, action_id)
+    return _t("intake_undone", names=", ".join(names))
+
+
+_INTAKE_AMT_RE = re.compile(r"[Rr]?\s*(\d+(?:\.\d{1,2})?)")
+_INTAKE_PER_PACK_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(?:per|in(?:side)?(?:\s+of)?(?:\s+a)?|/)\s*pack", re.IGNORECASE)
+_INTAKE_PACK_OF_RE = re.compile(
+    r"pack\s*(?:of\s*)?(\d+(?:\.\d+)?)", re.IGNORECASE)
+
+
+def _intake_amounts(text):
+    return [int(round(float(m.group(1)) * 100))
+            for m in _INTAKE_AMT_RE.finditer(text or "")]
+
+
+def _repropose_intake(conn, shop_id, payload):
+    payload.pop("price_q", None)
+    return _propose(conn, shop_id, "stock_intake", payload,
+                    _render_intake(conn, shop_id, payload))
+
+
+def _intake_set_price(payload, n, cost, sell):
+    ln = payload["lines"][n - 1]
+    if cost is not None:
+        ln["cost_cents"], ln["cost_source"] = cost, "stated"
+    if sell is not None:
+        ln["sell_cents"], ln["sell_source"] = sell, "stated"
+
+
+_INTAKE_FILLER = {"loaf", "loaves", "bottle", "bottles", "tin", "tins",
+                  "jar", "jars", "sachet", "sachets", "piece", "pieces",
+                  "item", "items"}
+
+
+def _intake_apply_rest(conn, shop_id, ln, rest):
+    """Fill one line from '3 packs, cost R18, sell R21' / '6 per pack'."""
+    low = f" {(rest or '').strip()} "
+    per_pack = False
+    m = _INTAKE_PER_PACK_RE.search(low) or _INTAKE_PACK_OF_RE.search(low)
+    if m and ln.get("pack_q"):
+        try:
+            per = float(m.group(1))
+        except ValueError:
+            per = 0
+        if per > 0 and (ln.get("packs_seen") or 0) > 0:
+            ln["qty"] = ln["packs_seen"] * per
+            ln["qty_source"], ln["unit"] = "stated", None
+            ln["pack_q"], ln["packs_seen"] = False, None
+            per_pack = True
+            low = _INTAKE_PER_PACK_RE.sub(" ", low)
+            low = _INTAKE_PACK_OF_RE.sub(" ", low)
+    cost = sell = None
+    for key in ("cost", "sell"):
+        mm = re.search(rf"\b{key}\w*\s*:?\s*[Rr]?\s*(\d+(?:\.\d{{1,2}})?)",
+                       low)
+        if mm:
+            val = int(round(float(mm.group(1)) * 100))
+            if key == "cost":
+                cost = val
+            else:
+                sell = val
+    words = re.sub(r"\bcost\w*\s*:?\s*[Rr]?\s*\d+(?:\.\d{1,2})?", " ", low,
+                   flags=re.IGNORECASE)
+    words = re.sub(r"\bsell\w*\s*:?\s*[Rr]?\s*\d+(?:\.\d{1,2})?", " ", words,
+                   flags=re.IGNORECASE)
+    toks = words.replace(",", " ").split()
+    qty = None
+    unit = None
+    if toks:
+        try:
+            qty = float(toks[0])
+            rest_words = toks[1:]
+        except ValueError:
+            qty = None
+            rest_words = toks
+        if qty is not None and qty <= 0:
+            qty = None
+        if qty is not None and rest_words and _is_pack_unit(rest_words[0]):
+            unit = rest_words[0]
+            rest_words = rest_words[1:]
+    else:
+        rest_words = []
+    if qty is not None:
+        if unit is not None and _is_pack_unit(unit) and \
+                (ln.get("product_id") is None
+                 or not _pack_size_of(conn, ln)):
+            ln["pack_q"], ln["packs_seen"] = True, qty
+            ln["qty"], ln["qty_source"] = None, None
+        else:
+            ln["qty"], ln["qty_source"], ln["unit"] = qty, "stated", unit
+        rest_words = [w for w in rest_words if w.lower() not in _INTAKE_FILLER]
+    name = " ".join(rest_words).strip(" .")
+    renamed = False
+    if name and not (qty is not None and not rest_words):
+        pid, ambiguous, new = _intake_match(conn, shop_id, name)
+        ln["name"] = name
+        ln["product_id"], ln["ambiguous"], ln["new"] = pid, ambiguous, new
+        if pid is not None:
+            row = conn.execute("SELECT price_cents FROM products WHERE id = ?",
+                               (pid,)).fetchone()
+            if row and row["price_cents"] and ln.get("sell_cents") is None:
+                ln["sell_cents"], ln["sell_source"] = row["price_cents"], \
+                    "shoplist"
+        renamed = True
+    return per_pack or cost is not None or sell is not None \
+        or qty is not None or renamed
+
+
+def correct_intake_line(conn: sqlite3.Connection, shop_id: str, line_no: int,
+                        rest: str) -> str:
+    pend = get_pending(conn, shop_id)
+    if pend is None or pend["action_type"] != "stock_intake":
+        return _t("intake_no_preview")
+    payload = json.loads(pend["payload_json"])
+    if line_no < 1 or line_no > len(payload.get("lines", [])):
+        return _t("intake_line_missing", n=line_no,
+                  m=len(payload.get("lines", [])))
+    ln = payload["lines"][line_no - 1]
+    cost = sell = None
+    low = f" {(rest or '').strip()} "
+    for key in ("cost", "sell"):
+        mm = re.search(rf"\b{key}\w*\s*:?\s*[Rr]?\s*(\d+(?:\.\d{{1,2}})?)",
+                       low)
+        if mm:
+            val = int(round(float(mm.group(1)) * 100))
+            if key == "cost":
+                cost = val
+            else:
+                sell = val
+    ok = _intake_apply_rest(conn, shop_id, ln, rest)
+    if cost is not None or sell is not None:
+        _intake_set_price(payload, line_no, cost, sell)
+        ok = True
+    if not ok:
+        return _t("intake_bad_answer")
+    return _repropose_intake(conn, shop_id, payload)
+
+
+def answer_intake(conn: sqlite3.Connection, shop_id: str, text: str):
+    """Fill the pending intake from a free-form answer. None to pass on."""
+    pend = get_pending(conn, shop_id)
+    if pend is None or pend["action_type"] != "stock_intake":
+        return None
+    payload = json.loads(pend["payload_json"])
+    lines = payload.get("lines", [])
+    if not lines or "?" in (text or ""):
+        return None
+    msg = (text or "").strip()
+    if not msg:
+        return None
+    price_q = payload.get("price_q") or {}
+    if price_q and re.fullmatch(r"(cost|sell)\w*", msg.lower()):
+        _intake_set_price(payload, price_q["n"],
+                          price_q["amount"] if msg.lower().startswith("cost")
+                          else None,
+                          None if msg.lower().startswith("cost")
+                          else price_q["amount"])
+        return _repropose_intake(conn, shop_id, payload)
+    if re.fullmatch(r"[Rr]?\s*\d+(?:\.\d{1,2})?", msg):
+        amount = _intake_amounts(msg)[0]
+        looks_money = msg.lower().startswith("r") or "." in msg
+        if not looks_money:
+            qty_missing = [i + 1 for i, ln in enumerate(lines)
+                           if ln.get("qty") is None and not ln.get("pack_q")]
+            if len(qty_missing) == 1:
+                lines[qty_missing[0] - 1]["qty"] = float(amount) / 100
+                lines[qty_missing[0] - 1]["qty_source"] = "stated"
+                return _repropose_intake(conn, shop_id, payload)
+            pack_missing = [i + 1 for i, ln in enumerate(lines)
+                            if ln.get("pack_q")]
+            if len(pack_missing) == 1 and not qty_missing:
+                ln = lines[pack_missing[0] - 1]
+                per = float(amount) / 100
+                if per > 0 and (ln.get("packs_seen") or 0) > 0:
+                    ln["qty"] = ln["packs_seen"] * per
+                    ln["qty_source"], ln["unit"] = "stated", None
+                    ln["pack_q"], ln["packs_seen"] = False, None
+                    return _repropose_intake(conn, shop_id, payload)
+        missing = [i + 1 for i, ln in enumerate(lines)
+                   if ln.get("cost_cents") is None
+                   or ln.get("sell_cents") is None]
+        if len(missing) == 1:
+            ln = lines[missing[0] - 1]
+            if (ln.get("cost_cents") is None) != \
+                    (ln.get("sell_cents") is None):
+                if ln.get("cost_cents") is None:
+                    _intake_set_price(payload, missing[0], amount, None)
+                else:
+                    _intake_set_price(payload, missing[0], None, amount)
+                return _repropose_intake(conn, shop_id, payload)
+            payload["price_q"] = {"n": missing[0], "amount": amount}
+            conn.execute("UPDATE pending_actions SET payload_json = ?"
+                         " WHERE id = ?", (json.dumps(payload), pend["id"]))
+            conn.commit()
+            from app.db import cents_to_rand
+            return _t("intake_costsell", amt=cents_to_rand(amount))
+        return None
+    segs = [s.strip() for s in
+            re.split(r",|;|\band\b|&|\+", msg, flags=re.IGNORECASE)
+            if s.strip()]
+    if not segs:
+        return None
+    targets = []
+    scope = None
+    for seg in segs:
+        m = re.match(r"line\s+(\d+)\s*:\s*(.+)$", seg, re.IGNORECASE)
+        if m:
+            n = int(m.group(1))
+            if n < 1 or n > len(lines):
+                return _t("intake_line_missing", n=n, m=len(lines))
+            scope = n
+            targets.append((n, m.group(2)))
+            continue
+        words = set(seg.lower().split())
+        best = None
+        for i, ln in enumerate(lines, 1):
+            label = (ln.get("name") or "").lower()
+            if words & set(label.split()):
+                best = i
+                break
+        if best is None and scope is not None and (
+                _intake_amounts(seg) or "cost" in seg.lower()
+                or "sell" in seg.lower() or "pack" in seg.lower()
+                or re.search(r"\d", seg)):
+            best = scope  # 'line 1: cost R18, sell R21'
+        if best is None and ("cost" in seg.lower()) != ("sell" in seg.lower()):
+            want = "cost_cents" if "cost" in seg.lower() else "sell_cents"
+            cands = [i for i, ln in enumerate(lines, 1)
+                     if ln.get(want) is None]
+            if len(cands) == 1:
+                best = cands[0]
+        if best is None and len(lines) == 1 and (
+                _intake_amounts(seg) or re.search(r"\d", seg)
+                or "cost" in seg.lower() or "sell" in seg.lower()
+                or "pack" in seg.lower()):
+            best = 1
+        if best is None:
+            return None
+        scope = best
+        targets.append((best, seg))
+    applied = False
+    for n, rest in targets:
+        if _intake_apply_rest(conn, shop_id, lines[n - 1], rest):
+            low = f" {rest} "
+            cost = sell = None
+            for key in ("cost", "sell"):
+                mm = re.search(
+                    rf"\b{key}\w*\s*:?\s*[Rr]?\s*(\d+(?:\.\d{{1,2}})?)", low,
+                    re.IGNORECASE)
+                if mm:
+                    val = int(round(float(mm.group(1)) * 100))
+                    if key == "cost":
+                        cost = val
+                    else:
+                        sell = val
+            if cost is not None or sell is not None:
+                _intake_set_price(payload, n, cost, sell)
+            applied = True
+    if not applied:
+        return None
+    return _repropose_intake(conn, shop_id, payload)
 
 
 def add_stock(conn: sqlite3.Connection, shop_id: str, product: str, qty: float,
@@ -3745,6 +4315,8 @@ def _undo_row(conn: sqlite3.Connection, shop_id: str, row) -> str:
         msg = _undo_sale(conn, shop_id, undo, row["action_id"])
     elif kind == "stock":
         msg = _undo_stock(conn, shop_id, undo, row["action_id"])
+    elif kind == "stock_intake":
+        msg = _undo_stock_intake(conn, shop_id, undo, row["action_id"])
     elif kind == "price":
         msg = _undo_price(conn, shop_id, undo)
     elif kind == "expiry":
@@ -3782,6 +4354,7 @@ _APPLIERS = {
     "record_supplier_payment": _apply_supplier_payment,
     "record_sale": _apply_record_sale,
     "add_stock": _apply_add_stock,
+    "stock_intake": _apply_stock_intake,
     "set_price": _apply_set_price,
     "expiry_note": _apply_expiry_note,
     "read_slip": _apply_slip,

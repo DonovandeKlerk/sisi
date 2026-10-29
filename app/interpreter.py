@@ -109,6 +109,20 @@ def media_brief(doc: dict | None, caption: str, digest: str) -> str:
     if not isinstance(doc, dict):
         return "PHOTO attached but unreadable: ask for a clearer picture."
     kind = doc.get("doc_type", "other")
+    goods = []
+    for p in doc.get("products", []) or []:
+        if not isinstance(p, dict):
+            continue
+        label = " ".join(x for x in
+                         (p.get("brand"), p.get("variant"), p.get("size"))
+                         if x) or "unreadable label"
+        n = p.get("visible_count")
+        goods.append(label + (f" x{n} seen" if n else " (count unclear)")
+                     + ("" if p.get("readable") else " [uncertain]")
+                     + (f" ({p['notes']})" if p.get("notes") else ""))
+    goods_txt = (" Packaged goods seen (unverified): " + "; ".join(goods)
+                 + ".") if goods else ""
+    cap = f" Caption: {caption!r}." if caption else ""
     if kind == "book_page":
         book = doc.get("book") or {}
         lines = book.get("lines") or []
@@ -117,19 +131,22 @@ def media_brief(doc: dict | None, caption: str, digest: str) -> str:
         return ("PHOTO EVIDENCE (handwritten book page, unverified — propose"
                 f" from it, never auto-save): {len(lines)} lines"
                 + (f", unreadable: {', '.join(bad)}" if bad else "")
-                + (f"; caption: {caption!r}" if caption else ""))
+                + goods_txt + cap)
     if kind == "receipt":
         rec = doc.get("receipt") or {}
         return ("PHOTO EVIDENCE (purchase receipt, unverified — propose from"
                 f" it, never auto-save): {rec.get('supplier', '?')}"
                 f" total {rec.get('total_cents', '?')}"
-                + (f"; caption: {caption!r}" if caption else ""))
+                + goods_txt + cap)
     if kind == "expiry":
         items = (doc.get("expiry") or {}).get("items", []) or []
         return (f"PHOTO EVIDENCE (shelf/expiry check): {len(items)} dated items"
-                + (f"; caption: {caption!r}" if caption else ""))
+                + goods_txt + cap)
+    if goods:
+        return ("PHOTO EVIDENCE (packaged goods, unverified — propose from"
+                " it, never auto-save): " + "; ".join(goods) + "." + cap)
     if caption:
-        return f"PHOTO attached (no readable document). Caption: {caption!r}."
+        return f"PHOTO attached (no readable document).{cap}"
     return "PHOTO attached (no readable document, no caption)."
 
 
@@ -537,7 +554,24 @@ def _exec_payment(conn, shop_id, args, bundle):
 
 
 def _exec_stock_add(conn, shop_id, args, bundle):
-    from app.tools import add_stock
+    from app.tools import add_stock, propose_stock_intake
+    raw_items = [e for e in args.get("items") or [] if isinstance(e, dict)]
+    doc = bundle.get("doc") or {}
+    is_photo = "digest" in bundle or (
+        isinstance(doc, dict) and bool(doc.get("products")))
+    if is_photo or len(raw_items) > 1:
+        # photo intake or multi-item: one editable preview, one confirm
+        from app.tools import get_pending
+        prior = None
+        pend = get_pending(conn, shop_id)
+        if pend is not None and pend["action_type"] == "stock_intake" \
+                and not bundle.get("digest"):
+            import json as _json
+            prior = _json.loads(pend["payload_json"])
+        return propose_stock_intake(
+            conn, shop_id, doc.get("products", []) if isinstance(doc, dict)
+            else [], raw_items, args.get("supplier"),
+            bundle.get("digest") or "", prior), None
     items = _items(args.get("items"), need_qty=True)
     supplier = args.get("supplier")
     parts = []
