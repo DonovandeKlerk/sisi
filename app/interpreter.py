@@ -555,19 +555,31 @@ def _exec_payment(conn, shop_id, args, bundle):
 
 def _exec_stock_add(conn, shop_id, args, bundle):
     from app.tools import (add_stock, get_pending, propose_stock_intake,
-                           start_guided_intake)
+                           start_guided_intake, _clean_stock_account)
     raw_items = [e for e in args.get("items") or [] if isinstance(e, dict)]
     doc = bundle.get("doc") or {}
     is_photo = "digest" in bundle or (
         isinstance(doc, dict) and bool(doc.get("products")))
+    # Explicit payment only: the planner passes account/pay_cents solely
+    # when the owner states payment; never defaulted here. Multi-item
+    # and photo intakes stash it (noted now, asked after saving); the
+    # single-item path below keeps its combined one-Yes preview.
+    top_acct = _clean_stock_account(args.get("account"))
+    top_pay = _cents(args.get("pay_cents"))
+    pending_pay = {"amount": top_pay, "account": top_acct,
+                   "supplier": str(args.get("supplier") or "").strip()} \
+        if top_pay is not None and top_acct is not None else None
     if is_photo:
         # photo intake: guided one-product-at-a-time session (grounding
         # happens inside start_guided_intake). Text multi-item keeps the
         # one-shot preview below.
         from app.db import now_iso
-        if get_pending(conn, shop_id) is not None:
+        pend_now = get_pending(conn, shop_id)
+        if pend_now is not None and pend_now["action_type"] != "link_choice":
             # _propose used to supersede this; a fresh photo intake still
             # replaces any live preview so Yes can't confirm stale lines.
+            # A receipt question survives this: the session pauses it
+            # (hint on the overview) or a new choice replaces it aloud.
             conn.execute(
                 "UPDATE pending_actions SET status = 'superseded',"
                 " resolved_at = ? WHERE shop_id = ? AND status = 'pending'",
@@ -576,9 +588,11 @@ def _exec_stock_add(conn, shop_id, args, bundle):
         caption = bundle.get("caption") or bundle.get("cap") \
             or bundle.get("text") or bundle.get("quote") or ""
         products = doc.get("products", []) if isinstance(doc, dict) else []
-        return start_guided_intake(
+        out = start_guided_intake(
             conn, shop_id, products, raw_items, caption,
-            bundle.get("digest") or "", args.get("supplier")), None
+            bundle.get("digest") or "", args.get("supplier"),
+            pending_pay=pending_pay)
+        return out, None
     if len(raw_items) > 1:
         # text multi-item: one editable preview, one confirm
         prior = None
@@ -590,12 +604,10 @@ def _exec_stock_add(conn, shop_id, args, bundle):
         return propose_stock_intake(
             conn, shop_id, doc.get("products", []) if isinstance(doc, dict)
             else [], raw_items, args.get("supplier"),
-            bundle.get("digest") or "", prior), None
+            bundle.get("digest") or "", prior,
+            pending_pay=pending_pay), None
     items = _items(args.get("items"), need_qty=True)
     supplier = args.get("supplier")
-    from app.tools import _clean_stock_account
-    top_acct = _clean_stock_account(args.get("account"))
-    top_pay = _cents(args.get("pay_cents"))
     parts = []
     for it in items:
         raw = next((e for e in (args.get("items") or [])

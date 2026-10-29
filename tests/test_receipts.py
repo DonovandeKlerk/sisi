@@ -81,6 +81,33 @@ def test_receipt_supplier_credit_and_undo(conn):
     assert "• Till R1000.00" in cash_balances(conn, SHOP)
 
 
+def test_receipt_undo_created_product_cleans_moves(conn):
+    from app.tools import undo_last
+
+    seed_demo(SHOP, conn)
+    set_float(conn, SHOP, {"cash": 100000})
+    propose_receipt(conn, SHOP, _receipt(
+        receipt_no="R-9NEW", total_cents=6000,
+        lines=[{"line_no": 1, "text": "MYSTERY BEANS 500G x3 60.00",
+                "item": "Mystery Beans 500g", "packs": None,
+                "pack_size": None, "qty_units": 3,
+                "unit_cost_cents": 2000, "line_total_cents": 6000}]))
+    confirm_pending(conn, SHOP)
+    row = conn.execute("SELECT id, stock_qty FROM products"
+                       " WHERE shop_id = ? AND name = ?",
+                       (SHOP, "Mystery Beans 500g")).fetchone()
+    assert row is not None and row["stock_qty"] == 3
+    undo_last(conn, SHOP)  # must not raise FOREIGN KEY
+    left = conn.execute("SELECT COUNT(*) c FROM products"
+                        " WHERE shop_id = ? AND name = ?",
+                        (SHOP, "Mystery Beans 500g")).fetchone()["c"]
+    assert left == 0
+    moves = conn.execute("SELECT COUNT(*) c FROM stock_moves"
+                         " WHERE shop_id = ? AND product_id = ?",
+                         (SHOP, row["id"])).fetchone()["c"]
+    assert moves == 0
+
+
 def test_receipt_duplicate_skipped(conn):
     seed_demo(SHOP, conn)
     propose_receipt(conn, SHOP, _receipt())

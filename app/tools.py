@@ -211,13 +211,78 @@ def get_pending(conn: sqlite3.Connection, shop_id: str) -> sqlite3.Row | None:
     ).fetchone()
 
 
+def get_deferred_link(conn: sqlite3.Connection, shop_id: str) -> sqlite3.Row | None:
+    """The paused link_choice, if any (invisible to get_pending)."""
+    return conn.execute(
+        "SELECT * FROM pending_actions WHERE shop_id = ? AND status = 'deferred'"
+        " AND action_type = 'link_choice' ORDER BY id DESC LIMIT 1",
+        (shop_id,),
+    ).fetchone()
+
+
+def _deferred_label(payload: dict) -> str:
+    """Short receipt label for a deferred link_choice ('Jumbo R-1')."""
+    if payload.get("direction") == "photo_receipt":
+        receipt = payload.get("receipt") or {}
+        label = f"{receipt.get('supplier') or ''} {receipt.get('receipt_no') or ''}".strip()
+    else:
+        info = payload.get("receipt_info") or {}
+        label = f"{info.get('sup') or ''} {info.get('ref') or ''}".strip()
+    return label or "receipt"
+
+
+def _deferred_nudge() -> str:
+    """The resume line appended while a deferred link_choice waits."""
+    return "\n\n" + _t("link_deferred_hint")
+
+
+def defer_pending_link_choice(conn: sqlite3.Connection, shop_id: str) -> bool:
+    """Pause a pending link_choice ahead of a photo intake (True if paused)."""
+    pend = get_pending(conn, shop_id)
+    if pend is None or pend["action_type"] != "link_choice":
+        return False
+    conn.execute("UPDATE pending_actions SET status = 'deferred' WHERE id = ?",
+                 (pend["id"],))
+    conn.commit()
+    return True
+
+
 def _propose(conn: sqlite3.Connection, shop_id: str, action_type: str, payload: dict, preview: str,
              *, commit: bool = True) -> str:
+    extra = ""
+    if action_type != "link_choice":
+        old = conn.execute(
+            "SELECT id FROM pending_actions WHERE shop_id = ? AND status = 'pending'"
+            " AND action_type = 'link_choice' ORDER BY id DESC LIMIT 1",
+            (shop_id,)).fetchone()
+        if old is not None:
+            # A new request pauses the receipt question instead of
+            # silently replacing it; 'resume' brings it back.
+            conn.execute("UPDATE pending_actions SET status = 'deferred' WHERE id = ?",
+                         (old["id"],))
+            extra = "\n" + _t("link_deferred_hint")
+    else:
+        dropped = conn.execute(
+            "SELECT id, payload_json FROM pending_actions WHERE shop_id = ?"
+            " AND status = 'deferred' AND action_type = 'link_choice'"
+            " ORDER BY id DESC", (shop_id,)).fetchall()
+        if dropped:
+            # One live deferred at most: a newer receipt question
+            # replaces it, always naming the dropped receipt.
+            label = _deferred_label(json.loads(dropped[0]["payload_json"]))
+            conn.execute(
+                "UPDATE pending_actions SET status = 'superseded', resolved_at = ?"
+                " WHERE shop_id = ? AND status = 'deferred'"
+                " AND action_type = 'link_choice'",
+                (now_iso(), shop_id))
+            extra = "\n" + _t("link_replaced", label=label[:40])
     conn.execute(
         "UPDATE pending_actions SET status = 'superseded', resolved_at = ?"
         " WHERE shop_id = ? AND status = 'pending'",
         (now_iso(), shop_id),
     )
+    if extra:
+        preview = preview + extra
     conn.execute(
         "INSERT INTO pending_actions (shop_id, action_type, payload_json, preview_text,"
         " created_at) VALUES (?, ?, ?, ?, ?)",
@@ -271,6 +336,18 @@ def confirm_pending(conn: sqlite3.Connection, shop_id: str) -> str:
         # Linked costs never auto-chain a price change: the payment
         # pending must survive as the next proposal.
         message += _after_receipt_link(conn, shop_id, payload)
+    if row["action_type"] == "stock_intake":
+        message += _after_intake_pay(conn, shop_id, payload.get("pending_pay"),
+                                     payload.get("supplier") or "")
+    if row["action_type"] == "stock_intake_item" and payload.get("pending_pay") \
+            and get_intake_session(conn, shop_id) is None:
+        # The final item cleared the session; mid-flow confirms keep quiet.
+        item = payload.get("item") or {}
+        message += _after_intake_pay(
+            conn, shop_id, payload["pending_pay"],
+            payload.get("supplier") or item.get("supplier") or "")
+    if get_deferred_link(conn, shop_id) is not None:
+        message += _deferred_nudge()
     return message
 
 
@@ -314,7 +391,42 @@ def cancel_pending(conn: sqlite3.Connection, shop_id: str) -> str:
         (now_iso(), row["id"]),
     )
     conn.commit()
-    return _t("not_saved")
+    out = _t("not_saved")
+    if get_deferred_link(conn, shop_id) is not None:
+        out += _deferred_nudge()
+    return out
+
+
+def resume_deferred_link(conn: sqlite3.Connection, shop_id: str) -> str | None:
+    """Restore a paused link_choice as the pending question (None when none).
+
+    The interrupting preview, if any, is superseded: saying 'resume'
+    means the receipt question is the live one again.
+    """
+    ensure_shop(conn, shop_id)
+    row = get_deferred_link(conn, shop_id)
+    if row is None:
+        return None
+    payload = json.loads(row["payload_json"])
+    conn.execute("UPDATE pending_actions SET status = 'superseded',"
+                 " resolved_at = ? WHERE id = ?",
+                 (now_iso(), row["id"]))
+    ask = _link_choice_ask(payload)
+    _propose(conn, shop_id, "link_choice", payload, ask)
+    return f"{_t('link_resumed')}\n\n{ask}"
+
+
+def cancel_deferred_link(conn: sqlite3.Connection, shop_id: str) -> str | None:
+    """Drop a paused link_choice (None when none)."""
+    ensure_shop(conn, shop_id)
+    row = get_deferred_link(conn, shop_id)
+    if row is None:
+        return None
+    conn.execute("UPDATE pending_actions SET status = 'cancelled',"
+                 " resolved_at = ? WHERE id = ?",
+                 (now_iso(), row["id"]))
+    conn.commit()
+    return _t("link_deferred_cancelled")
 
 
 # ---------------------------------------------------------------------------
@@ -1176,6 +1288,10 @@ def _render_intake(conn, shop_id, payload):
         name = ln.get("name") or _t("intake_noname")
         parts.append(f"• {i}. {name} — {qtybit} · {sellbit} · {costbit}"
                      + tags)
+    pay = payload.get("pending_pay")
+    if isinstance(pay, dict) and pay.get("amount"):
+        parts.append(_t("intake_pay_noted", amt=cents_to_rand(pay["amount"]),
+                        acct=_pay_acct_label(pay)))
     needs = _intake_needs(payload)
     if needs:
         parts.append(_t("intake_ask", needs="; ".join(needs)))
@@ -1188,7 +1304,8 @@ def propose_stock_intake(conn: sqlite3.Connection, shop_id: str,
                          products: list, items: list,
                          supplier: str | None = None,
                          photo_hash: str | None = None,
-                         prior: dict | None = None) -> str:
+                         prior: dict | None = None,
+                         pending_pay: dict | None = None) -> str:
     """One editable intake preview for photo (or multi-item) stock adds.
 
     Vision products and planner items merge into lines with explicit
@@ -1196,6 +1313,8 @@ def propose_stock_intake(conn: sqlite3.Connection, shop_id: str,
     owner answers. No payment is recorded: cost stays None (no posting)
     until the owner states it and confirms. A prior pending payload
     keeps its stated answers when the planner re-enters mid-intake.
+    A stated payment rides as payload["pending_pay"] (noted in the
+    preview, proposed as its own pending after Yes).
     """
     ensure_shop(conn, shop_id)
     products = [p for p in products or [] if isinstance(p, dict)]
@@ -1238,7 +1357,9 @@ def propose_stock_intake(conn: sqlite3.Connection, shop_id: str,
         lines.append(ln)  # earlier lines survive planner re-entry
     if not lines:
         return _t("intake_noproducts")
-    payload = _build_intake_payload(lines, supplier, photo_hash, prior)
+    stash = pending_pay or (prior or {}).get("pending_pay")
+    payload = _build_intake_payload(lines, supplier, photo_hash, prior,
+                                    stash)
     if payload.get("photo_hash"):
         # Photo one-shot only: text multi-item adds skip receipt matching.
         match = _find_unlinked_receipt(
@@ -1248,12 +1369,15 @@ def propose_stock_intake(conn: sqlite3.Connection, shop_id: str,
             [ln.get("name") or "" for ln in lines])
         if match is not None:
             info = _link_receipt_info(match)
+            link_payload: dict = {
+                "direction": "receipt_photo_oneshot",
+                "products": products, "items": items,
+                "supplier": supplier, "photo_hash": photo_hash,
+                "prior": prior, "match": match, "receipt_info": info}
+            if stash:
+                link_payload["pending_pay"] = stash
             return _propose(
-                conn, shop_id, "link_choice",
-                {"direction": "receipt_photo_oneshot",
-                 "products": products, "items": items,
-                 "supplier": supplier, "photo_hash": photo_hash,
-                 "prior": prior, "match": match, "receipt_info": info},
+                conn, shop_id, "link_choice", link_payload,
                 _t("link_ask_photo", ref=info["ref"], sup=info["sup"],
                    date=info["date"], names=info["names"]))
     return _propose(conn, shop_id, "stock_intake", payload,
@@ -1262,10 +1386,15 @@ def propose_stock_intake(conn: sqlite3.Connection, shop_id: str,
 
 def _build_intake_payload(lines: list, supplier: str | None,
                           photo_hash: str | None,
-                          prior: dict | None) -> dict:
-    return {"lines": lines, "supplier": (supplier or "").strip()
-            or (prior or {}).get("supplier", ""),
-            "photo_hash": photo_hash or (prior or {}).get("photo_hash", "")}
+                          prior: dict | None,
+                          pending_pay: dict | None = None) -> dict:
+    out = {"lines": lines, "supplier": (supplier or "").strip()
+           or (prior or {}).get("supplier", ""),
+           "photo_hash": photo_hash or (prior or {}).get("photo_hash", "")}
+    stash = pending_pay or (prior or {}).get("pending_pay")
+    if stash:
+        out["pending_pay"] = stash
+    return out
 
 
 def _rebuild_intake_lines(conn: sqlite3.Connection, shop_id: str,
@@ -1518,6 +1647,10 @@ def save_intake_session(conn: sqlite3.Connection, shop_id: str,
     now = now_iso()
     expires = (datetime.now(timezone.utc) + _INTAKE_SESSION_TTL).strftime(
         "%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    stash = dict(session.get("stash") or {})
+    if session.get("pending_pay") is not None:
+        # A stashed payment survives the round-trip via the stash JSON.
+        stash["pending_pay"] = session["pending_pay"]
     conn.execute(
         """INSERT INTO intake_sessions
              (shop_id, photo_digest, caption, vision_json, items_json,
@@ -1537,7 +1670,7 @@ def save_intake_session(conn: sqlite3.Connection, shop_id: str,
          session.get("current") or 0,
          session.get("field"),
          session.get("status") or "active",
-         _dump_intake_json(session.get("stash"), "{}"),
+         _dump_intake_json(stash, "{}"),
          now, expires),
     )
     if commit:
@@ -1557,7 +1690,8 @@ def get_intake_session(conn: sqlite3.Connection, shop_id: str) -> dict | None:
                      (shop_id,))
         conn.commit()
         return None
-    return {
+    stash = _load_intake_json(row["stash_json"], {})
+    out = {
         "photo_digest": row["photo_digest"] or "",
         "caption": row["caption"] or "",
         "vision_json": _load_intake_json(row["vision_json"], []),
@@ -1565,8 +1699,11 @@ def get_intake_session(conn: sqlite3.Connection, shop_id: str) -> dict | None:
         "current": row["current"] or 0,
         "field": row["field"],
         "status": row["status"] or "active",
-        "stash": _load_intake_json(row["stash_json"], {}),
+        "stash": stash,
     }
+    if stash.get("pending_pay") is not None:
+        out["pending_pay"] = stash["pending_pay"]
+    return out
 
 
 def clear_intake_session(conn: sqlite3.Connection, shop_id: str,
@@ -2157,13 +2294,24 @@ def _guided_remaining(session: dict) -> int:
                if e.get("state") in (None, "pending"))
 
 
+def _guided_session_supplier(session: dict) -> str:
+    for e in session.get("items_json") or []:
+        if isinstance(e, dict) and (e.get("supplier") or "").strip():
+            return e["supplier"].strip()
+    return ""
+
+
 def _guided_cancel_all(conn: sqlite3.Connection, shop_id: str,
                        session: dict) -> str:
     n = _guided_remaining(session)
+    pay = session.get("pending_pay") \
+        or (session.get("stash") or {}).get("pending_pay")
+    sup = _guided_session_supplier(session)
     _guided_drop_item_pending(conn, shop_id)
     _clear_dup_stash(conn, shop_id)
     clear_intake_session(conn, shop_id)
-    return _t("g_cancel_done", n=n)
+    return _t("g_cancel_done", n=n) + _after_intake_pay(conn, shop_id, pay,
+                                                        sup)
 
 
 def _guided_unnormalize_cost(item: dict) -> None:
@@ -2272,8 +2420,12 @@ def _guided_skip_item(conn: sqlite3.Connection, shop_id: str,
     skipped = _t("g_skipped", name=name)
     if nxt_idx >= len(items):
         done = _guided_summary(items)
+        pay = session.get("pending_pay") \
+            or (session.get("stash") or {}).get("pending_pay")
+        sup = _guided_session_supplier(session)
         clear_intake_session(conn, shop_id)
-        return f"{skipped}\n{done}"
+        return f"{skipped}\n{done}" + _after_intake_pay(conn, shop_id, pay,
+                                                        sup)
     session["current"] = nxt_idx
     nxt_item = items[nxt_idx]
     nxt = _guided_next_field(nxt_item)
@@ -2714,7 +2866,8 @@ def _guided_build_items(conn: sqlite3.Connection, shop_id: str,
 def start_guided_intake(conn: sqlite3.Connection, shop_id: str,
                         products: list, items: list, caption: str,
                         photo_hash: str,
-                        supplier: str | None = None) -> str:
+                        supplier: str | None = None,
+                        pending_pay: dict | None = None) -> str:
     """Begin (replacing any active session): overview + first prompt."""
     ensure_shop(conn, shop_id)
     built = _guided_build_items(conn, shop_id, products, items, caption,
@@ -2729,24 +2882,31 @@ def start_guided_intake(conn: sqlite3.Connection, shop_id: str,
     if match is not None:
         _guided_drop_item_pending(conn, shop_id)
         info = _link_receipt_info(match)
+        link_payload: dict = {
+            "direction": "receipt_photo_guided",
+            "products": [p for p in products or [] if isinstance(p, dict)],
+            "items": [e for e in items or [] if isinstance(e, dict)],
+            "caption": caption or "", "photo_hash": photo_hash or "",
+            "supplier": supplier, "match": match, "receipt_info": info}
+        if pending_pay:
+            link_payload["pending_pay"] = pending_pay
         return _propose(
-            conn, shop_id, "link_choice",
-            {"direction": "receipt_photo_guided",
-             "products": [p for p in products or [] if isinstance(p, dict)],
-             "items": [e for e in items or [] if isinstance(e, dict)],
-             "caption": caption or "", "photo_hash": photo_hash or "",
-             "supplier": supplier, "match": match, "receipt_info": info},
+            conn, shop_id, "link_choice", link_payload,
             _t("link_ask_photo", ref=info["ref"], sup=info["sup"],
                date=info["date"], names=info["names"]))
     return _open_guided_session(conn, shop_id, built, products, caption,
-                                photo_hash)
+                                photo_hash, pending_pay=pending_pay)
 
 
 def _open_guided_session(conn: sqlite3.Connection, shop_id: str, built: list,
                          products: list, caption: str, photo_hash: str,
-                         linked_receipt_id: int | None = None) -> str:
+                         linked_receipt_id: int | None = None,
+                         pending_pay: dict | None = None) -> str:
     """Create the guided session for already-built items (no re-match)."""
     _guided_drop_item_pending(conn, shop_id)  # a fresh session replaces
+    paused = defer_pending_link_choice(conn, shop_id)
+    pay = pending_pay if isinstance(pending_pay, dict) \
+        and pending_pay.get("amount") else None
     session = {
         "photo_digest": photo_hash or "",
         "caption": caption or "",
@@ -2758,15 +2918,23 @@ def _open_guided_session(conn: sqlite3.Connection, shop_id: str, built: list,
         "stash": {"linked_receipt_id": linked_receipt_id}
         if linked_receipt_id else {},
     }
+    if pay:
+        session["pending_pay"] = pay
     save_intake_session(conn, shop_id, session)
     head = _t("g_head", done=0, total=len(built))
     names = ", ".join(line.get("name") or "?" for line in built)
     found = _t("g_found", n=len(built), names=names)
+    note = ""
+    if pay:
+        note = "\n" + _t("intake_pay_noted", amt=cents_to_rand(pay["amount"]),
+                         acct=_pay_acct_label(pay))
+    if paused:
+        note += "\n" + _t("link_deferred_hint")
     if session["field"] is None:
-        return f"{head}\n{found}\n" + propose_intake_item(conn, shop_id, 0)
+        return f"{head}\n{found}{note}\n" + propose_intake_item(conn, shop_id, 0)
     first = _t("g_item", i=1, n=len(built),
                name=built[0].get("name") or "?")
-    return (f"{head}\n{found}\n{first}\n"
+    return (f"{head}\n{found}{note}\n{first}\n"
             f"{ask_intake_field(built[0], session['field'])}")
 
 
@@ -2911,6 +3079,10 @@ def propose_intake_item(conn: sqlite3.Connection, shop_id: str,
     payload = {"idx": idx, "item": item,
                "supplier": item.get("supplier") or "",
                "photo_hash": session.get("photo_digest") or ""}
+    pay = session.get("pending_pay") \
+        or (session.get("stash") or {}).get("pending_pay")
+    if pay:
+        payload["pending_pay"] = pay
     return _propose(conn, shop_id, "stock_intake_item", payload,
                     f"{head}\n{_guided_line_detail(item)}\n"
                     f"{_t('g_preview_ask')}", commit=commit)
@@ -3109,7 +3281,10 @@ def guided_skip_pending(conn: sqlite3.Connection, shop_id: str) -> str:
             or idx < 0 or idx >= len(items):
         return cancel_pending(conn, shop_id)
     session["current"] = idx
-    return _guided_skip_item(conn, shop_id, session)
+    out = _guided_skip_item(conn, shop_id, session)
+    if get_deferred_link(conn, shop_id) is not None:
+        out += _deferred_nudge()
+    return out
 
 
 def _guided_set_name(conn: sqlite3.Connection, shop_id: str, item: dict,
@@ -5743,8 +5918,8 @@ def _apply_receipt(conn: sqlite3.Connection, shop_id: str, payload: dict, action
         if e.get("new"):
             cur = conn.execute(
                 "INSERT INTO products (shop_id, name, cost_cents, stock_qty)"
-                " VALUES (?, ?, ?, ?)",
-                (shop_id, e["name"], avg, e["units"]))
+                " VALUES (?, ?, ?, 0)",  # the UPDATE below adds units once
+                (shop_id, e["name"], avg))
             pid, created, old_cost = cur.lastrowid, True, None
         else:
             pid, created = e["product_id"], False
@@ -5806,14 +5981,59 @@ def _apply_receipt(conn: sqlite3.Connection, shop_id: str, payload: dict, action
              "supplier": payload["supplier"], "cost_increases": increases})
 
 
+def _link_split(entry: dict) -> tuple[float, float]:
+    """A linked line as (costs-only units, surplus-stock units).
+
+    The intake already holds intake_qty units; the slip's first
+    min(slip, intake) units attach costs only and the surplus adds
+    stock. Entries without intake_qty predate splitting: all costs-only.
+    """
+    slip = entry.get("units") or 0
+    have = entry.get("intake_qty")
+    if have is None:
+        return slip, 0
+    linked = min(slip, max(have, 0))
+    return linked, slip - linked
+
+
+def _link_cost_bit(conn: sqlite3.Connection, shop_id: str, entry: dict,
+                   avg) -> str:
+    """Cost part of a new-stock line: explicit old→new on every change."""
+    if avg is None:
+        return _t("rcpt_avg_unknown")
+    new = cents_to_rand(int(round(avg)))
+    if entry.get("new"):
+        return _t("link_cost_new", new=new)
+    old = conn.execute("SELECT cost_cents FROM products WHERE id = ?",
+                       (entry["product_id"],)).fetchone()["cost_cents"]
+    if old is None:
+        return _t("link_cost_new", new=new)
+    if int(round(avg)) == int(round(old)):
+        return _t("rcpt_avg", avg=new)
+    return _t("link_cost_change", old=cents_to_rand(int(round(old))),
+              new=new)
+
+
+def _link_stock_bit(conn: sqlite3.Connection, entry: dict, qty) -> str:
+    have = 0 if entry.get("new") else conn.execute(
+        "SELECT stock_qty FROM products WHERE id = ?",
+        (entry["product_id"],)).fetchone()["stock_qty"]
+    return _t("rcpt_stock_to", a=_fmt_qty(have), b=_fmt_qty(have + qty))
+
+
 def _render_receipt_link_preview(conn: sqlite3.Connection, shop_id: str,
                                  payload: dict) -> str:
-    """LINK preview: per-line disposition, payment asked separately."""
+    """LINK preview: per-line disposition, payment asked separately.
+
+    Sections: costs-only lines, new-stock lines (incl. split surplus),
+    expenses, then flagged-excluded. Every cost change shows old→new;
+    sell prices are never touched by a link.
+    """
     stock = sorted(payload["stock"], key=lambda e: e["line_no"])
     expenses = sorted(payload["expenses"], key=lambda e: e["line_no"])
     flagged = sorted(payload["flagged"], key=lambda e: e["line_no"])
     blocks = [_t("link_head", sup=payload["supplier"])]
-    lines = []
+    linked_lines, new_lines = [], []
     for e in stock:
         if e.get("unresolved"):
             flagged.append({"line_no": e["line_no"], "text": e.get("text", ""),
@@ -5821,42 +6041,52 @@ def _render_receipt_link_preview(conn: sqlite3.Connection, shop_id: str,
             continue
         if e.get("linked") and e.get("product_id") is not None:
             avg = _receipt_avg_cost(conn, shop_id, e)
+            lq, sq = _link_split(e)
             if avg is None:
-                lines.append(_t("link_matched_unknown", name=e["name"]))
+                linked_lines.append(_t("link_matched_unknown", name=e["name"]))
             else:
                 old = conn.execute("SELECT cost_cents FROM products WHERE id = ?",
                                    (e["product_id"],)).fetchone()["cost_cents"]
                 old_txt = cents_to_rand(int(round(old))) \
                     if old is not None else "?"
-                lines.append(_t("link_matched", name=e["name"], old=old_txt,
-                                new=cents_to_rand(int(round(avg)))))
+                new_txt = cents_to_rand(int(round(avg)))
+                if e.get("intake_qty") is None:
+                    linked_lines.append(_t("link_matched", name=e["name"],
+                                           old=old_txt, new=new_txt))
+                elif sq > 0 and lq > 0:
+                    linked_lines.append(_t(
+                        "link_split_cost", name=e["name"], old=old_txt,
+                        new=new_txt, lq=_fmt_qty(lq),
+                        rq=_fmt_qty(e["units"])))
+                elif sq <= 0:
+                    linked_lines.append(_t(
+                        "link_matched_qty", name=e["name"], old=old_txt,
+                        new=new_txt, rq=_fmt_qty(e["units"]),
+                        iq=_fmt_qty(e["intake_qty"])))
+                # else: no overlap at all; the surplus line carries it.
+            if sq > 0:
+                bit = _t("link_unmatched", q=_fmt_qty(sq), name=e["name"])
+                bit += _link_cost_bit(conn, shop_id, e, avg)
+                bit += _link_stock_bit(conn, e, sq)
+                new_lines.append(bit)
             continue
         bit = _t("link_unmatched", q=_fmt_qty(e["units"]), name=e["name"])
         if e.get("pack_word"):
             bit += f" ({e['pack_word']})"
         if e.get("new"):
             bit += _t("rcpt_new")
-        avg = _receipt_avg_cost(conn, shop_id, e)
-        if avg is None:
-            bit += _t("rcpt_avg_unknown")
-        else:
-            bit += _t("rcpt_avg", avg=cents_to_rand(int(round(avg))))
-            if not e.get("new"):
-                old = conn.execute("SELECT cost_cents FROM products WHERE id = ?",
-                                   (e["product_id"],)).fetchone()["cost_cents"]
-                if old is not None and int(round(avg)) != int(round(old)):
-                    bit += _t("rcpt_was", old=cents_to_rand(int(round(old))))
-        have = 0 if e.get("new") else conn.execute(
-            "SELECT stock_qty FROM products WHERE id = ?",
-            (e["product_id"],)).fetchone()["stock_qty"]
-        bit += _t("rcpt_stock_to", a=_fmt_qty(have),
-                  b=_fmt_qty(have + e["units"]))
-        lines.append(bit)
-    for e in expenses:
-        lines.append(_t("rcpt_exp_line", cat=_cat_name(e["category"]),
-                        total=cents_to_rand(e["total"])))
-    if lines:
-        blocks.append("\n".join(lines))
+        bit += _link_cost_bit(conn, shop_id, e,
+                              _receipt_avg_cost(conn, shop_id, e))
+        bit += _link_stock_bit(conn, e, e["units"])
+        new_lines.append(bit)
+    if linked_lines:
+        blocks.append(_t("link_sec_linked") + "\n" + "\n".join(linked_lines))
+    if new_lines:
+        blocks.append(_t("link_sec_new") + "\n" + "\n".join(new_lines))
+    if expenses:
+        blocks.append(_t("link_sec_exp") + "\n" + "\n".join(
+            _t("rcpt_exp_line", cat=_cat_name(e["category"]),
+               total=cents_to_rand(e["total"])) for e in expenses))
     if flagged:
         blocks.append(_t("rcpt_flag_head") + "\n" + "\n".join(
             _t("book_flag_line", n=e["line_no"], text=e.get("text", "")[:60],
@@ -5876,7 +6106,7 @@ def _render_receipt_link_preview(conn: sqlite3.Connection, shop_id: str,
         tail.append(_t("rcpt_vat", vat=cents_to_rand(payload["vat"])))
     tail.append(_t("link_pay_note"))
     blocks.append("\n".join(tail))
-    blocks.append(_t("link_hint"))
+    blocks.append(_t("link_hint") + "\n" + _t("link_correct_hint"))
     return "\n\n".join(blocks)
 
 
@@ -5907,13 +6137,28 @@ def _apply_receipt_link(conn: sqlite3.Connection, shop_id: str, payload: dict,
                 increases.append({"product_id": e["product_id"],
                                   "name": e["name"],
                                   "old": old_cost, "new": avg})
+            _lq, surplus = _link_split(e)
+            if surplus > 0:
+                # Split line: the surplus was never taken into stock.
+                # It rides as a moves row (same old_cost, so undo is
+                # unchanged); only the surplus moves stock.
+                conn.execute("UPDATE products SET stock_qty = stock_qty + ?"
+                             " WHERE id = ?",
+                             (surplus, e["product_id"]))
+                conn.execute("INSERT INTO stock_moves (shop_id, product_id, delta_qty,"
+                             " reason, action_id, created_at)"
+                             " VALUES (?, ?, ?, 'receipt', ?, ?)",
+                             (shop_id, e["product_id"], surplus, action_id,
+                              now_iso()))
+                moves.append({"product_id": e["product_id"], "qty": surplus,
+                              "created": False, "old_cost": old_cost})
             continue
         avg = _receipt_avg_cost(conn, shop_id, e) if e.get("unit_cost") is not None else None
         if e.get("new"):
             cur = conn.execute(
                 "INSERT INTO products (shop_id, name, cost_cents, stock_qty)"
-                " VALUES (?, ?, ?, ?)",
-                (shop_id, e["name"], avg, e["units"]))
+                " VALUES (?, ?, ?, 0)",  # the UPDATE below adds units once
+                (shop_id, e["name"], avg))
             pid, created, old_cost = cur.lastrowid, True, None
         else:
             pid, created = e["product_id"], False
@@ -5970,6 +6215,8 @@ def _undo_receipt_link(conn: sqlite3.Connection, shop_id: str, undo: dict,
                      (m.get("old_cost"), m["product_id"]))
     for m in undo.get("moves", []):
         if m.get("created"):
+            conn.execute("DELETE FROM stock_moves WHERE product_id = ?",
+                         (m["product_id"],))
             conn.execute("DELETE FROM products WHERE id = ?", (m["product_id"],))
         else:
             _restore_stock(conn, shop_id, m["product_id"], -m["qty"], action_id)
@@ -5982,6 +6229,52 @@ def _undo_receipt_link(conn: sqlite3.Connection, shop_id: str, undo: dict,
     return _t("undo_receipt_link", sup=undo.get("supplier", "supplier"))
 
 
+def _link_payment_note(supplier: str, receipt_no: str) -> str:
+    return f"receipt {supplier or ''} {receipt_no or ''}".strip()
+
+
+def _link_payment_recorded(conn: sqlite3.Connection, shop_id: str,
+                           note: str) -> bool:
+    """An unreversed purchase/supplier move already carries this note."""
+    if not note:
+        return False
+    for table, extra in (("cash_moves", "AND kind = 'purchase'"),
+                         ("supplier_moves", "")):
+        hit = conn.execute(
+            f"SELECT 1 FROM {table} WHERE shop_id = ? AND note = ?"
+            f" AND reversed = 0 {extra} LIMIT 1", (shop_id, note)).fetchone()
+        if hit is not None:
+            return True
+    return False
+
+
+def _link_payment_warn(conn: sqlite3.Connection, shop_id: str, supplier: str,
+                       total: int, note: str) -> str:
+    """Heuristic near-match: same supplier + amount + 14d, different note."""
+    sup = (supplier or "").strip()
+    if not sup or not total:
+        return ""
+    row = conn.execute(
+        "SELECT note FROM supplier_moves WHERE shop_id = ? AND supplier = ?"
+        " AND amount_cents = ? AND created_at >= ? AND reversed = 0"
+        " AND note != ? ORDER BY created_at DESC LIMIT 1",
+        (shop_id, sup, total, _link_cutoff(), note)).fetchone()
+    if row is None:
+        for cand in conn.execute(
+                "SELECT note FROM cash_moves WHERE shop_id = ?"
+                " AND kind = 'purchase' AND ABS(amount_cents) = ?"
+                " AND created_at >= ? AND reversed = 0 AND note != ?"
+                " ORDER BY created_at DESC LIMIT 50",
+                (shop_id, total, _link_cutoff(), note)).fetchall():
+            if sup.casefold() in (cand["note"] or "").casefold():
+                row = cand
+                break
+    if row is None:
+        return ""
+    return "\n" + _t("link_pay_warn", amt=cents_to_rand(total),
+                     note=(row["note"] or "")[:30])
+
+
 def _after_receipt_link(conn: sqlite3.Connection, shop_id: str,
                         payload: dict) -> str:
     """Propose the link's payment as a SEPARATE pending (separate Yes/undo)."""
@@ -5991,14 +6284,50 @@ def _after_receipt_link(conn: sqlite3.Connection, shop_id: str,
     acct = payload.get("account") or "cash"
     sup = payload.get("supplier") or ""
     no = payload.get("receipt_no") or ""
-    note = f"receipt {sup} {no}".strip()
+    note = _link_payment_note(sup, no)
+    if _link_payment_recorded(conn, shop_id, note):
+        return "\n\n" + _t("link_pay_done", note=note[:50])
     if acct == "supplier":
         preview = record_purchase(conn, shop_id, total, account="supplier",
                                   supplier=sup, note=note)
     else:
         preview = record_purchase(conn, shop_id, total, account=acct,
                                   note=note or sup)
+    warn = _link_payment_warn(conn, shop_id, sup, total, note)
+    if warn:
+        pend = get_pending(conn, shop_id)
+        if pend is not None and pend["action_type"] == "record_purchase":
+            conn.execute("UPDATE pending_actions SET preview_text = preview_text || ?"
+                         " WHERE id = ?", (warn, pend["id"]))
+            conn.commit()
+        preview += warn
     return "\n\n" + preview
+
+
+def _pay_acct_label(pay: dict) -> str:
+    if str(pay.get("account") or "") == "supplier":
+        return _t("rcpt_sup_acct",
+                  sup=str(pay.get("supplier") or "supplier")[:30])
+    return _acct_name(str(pay.get("account") or "cash"))
+
+
+def _after_intake_pay(conn: sqlite3.Connection, shop_id: str, pay,
+                      supplier: str = "") -> str:
+    """Propose a stashed intake payment (multi-item/photo carry-forward)."""
+    if not isinstance(pay, dict):
+        return ""
+    try:
+        amount = int(pay.get("amount") or 0)
+    except (TypeError, ValueError):
+        return ""
+    acct = str(pay.get("account") or "")
+    if amount <= 0 or acct not in ("cash", "petty", "bank", "supplier"):
+        return ""
+    sup = str(pay.get("supplier") or supplier or "").strip()
+    note = f"stock {sup}" if sup else "stock intake"
+    return "\n\n" + record_purchase(
+        conn, shop_id, amount, account=acct,
+        supplier=sup if acct == "supplier" else None, note=note)
 
 
 def _link_choice_ask(payload: dict) -> str:
@@ -6019,11 +6348,17 @@ def _link_choice_link_receipt(conn: sqlite3.Connection, shop_id: str,
         " AND reason = 'restock'",
         (shop_id, candidate["action_id"])).fetchall()
     have = {m["product_id"] for m in moves}
+    have_qty: dict = {}
+    for m in moves:
+        have_qty[m["product_id"]] = have_qty.get(m["product_id"], 0) \
+            + (m["delta_qty"] or 0)
     link = json.loads(json.dumps(receipt))
     link["linked_action"] = candidate["action_id"]
     for e in link["stock"]:
         e["linked"] = (not e.get("unresolved")
                        and e.get("product_id") in have)
+        pid = e.get("product_id")
+        e["intake_qty"] = have_qty.get(pid, 0) if pid is not None else 0
     return _propose(conn, shop_id, "receipt_link", link,
                     _render_receipt_link_preview(conn, shop_id, link))
 
@@ -6082,7 +6417,8 @@ def _link_choice_link_photo(conn: sqlite3.Connection, shop_id: str,
         out = _open_guided_session(
             conn, shop_id, rest, payload.get("products") or [],
             payload.get("caption") or "", payload.get("photo_hash") or "",
-            linked_receipt_id=match["receipt_id"])
+            linked_receipt_id=match["receipt_id"],
+            pending_pay=payload.get("pending_pay"))
         cur = get_pending(conn, shop_id)
         if pend_id is not None and cur is not None \
                 and cur["id"] == pend_id:
@@ -6109,7 +6445,8 @@ def _link_choice_link_photo(conn: sqlite3.Connection, shop_id: str,
               names=_short_list([d.get("name") or "?" for d in dropped], 65))
     rest_payload = _build_intake_payload(rest, payload.get("supplier"),
                                          payload.get("photo_hash"),
-                                         payload.get("prior"))
+                                         payload.get("prior"),
+                                         payload.get("pending_pay"))
     rest_payload["linked_receipt_id"] = match["receipt_id"]
     preview = _render_intake(conn, shop_id, rest_payload)
     _propose(conn, shop_id, "stock_intake", rest_payload, preview)
@@ -6132,7 +6469,8 @@ def _link_choice_new_photo(conn: sqlite3.Connection, shop_id: str,
             return _t("intake_noproducts")
         out = _open_guided_session(
             conn, shop_id, built, payload.get("products") or [],
-            payload.get("caption") or "", payload.get("photo_hash") or "")
+            payload.get("caption") or "", payload.get("photo_hash") or "",
+            pending_pay=payload.get("pending_pay"))
         cur = get_pending(conn, shop_id)
         if pend_id is not None and cur is not None \
                 and cur["id"] == pend_id:
@@ -6148,7 +6486,8 @@ def _link_choice_new_photo(conn: sqlite3.Connection, shop_id: str,
         return _t("intake_noproducts")
     rest_payload = _build_intake_payload(lines, payload.get("supplier"),
                                          payload.get("photo_hash"),
-                                         payload.get("prior"))
+                                         payload.get("prior"),
+                                         payload.get("pending_pay"))
     preview = _render_intake(conn, shop_id, rest_payload)
     _propose(conn, shop_id, "stock_intake", rest_payload, preview)
     return preview
@@ -6173,24 +6512,33 @@ def answer_link_choice(conn: sqlite3.Connection, shop_id: str,
         conn.commit()
         return _t("not_saved"), None
     direction = payload.get("direction")
+    handler = None
     if word in ("link", "same"):
         if direction == "photo_receipt":
-            return _link_choice_link_receipt(conn, shop_id, payload), None
-        if direction in ("receipt_photo_guided", "receipt_photo_oneshot"):
-            return _link_choice_link_photo(conn, shop_id, payload), None
-        return _link_choice_ask(payload), ["link", "new"]
-    if word == "new":
+            handler = _link_choice_link_receipt
+        elif direction in ("receipt_photo_guided", "receipt_photo_oneshot"):
+            handler = _link_choice_link_photo
+    elif word == "new":
         if direction == "photo_receipt":
-            return _link_choice_new_receipt(conn, shop_id, payload), None
-        if direction in ("receipt_photo_guided", "receipt_photo_oneshot"):
-            return _link_choice_new_photo(conn, shop_id, payload), None
+            handler = _link_choice_new_receipt
+        elif direction in ("receipt_photo_guided", "receipt_photo_oneshot"):
+            handler = _link_choice_new_photo
+    if handler is None:
         return _link_choice_ask(payload), ["link", "new"]
-    return _link_choice_ask(payload), ["link", "new"]
+    # Answered: settle the choice BEFORE proposing, so the follow-up
+    # preview never pauses (defers) the question it just answered.
+    conn.execute("UPDATE pending_actions SET status = 'confirmed',"
+                 " resolved_at = ? WHERE id = ?",
+                 (now_iso(), pend["id"]))
+    conn.commit()
+    return handler(conn, shop_id, payload), None
 
 
 def _undo_receipt(conn: sqlite3.Connection, shop_id: str, undo: dict, action_id: str) -> str:
     for m in undo.get("moves", []):
         if m.get("created"):
+            conn.execute("DELETE FROM stock_moves WHERE product_id = ?",
+                         (m["product_id"],))
             conn.execute("DELETE FROM products WHERE id = ?", (m["product_id"],))
         else:
             _restore_stock(conn, shop_id, m["product_id"], -m["qty"], action_id)
@@ -6260,6 +6608,48 @@ def correct_receipt_account(conn: sqlite3.Connection, shop_id: str, account: str
     payload["account"] = account
     payload["account_guessed"] = False
     preview = _render_receipt_preview(conn, shop_id, payload)
+    conn.execute("UPDATE pending_actions SET payload_json = ?, preview_text = ? WHERE id = ?",
+                 (json.dumps(payload), preview, pend["id"]))
+    conn.commit()
+    return preview
+
+
+def _link_intake_qty(conn: sqlite3.Connection, shop_id: str, payload: dict,
+                     product_id) -> float:
+    """Restock units of one product under this link's intake action."""
+    action = payload.get("linked_action") or ""
+    if not action or product_id is None:
+        return 0
+    rows = conn.execute(
+        "SELECT delta_qty FROM stock_moves WHERE shop_id = ? AND action_id = ?"
+        " AND reason = 'restock' AND product_id = ?",
+        (shop_id, action, product_id)).fetchall()
+    return sum((r["delta_qty"] or 0) for r in rows)
+
+
+def correct_link_line(conn: sqlite3.Connection, shop_id: str, line_no: int, rest: str) -> str:
+    """Flip one LINK line: 'line 2 is link' (costs only) or '... is new' (stock).
+
+    Mirrors correct_receipt_line: anything else re-hints without writing.
+    """
+    pend = get_pending(conn, shop_id)
+    if pend is None or pend["action_type"] != "receipt_link":
+        return _t("link_no_preview")
+    payload = json.loads(pend["payload_json"])
+    if line_no < 1 or line_no > (payload.get("line_count") or 0):
+        return _t("rcpt_line_missing", n=line_no)
+    word = (rest or "").strip().lower()
+    entry = next((e for e in payload.get("stock", [])
+                  if e.get("line_no") == line_no
+                  and not e.get("unresolved")), None)
+    if entry is None or word not in ("link", "new"):
+        return _t("link_correct_hint")
+    entry["linked"] = word == "link"
+    if word == "link" and entry.get("intake_qty") is None \
+            and entry.get("product_id") is not None:
+        entry["intake_qty"] = _link_intake_qty(conn, shop_id, payload,
+                                               entry["product_id"])
+    preview = _render_receipt_link_preview(conn, shop_id, payload)
     conn.execute("UPDATE pending_actions SET payload_json = ?, preview_text = ? WHERE id = ?",
                  (json.dumps(payload), preview, pend["id"]))
     conn.commit()

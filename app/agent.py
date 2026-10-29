@@ -50,6 +50,7 @@ from app.tools import (
     answer_link_choice,
     ask_intake_field,
     build_order,
+    cancel_deferred_link,
     cancel_pending,
     get_intake_session,
     guided_reprompt,
@@ -64,6 +65,7 @@ from app.tools import (
     confirm_pending,
     correct_book_line,
     correct_intake_line,
+    correct_link_line,
     correct_receipt_account,
     correct_receipt_line,
     delete_my_data,
@@ -88,6 +90,7 @@ from app.tools import (
     resend_last_media,
     resolve_sender,
     reset_shop,
+    resume_deferred_link,
     save_intake_session,
     confirm_logo,
     stage_shop_logo,
@@ -946,6 +949,9 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str,
     linked = try_link_choice_reply(conn, shop_id, text)
     if linked is not None:
         return linked
+    resumed = try_deferred_link_resume(conn, shop_id, text)
+    if resumed is not None:
+        return resumed
     m = re.match(r"(speak|khuluma|praat|thetha)\s+(.+)$", word)
     if m and normalize_lang(m.group(2).strip()) is not None:
         return set_owner_language(conn, shop_id, m.group(2).strip()), None
@@ -1004,6 +1010,10 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str,
             reply = answer_intake_session(conn, shop_id, text)
             if reply is not None:
                 return reply, None
+        if get_pending(conn, shop_id) is None:
+            dropped = cancel_deferred_link(conn, shop_id)
+            if dropped is not None:
+                return dropped, None
         clear_await_price(conn, shop_id)
         return cancel_pending(conn, shop_id), None
     if word in YES_WORDS:
@@ -1548,13 +1558,17 @@ def try_line_correction(conn: sqlite3.Connection, shop_id: str, text: str) -> st
                                  m.group(2).strip())
     pend = get_pending(conn, shop_id)
     if pend is None or pend["action_type"] not in ("book_page", "receipt",
-                                                  "stock_intake"):
+                                                  "stock_intake",
+                                                  "receipt_link"):
         return None
     if pend["action_type"] == "receipt":
         return correct_receipt_line(conn, shop_id, int(m.group(1)), m.group(2).strip())
     if pend["action_type"] == "stock_intake":
         return correct_intake_line(conn, shop_id, int(m.group(1)),
                                    m.group(2).strip())
+    if pend["action_type"] == "receipt_link":
+        return correct_link_line(conn, shop_id, int(m.group(1)),
+                                 m.group(2).strip())
     return correct_book_line(conn, shop_id, int(m.group(1)), m.group(2).strip())
 
 
@@ -1570,6 +1584,21 @@ def try_link_choice_reply(conn: sqlite3.Connection, shop_id: str,
             or word in ("undo book", "resend"):
         return None  # control commands pass through; the choice waits
     return answer_link_choice(conn, shop_id, text)
+
+
+def try_deferred_link_resume(conn: sqlite3.Connection, shop_id: str,
+                             text: str) -> tuple[str, list[str] | None] | None:
+    """'resume' restores a paused link_choice (None when none waiting).
+
+    This beats the guided-session resume: a paused receipt question is
+    the older business, and the session keeps waiting its turn.
+    """
+    if _normalize(text or "") != "resume":
+        return None
+    out = resume_deferred_link(conn, shop_id)
+    if out is None:
+        return None
+    return out, ["link", "new"]
 
 
 def try_intake_reply(conn: sqlite3.Connection, shop_id: str,
