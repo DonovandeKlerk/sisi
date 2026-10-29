@@ -3154,6 +3154,18 @@ STRINGS["en"].update({
     "g_saved_next": "✅ Saved. {next}",
     "g_invalid": "I didn't catch that. {hint}",
     "g_preview_ask": "Reply Yes to save, No to skip.",
+    "g_back_none": "Nothing to go back to — you're on the first question.",
+    "g_skipped": "⏭️ Skipped {name}.",
+    "g_paused": "⏸️ Paused. Reply 'resume' to carry on with stock intake.",
+    "g_resumed": "▶️ Carrying on.",
+    "g_cancel_ask": "❓ Cancel stock intake ({n} left)? Reply 'cancel' again.",
+    "g_cancel_done": "OK, stock intake cancelled ({n} dropped).",
+    "g_photo_choice": ("📸 New photo while you're on item {done} of {total}."
+                       " Reply 'add' to include it, or 'new' to start over."),
+    "g_dup_ask": ("📸 I already saved this photo on {day}."
+                  " Reply 'restock' to use it again."),
+    "g_resume_line": "📌 Still on item {i} of {n}: {q}",
+    "g_required": "That one I really need — {hint}",
 })
 STRINGS["zu"].update({
     "g_head": "📦 *Ukungenisa isitoko: {done} kokungu-{total} sekwenziwe*",
@@ -3180,6 +3192,18 @@ STRINGS["zu"].update({
     "g_saved_next": "✅ Kulondoloziwe. {next}",
     "g_invalid": "Angikuzwanga lokho. {hint}",
     "g_preview_ask": "Phendula ngo-Yes ukulondoloza, ngo-No ukweqa.",
+    "g_back_none": "Akukho ongabuyela kukho — usumbuzo wokuqala.",
+    "g_skipped": "⏭️ Kweqiwe u-{name}.",
+    "g_paused": "⏸️ Kumiswe okwesikhashana. Phendula ngo-'resume' ukuqhubeka.",
+    "g_resumed": "▶️ Siyaqhubeka.",
+    "g_cancel_ask": "❓ Ngikucime ukungenisa ({n} okuseleyo)? Phendula ngo-'cancel' futhi.",
+    "g_cancel_done": "Kulungile, ukungenisa kukhanseliwe ({n} okulahlweyo).",
+    "g_photo_choice": ("📸 Isithombe esisha ngenkathi ukunto {done} kokungu-{total}."
+                       " Phendula ngo-'add' ukusifaka, noma ngo-'new' ukuqala phansi."),
+    "g_dup_ask": ("📸 Ngasesigcina lesi sithombe ngo-{day}."
+                  " Phendula ngo-'restock' ukusisebenzisa futhi."),
+    "g_resume_line": "📌 Usakunto {i} kokungu-{n}: {q}",
+    "g_required": "Lena ngiyidinga ngempela — {hint}",
 })
 STRINGS["af"].update({
     "g_head": "📦 *Voorraad-inname: {done} van {total} klaar*",
@@ -3206,6 +3230,18 @@ STRINGS["af"].update({
     "g_saved_next": "✅ Gestoor. {next}",
     "g_invalid": "Ek het dit nie verstaan nie. {hint}",
     "g_preview_ask": "Antwoord Yes om te stoor, No om oor te slaan.",
+    "g_back_none": "Niks om na terug te gaan nie — jy is op die eerste vraag.",
+    "g_skipped": "⏭️ {name} oorgeslaan.",
+    "g_paused": "⏸️ Gepouse. Antwoord 'resume' om met inname voort te gaan.",
+    "g_resumed": "▶️ Ons gaan voort.",
+    "g_cancel_ask": "❓ Inname kanselleer (nog {n} oor)? Antwoord weer 'cancel'.",
+    "g_cancel_done": "OK, inname gekanselleer ({n} laat vaar).",
+    "g_photo_choice": ("📸 Nuwe foto terwyl jy op item {done} van {total} is."
+                       " Antwoord 'add' om dit in te sluit, of 'new' om oor te begin."),
+    "g_dup_ask": ("📸 Ek het hierdie foto al op {day} gestoor."
+                  " Antwoord 'restock' om dit weer te gebruik."),
+    "g_resume_line": "📌 Steeds op item {i} van {n}: {q}",
+    "g_required": "Daardie een het ek regtig nodig — {hint}",
 })
 STRINGS["xh"].update({
     "g_head": "📦 *Ukungeniswa kwesitokhwe: {done} kwezingu-{total} kwenziwe*",
@@ -3232,4 +3268,16 @@ STRINGS["xh"].update({
     "g_saved_next": "✅ Kugcinwe. {next}",
     "g_invalid": "Andikuqondanga oko. {hint}",
     "g_preview_ask": "Phendula ngo-Yes ukugcina, ngo-No ukutsiba.",
+    "g_back_none": "Akukho mbuyekezo — ukumbuzo wokuqala.",
+    "g_skipped": "⏭️ Kutsitywe u-{name}.",
+    "g_paused": "⏸️ Kunqumamiswe. Phendula ngo-'resume' ukuqhubeka nenqanawe.",
+    "g_resumed": "▶️ Siyaqhubeka.",
+    "g_cancel_ask": "❓ Ndikurhoxise inqanawe ({n} okuseleyo)? Phendula ngo-'cancel' kwakhona.",
+    "g_cancel_done": "Kulungile, inqanawe irhoxisiwe ({n} okulahlweyo).",
+    "g_photo_choice": ("📸 Umfanekiso omtsha: ukwinto {done} kwezingu-{total}."
+                       " Phendula 'add' ukuwufaka, okanye 'new'."),
+    "g_dup_ask": ("📸 Sele ndawugcina lo mfanekiso ngo-{day}."
+                  " Phendula ngo-'restock' ukuwusebenzisa kwakhona."),
+    "g_resume_line": "📌 Usakwinto {i} kwezingu-{n}: {q}",
+    "g_required": "Le ndiyidinga ngenene — {hint}",
 })

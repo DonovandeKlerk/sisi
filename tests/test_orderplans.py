@@ -483,7 +483,9 @@ def test_duplicate_photo_after_confirm(conn, shop, monkeypatch):
     handle_photo(conn, SHOP, photo, CAPTION)
     handle_text(conn, SHOP, "Yes")
     _doc, reply, _b = handle_photo(conn, SHOP, photo, CAPTION)
-    assert "🧾" in reply  # already recorded as the order
+    assert "already saved" in reply and "restock" in reply  # ask first
+    msg, _b = handle_text(conn, SHOP, "restock")
+    assert "can't make out any products" in msg  # no stock lines to restock
 
 
 # --- statements, summaries, undo -----------------------------------------------

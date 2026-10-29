@@ -1720,6 +1720,369 @@ def _guided_seen_qty(item: dict) -> float | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Task 5: conversation commands + photo/dup choices.
+# ---------------------------------------------------------------------------
+
+_GUIDED_CMD_BACK = {"back", "go back"}
+_GUIDED_CMD_SKIP_ITEM = {"skip item", "skip this item"}
+_GUIDED_CMD_PAUSE = {"pause", "later"}
+_GUIDED_CMD_RESUME = {"resume", "continue"}
+# Mirrors agent.CANCEL_WORDS; tools cannot import agent.
+_GUIDED_CMD_CANCEL = {"cancel", "cancel that", "never mind", "nevermind",
+                      "kanselleer", "kanselleer dit", "khansela",
+                      "ngiyayekisa", "rhoxisa"}
+_GUIDED_CMD_CANCEL_ALL = {"cancel all", "cancel everything"}
+_GUIDED_CMD_ADD = {"add"}
+_GUIDED_CMD_NEW = {"new"}
+_GUIDED_CMD_RESTOCK = {"restock"}
+# Mirrors agent.NO_WORDS.
+_GUIDED_NO_WORDS = {"no", "n", "nope", "cha", "hayi", "nee", "aowa"}
+
+# Fields the owner cannot skip: dodged with garbage they get g_required,
+# while skippable price fields get g_invalid. Explicit "skip" stays
+# g_invalid everywhere (Task 2 contract).
+_GUIDED_REQUIRED_FIELDS = frozenset(
+    {"name", "which", "qty", "packs", "sell_unit", "per_pack", "cost_basis"})
+
+_GUIDED_ACK_TOKENS = {
+    "thank", "thanks", "thx", "hello", "hi", "hey", "heita", "sawubona",
+    "sanibona", "molo", "molweni", "dumela", "dumelang", "morning",
+    "afternoon", "evening", "bye", "goodbye", "ngiyabonga", "dankie",
+    "enkosi", "cool", "great", "nice", "awesome", "perfect",
+}
+_GUIDED_INTENT_TOKENS = {
+    "cash", "float", "till", "petty", "bank", "owe", "owes", "owing",
+    "owed", "debt", "debtor", "debtors", "balance", "balances", "statement",
+    "statements", "receipt", "receipts", "slip", "slips", "invoice",
+    "invoices", "order", "orders", "ordering", "supplier", "suppliers",
+    "wholesaler", "wholesalers", "restock", "remind", "reminder",
+    "reminders", "reminded", "snooze", "expense", "expenses", "paid",
+    "pay", "paying", "payment", "payments", "profit", "profits", "report",
+    "reports", "month", "monthly", "credit", "credits", "book", "booking",
+    "booked", "customer", "customers", "menu", "menus", "help", "spaza",
+    "permit", "permits", "licence", "license", "licences", "register",
+    "registration", "fund", "funding", "funded", "compliance", "scam",
+    "scams", "electricity", "rent", "wage", "wages", "transport",
+    "cashup", "counted", "count", "stock", "stocks", "shelf", "shelves",
+    "shefu", "isitokwe", "voorraad", "expire", "expires", "expired",
+    "expiry", "expiries", "sold", "send", "sending", "sale", "sales",
+    "afford", "affordable",
+}
+_GUIDED_Q_WORDS = {
+    "what", "how", "why", "when", "where", "who", "whom", "whose",
+    "which", "can", "could", "would", "should", "will", "do", "does",
+    "did", "is", "are", "was", "were", "have", "has", "had",
+}
+
+_DUP_STASH_KEY = "intake-dup-photo"
+
+
+def _guided_command(text: str) -> str:
+    """Normalize a message for whole-message command matching."""
+    return re.sub(r"\s+", " ", (text or "").strip().lower()
+                  ).strip(" .!?,:;\"'")
+
+
+def _guided_unrelated(text: str, field: str | None) -> bool:
+    """True when the text is new business for the planner, not an answer.
+
+    Greetings, business-intent words, and (outside the free-text name
+    field) questions and question words all belong to the planner; vague
+    fragments like "yesterday maybe" do not and get clarified instead.
+    """
+    msg = text or ""
+    toks = set(re.findall(r"[a-z']+", msg.lower()))
+    if toks & _GUIDED_ACK_TOKENS or toks & _GUIDED_INTENT_TOKENS:
+        return True
+    if field != "name":
+        if "?" in msg or toks & _GUIDED_Q_WORDS:
+            return True
+    return False
+
+
+def _guided_reject(item: dict, field: str) -> str:
+    """Clarify a dodged question: required fields insist, prices ask."""
+    hint = ask_intake_field(item, field)
+    if field in _GUIDED_REQUIRED_FIELDS:
+        return _t("g_required", hint=hint)
+    return _t("g_invalid", hint=hint)
+
+
+def _guided_reject_or_pass(item: dict, field: str, msg: str) -> str | None:
+    """Clarify an attempted answer, pass new business to the planner."""
+    if not _guided_attempted(msg) and _guided_unrelated(msg, field):
+        return None
+    return _guided_reject(item, field)
+
+
+def _save_dup_stash(conn: sqlite3.Connection, shop_id: str,
+                    stash: dict) -> None:
+    """Stash a duplicate photo's vision so 'restock' can reuse it."""
+    ensure_shop(conn, shop_id)
+    conn.execute("INSERT INTO flags (shop_id, key, value)"
+                 " VALUES (?, ?, ?)"
+                 " ON CONFLICT(shop_id, key) DO UPDATE SET value = ?",
+                 (shop_id, _DUP_STASH_KEY, json.dumps(stash),
+                  json.dumps(stash)))
+    conn.commit()
+
+
+def _load_dup_stash(conn: sqlite3.Connection, shop_id: str) -> dict | None:
+    try:
+        row = conn.execute("SELECT value FROM flags WHERE shop_id = ?"
+                           " AND key = ?", (shop_id, _DUP_STASH_KEY)
+                           ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if row is None:
+        return None
+    try:
+        stash = json.loads(row["value"] or "")
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(stash, dict) or not stash:
+        return None
+    try:
+        saved = datetime.fromisoformat(
+            str(stash.get("saved_at") or "").replace("Z", "+00:00"))
+    except ValueError:
+        saved = None
+    if saved is not None and datetime.now(timezone.utc) - saved \
+            > _INTAKE_SESSION_TTL:
+        _clear_dup_stash(conn, shop_id)  # stale: "restock" is order business
+        return None
+    return stash
+
+
+def _clear_dup_stash(conn: sqlite3.Connection, shop_id: str) -> None:
+    try:
+        conn.execute("DELETE FROM flags WHERE shop_id = ? AND key = ?",
+                     (shop_id, _DUP_STASH_KEY))
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+
+def _guided_drop_item_pending(conn: sqlite3.Connection, shop_id: str) -> None:
+    """Silently supersede a live per-item preview (session moves on)."""
+    pend = get_pending(conn, shop_id)
+    if pend is not None and pend["action_type"] == "stock_intake_item":
+        conn.execute("UPDATE pending_actions SET status = 'superseded',"
+                     " resolved_at = ? WHERE id = ?",
+                     (now_iso(), pend["id"]))
+        conn.commit()
+
+
+def guided_reprompt(conn: sqlite3.Connection, shop_id: str) -> str:
+    """Re-ask the session's current question (or resurface its preview)."""
+    session = get_intake_session(conn, shop_id)
+    items = (session or {}).get("items_json") or []
+    idx = (session or {}).get("current") or 0
+    if session is None or idx < 0 or idx >= len(items):
+        return _t("intake_no_preview")
+    if session.get("field") is None:
+        pend = get_pending(conn, shop_id)
+        if pend is not None:
+            return pend["preview_text"]  # live question wins, never cloned
+        return propose_intake_item(conn, shop_id, idx)
+    item = items[idx]
+    head = _t("g_item", i=idx + 1, n=len(items),
+              name=item.get("name") or "?")
+    return f"{head}\n{ask_intake_field(item, session['field'])}"
+
+
+def _guided_remaining(session: dict) -> int:
+    items = session.get("items_json") or []
+    idx = session.get("current") or 0
+    return sum(1 for e in items[idx:]
+               if e.get("state") in (None, "pending"))
+
+
+def _guided_cancel_all(conn: sqlite3.Connection, shop_id: str,
+                       session: dict) -> str:
+    n = _guided_remaining(session)
+    _guided_drop_item_pending(conn, shop_id)
+    _clear_dup_stash(conn, shop_id)
+    clear_intake_session(conn, shop_id)
+    return _t("g_cancel_done", n=n)
+
+
+def _guided_clear_field(item: dict, field: str) -> None:
+    """Undo one trailed answer so its question can be re-asked."""
+    if field in ("name", "which"):
+        # Identity redo: "which" answers cannot be restored, so both go
+        # back to the name question; user-stated prices survive.
+        item["name"] = "?"
+        item["product_id"], item["ambiguous"], item["new"] = None, [], False
+        if item.get("sell_source") == "shoplist":
+            item["sell_cents"], item["sell_source"] = None, None
+        if item.get("per_pack_source") != "stated":
+            item["per_pack"], item["per_pack_source"] = None, None
+        if item.get("pack_sell_source") not in ("stated", "skipped"):
+            item["pack_sell_cents"], item["pack_sell_source"] = None, None
+    elif field == "qty":
+        old = item.get("qty")
+        item["qty"], item["qty_source"], item["stock_units"] = None, None, None
+        if old is not None and item.get("packs") == old:
+            item["packs"] = None  # "2 packs" answered both at once
+    elif field == "cost":
+        item["cost_cents"], item["cost_source"] = None, None
+        item["cost_basis"], item["cost_total"], item["cost_stash"] = \
+            None, None, None
+    elif field == "sell":
+        item["sell_cents"], item["sell_source"] = None, None
+        item["sell_both_asked"] = False
+    elif field == "sell_unit":
+        item["sell_unit"] = None
+    elif field == "per_pack":
+        item["per_pack"], item["per_pack_source"] = None, None
+    elif field == "packs":
+        item["packs"] = None
+    elif field == "cost_basis":
+        item["cost_basis"] = None
+        if item.get("cost_total") and item.get("cost_source") == "stated" \
+                and item.get("cost_stash") is None \
+                and item.get("cost_cents") is not None:
+            item["cost_stash"] = item["cost_cents"]  # total back on hold
+            item["cost_cents"], item["cost_source"] = None, None
+    elif field == "pack_sell":
+        item["pack_sell_cents"], item["pack_sell_source"] = None, None
+
+
+def _guided_back(conn: sqlite3.Connection, shop_id: str,
+                 session: dict) -> str:
+    """Redo the last answer, else the previous item, else g_back_none."""
+    items = session.get("items_json") or []
+    idx = session.get("current") or 0
+    item = items[idx]
+    trail = item.get("trail") or []
+    if trail:
+        last = trail.pop()
+        item["trail"] = trail
+        _guided_clear_field(item, last)
+        field = "name" if last == "which" else last
+        session["field"] = field
+        _guided_drop_item_pending(conn, shop_id)
+        save_intake_session(conn, shop_id, session)
+        return ask_intake_field(item, field)
+    if idx > 0:
+        session["current"] = idx - 1
+        prev = items[idx - 1]
+        nxt = _guided_next_field(prev)
+        session["field"] = nxt
+        _guided_drop_item_pending(conn, shop_id)
+        save_intake_session(conn, shop_id, session)
+        if nxt is None:
+            return propose_intake_item(conn, shop_id, idx - 1)
+        head = _t("g_item", i=idx, n=len(items),
+                  name=prev.get("name") or "?")
+        return f"{head}\n{ask_intake_field(prev, nxt)}"
+    return _t("g_back_none")
+
+
+def _guided_skip_item(conn: sqlite3.Connection, shop_id: str,
+                      session: dict) -> str:
+    """Skip the whole current item and ask the next one (Task 6 summarizes)."""
+    items = session.get("items_json") or []
+    idx = session.get("current") or 0
+    name = (items[idx].get("name") or "").strip() or "?"
+    items[idx]["state"] = "skipped"
+    _guided_drop_item_pending(conn, shop_id)
+    nxt_idx = idx + 1
+    while nxt_idx < len(items) and items[nxt_idx].get("state") not in (
+            None, "pending"):
+        nxt_idx += 1
+    skipped = _t("g_skipped", name=name)
+    if nxt_idx >= len(items):
+        clear_intake_session(conn, shop_id)
+        return skipped
+    session["current"] = nxt_idx
+    nxt_item = items[nxt_idx]
+    nxt = _guided_next_field(nxt_item)
+    session["field"] = nxt
+    save_intake_session(conn, shop_id, session)
+    if nxt is None:
+        return f"{skipped}\n" + propose_intake_item(conn, shop_id, nxt_idx)
+    head = _t("g_item", i=nxt_idx + 1, n=len(items),
+              name=nxt_item.get("name") or "?")
+    return f"{skipped}\n{head}\n{ask_intake_field(nxt_item, nxt)}"
+
+
+def _guided_add_photo(conn: sqlite3.Connection, shop_id: str,
+                      session: dict) -> str | None:
+    """Merge the stashed mid-session photo's products into the intake."""
+    stash = session.get("stash") or {}
+    if stash.get("kind") != "photo":
+        return None
+    fresh = [ln for ln in _guided_build_items(
+        conn, shop_id, stash.get("vision") or [], [],
+        stash.get("caption") or "", None)
+        if str(ln.get("name") or "").strip().casefold() not in {
+            str(e.get("name") or "").strip().casefold()
+            for e in session.get("items_json") or []}]
+    for key in ("kind", "digest", "caption", "vision"):
+        stash.pop(key, None)
+    session["stash"] = stash
+    if not fresh:
+        save_intake_session(conn, shop_id, session)
+        return f"{_t('intake_noproducts')}\n" + guided_reprompt(conn, shop_id)
+    session["items_json"].extend(fresh)
+    save_intake_session(conn, shop_id, session)
+    head = _t("g_head", done=session.get("current") or 0,
+              total=len(session["items_json"]))
+    names = ", ".join(ln.get("name") or "?" for ln in fresh)
+    found = _t("g_found", n=len(fresh), names=names)
+    return f"{head}\n{found}\n" + guided_reprompt(conn, shop_id)
+
+
+def _guided_new_photo(conn: sqlite3.Connection, shop_id: str,
+                      session: dict) -> str | None:
+    """Restart the intake from the stashed mid-session photo."""
+    stash = session.get("stash") or {}
+    if stash.get("kind") != "photo":
+        return None
+    return start_guided_intake(conn, shop_id, stash.get("vision") or [], [],
+                               stash.get("caption") or "",
+                               stash.get("digest") or "")
+
+
+def _guided_restock_photo(conn: sqlite3.Connection,
+                          shop_id: str) -> str | None:
+    """Start a guided intake from the stashed duplicate photo, if any."""
+    stash = _load_dup_stash(conn, shop_id)
+    if stash is None:
+        return None
+    _clear_dup_stash(conn, shop_id)
+    return start_guided_intake(conn, shop_id, stash.get("products") or [],
+                               [], stash.get("caption") or "",
+                               stash.get("digest") or "")
+
+
+def _guided_resume(conn: sqlite3.Connection, shop_id: str,
+                   session: dict) -> str:
+    """Reactivate a paused session and re-ask its current question."""
+    was_paused = session.get("status") == "paused"
+    session["status"] = "active"
+    save_intake_session(conn, shop_id, session)
+    prompt = guided_reprompt(conn, shop_id)
+    if was_paused:
+        return f"{_t('g_resumed')}\n{prompt}"
+    return prompt
+
+
+def _guided_cancel_step(conn: sqlite3.Connection, shop_id: str,
+                        session: dict) -> str:
+    """Ask before cancelling; a repeat confirms."""
+    stash = session.get("stash") or {}
+    if stash.get("cancel_armed"):
+        return _guided_cancel_all(conn, shop_id, session)
+    stash["cancel_armed"] = True
+    session["stash"] = stash
+    save_intake_session(conn, shop_id, session)
+    return _t("g_cancel_ask", n=_guided_remaining(session))
+
+
 def _guided_next_field(item: dict) -> str | None:
     """First still-open field for a guided item (None = ready for preview).
 
@@ -2033,6 +2396,7 @@ def start_guided_intake(conn: sqlite3.Connection, shop_id: str,
                                 supplier)
     if not built:
         return _t("intake_noproducts")
+    _guided_drop_item_pending(conn, shop_id)  # a fresh session replaces
     session = {
         "photo_digest": photo_hash or "",
         "caption": caption or "",
@@ -2186,30 +2550,180 @@ def _guided_pick_which(conn: sqlite3.Connection, shop_id: str, item: dict,
     return True
 
 
+_GUIDED_PREVIEW_LINE_RE = re.compile(r"(?i)\bline\s+\d")
+
+
+def _guided_looks_money(text: str) -> bool:
+    """True when the text states money (never a plain count)."""
+    msg = text or ""
+    if re.search(r"[Rr]\s*\d", msg) or re.search(r"\d+\.\d", msg):
+        return True
+    return bool(re.search(r"(?i)\b\d+\s*rands?\b", msg))
+
+
+def _guided_apply_preview_correction(item: dict, msg: str) -> bool:
+    """Apply an at-preview fix to the line. False when nothing matched."""
+    has_cost = bool(_GUIDED_COST_RE.search(msg))
+    has_sell = bool(_GUIDED_SELL_RE.search(msg))
+    if has_cost != has_sell:  # one named price: "sell R25", "cost R18"
+        cents = _coerce_pos_int(_guided_amount_cents(msg))
+        if cents is None:
+            return False
+        target = "cost" if has_cost else "sell"
+        if target == "sell" and item.get("sell_unit") == "both" \
+                and _guided_pack_noun(msg):
+            target = "pack_sell"  # "pack price R30" corrects the pack price
+        if target == "cost" and _guided_cost_total(msg) \
+                and (_guided_pack_context(item) or _guided_pack_word(msg)):
+            _guided_stash_cost(item, cents, msg)  # reopens cost_basis
+        else:
+            item[f"{target}_cents"] = cents
+            item[f"{target}_source"] = "stated"
+            _guided_cross_fill_packs(item, msg)
+            if target == "cost" and item.get("cost_basis") is None:
+                basis = _guided_cost_basis(msg)
+                if basis is not None:
+                    item["cost_basis"] = basis
+            if target == "sell" and item.get("sell_unit") is None \
+                    and _guided_pack_context(item):
+                preset = _guided_sell_unit(msg)
+                if preset is not None:
+                    item["sell_unit"] = preset
+            if target == "sell" and item.get("sell_unit") == "both":
+                item["sell_both_asked"] = True
+        return True
+    pp = _guided_per_pack(msg, bare_ok=False)
+    if pp is not None:  # explicit "5 in each pack" only; bare "5" is qty
+        item["per_pack"] = pp
+        item["per_pack_source"] = "stated"
+        _guided_restock(item)
+        return True
+    if _guided_fill_packs_from_count(item, msg):  # "2 packs", "both packs"
+        if item.get("qty") is None:
+            item["qty"] = item["packs"]
+            item["qty_source"] = "stated"
+            item["pack_q"] = False
+        item["unit"] = _guided_pack_word(msg) or item.get("unit") or "packs"
+        _guided_restock(item)
+        return True
+    if not (has_cost or has_sell) and not _guided_looks_money(msg) \
+            and not _GUIDED_PREVIEW_LINE_RE.search(msg):
+        qty = _guided_qty(msg)
+        if qty is not None:
+            item["qty"] = qty
+            item["qty_source"] = "stated"
+            pack_word = _guided_pack_word(msg)
+            if pack_word:
+                item["unit"] = pack_word
+            if pack_word or _is_pack_unit(item.get("unit")):
+                item["packs"] = qty
+                item["pack_q"] = False
+            _guided_restock(item)
+            return True
+    unit = _guided_sell_unit(msg)
+    if unit is not None:  # "singles", "whole", "both"
+        item["sell_unit"] = unit
+        _guided_restock(item)
+        return True
+    return False
+
+
+def _guided_answer_preview(conn: sqlite3.Connection, shop_id: str,
+                           session: dict, msg: str) -> str | None:
+    """Fix the previewed line from a correction, else clarify or pass on."""
+    items = session.get("items_json") or []
+    idx = session.get("current") or 0
+    item = items[idx]
+    cmd = _guided_command(msg)
+    if cmd in _GUIDED_YES_WORDS or cmd in _GUIDED_NO_WORDS:
+        return None  # bare Yes/No belongs to confirm/cancel, never edits
+    if cmd == "skip":
+        return _guided_skip_item(conn, shop_id, session)
+    if _guided_apply_preview_correction(item, msg):
+        nxt = _guided_next_field(item)
+        session["field"] = nxt
+        save_intake_session(conn, shop_id, session)
+        if nxt is None:
+            return propose_intake_item(conn, shop_id, idx)
+        return ask_intake_field(item, nxt)
+    if not _guided_attempted(msg) and _guided_unrelated(msg, None):
+        return None
+    return _t("g_invalid", hint=_t("g_preview_ask"))
+
+
 def answer_intake_session(conn: sqlite3.Connection, shop_id: str,
                           text: str) -> str | None:
     """Answer the session's open question. None when no session/unrelated."""
     session = get_intake_session(conn, shop_id)
+    msg = (text or "").strip()
+    cmd = _guided_command(msg)
+    if cmd in _GUIDED_CMD_RESTOCK:
+        out = _guided_restock_photo(conn, shop_id)
+        if out is not None:
+            return out
+        # No dup stash: "restock" is order business, parsed below as text.
     if session is None:
         return None
     items = session.get("items_json") or []
     idx = session.get("current") or 0
     field = session.get("field")
-    if field is None or idx < 0 or idx >= len(items):
+    if idx < 0 or idx >= len(items):
         return None
+    stash = session.get("stash") or {}
+    if cmd not in _GUIDED_CMD_CANCEL and cmd not in _GUIDED_CMD_CANCEL_ALL:
+        stash.pop("cancel_armed", None)  # anything else disarms cancel
+    if session.get("status") == "paused":
+        if cmd in _GUIDED_CMD_RESUME:
+            return _guided_resume(conn, shop_id, session)
+        if cmd in _GUIDED_CMD_CANCEL_ALL:
+            return _guided_cancel_all(conn, shop_id, session)
+        if cmd in _GUIDED_CMD_CANCEL:
+            return _guided_cancel_step(conn, shop_id, session)
+        if cmd in _GUIDED_CMD_ADD:
+            return _guided_add_photo(conn, shop_id, session)
+        if cmd in _GUIDED_CMD_NEW:
+            return _guided_new_photo(conn, shop_id, session)
+        if _guided_unrelated(msg, field):
+            return None
+        return _t("g_paused")
+    if cmd in _GUIDED_CMD_BACK:
+        return _guided_back(conn, shop_id, session)
+    if cmd in _GUIDED_CMD_SKIP_ITEM:
+        return _guided_skip_item(conn, shop_id, session)
+    if cmd in _GUIDED_CMD_PAUSE:
+        session["status"] = "paused"
+        save_intake_session(conn, shop_id, session)
+        return _t("g_paused")
+    if cmd in _GUIDED_CMD_RESUME:
+        return _guided_resume(conn, shop_id, session)
+    if cmd in _GUIDED_CMD_CANCEL_ALL:
+        return _guided_cancel_all(conn, shop_id, session)
+    if cmd in _GUIDED_CMD_CANCEL:
+        return _guided_cancel_step(conn, shop_id, session)
+    if cmd in _GUIDED_CMD_ADD:
+        return _guided_add_photo(conn, shop_id, session)
+    if cmd in _GUIDED_CMD_NEW:
+        return _guided_new_photo(conn, shop_id, session)
     item = items[idx]
-    msg = (text or "").strip()
+    if field is None:
+        return _guided_answer_preview(conn, shop_id, session, msg)
     if not msg:
-        return _t("g_invalid", hint=ask_intake_field(item, field))
+        return _guided_reject(item, field)
     if field == "name":
         if _guided_is_skip(msg) or "?" in msg:
             return _t("g_invalid", hint=ask_intake_field(item, field))
+        if cmd in _GUIDED_YES_WORDS or cmd in _GUIDED_NO_WORDS:
+            return _t("g_invalid", hint=ask_intake_field(item, field))
+        if _guided_unrelated(msg, field):
+            return None
         _guided_set_name(conn, shop_id, item, msg)
     elif field == "which":
         if not _guided_pick_which(conn, shop_id, item, msg):
-            if _guided_is_skip(msg) or _guided_attempted(msg):
+            if _guided_is_skip(msg):
                 return _t("g_invalid", hint=ask_intake_field(item, field))
-            return None
+            if cmd in _GUIDED_YES_WORDS or cmd in _GUIDED_NO_WORDS:
+                return _t("g_invalid", hint=ask_intake_field(item, field))
+            return _guided_reject_or_pass(item, field, msg)
     elif field == "qty":
         target = _guided_price_target(msg, field)
         if target in ("cost", "sell"):
@@ -2233,6 +2747,7 @@ def answer_intake_session(conn: sqlite3.Connection, shop_id: str,
                 and "both" not in qtoks:
             # "five in each pack": fills per_pack; packs still asked.
             item["per_pack"] = pp
+            item["per_pack_source"] = "stated"
             if item.get("packs") is not None and item.get("qty") is None:
                 item["qty"] = item["packs"]
                 item["qty_source"] = "stated"
@@ -2251,11 +2766,11 @@ def answer_intake_session(conn: sqlite3.Connection, shop_id: str,
                     else:
                         return _t("g_invalid",
                                   hint=ask_intake_field(item, field))
-                elif _guided_is_skip(msg) or _guided_attempted(msg):
+                elif _guided_is_skip(msg):
                     return _t("g_invalid",
                               hint=ask_intake_field(item, field))
                 else:
-                    return None
+                    return _guided_reject_or_pass(item, field, msg)
             else:
                 item["qty"] = qty
                 item["qty_source"] = "stated"
@@ -2267,6 +2782,7 @@ def answer_intake_session(conn: sqlite3.Connection, shop_id: str,
                     item["pack_q"] = False
                 if pp is not None:
                     item["per_pack"] = pp  # "2 packs of 5" fills both
+                    item["per_pack_source"] = "stated"
                 _guided_restock(item)
     elif field in ("cost", "sell"):
         if _guided_is_skip(msg):
@@ -2281,10 +2797,7 @@ def answer_intake_session(conn: sqlite3.Connection, shop_id: str,
                 target = "pack_sell"  # "pack price R30" corrects pack price
             cents = _coerce_pos_int(_guided_amount_cents(msg))
             if cents is None:
-                if _guided_attempted(msg):
-                    return _t("g_invalid",
-                              hint=ask_intake_field(item, field))
-                return None
+                return _guided_reject_or_pass(item, field, msg)
             if target == "cost" and _guided_cost_total(msg) \
                     and (_guided_pack_context(item)
                          or _guided_pack_word(msg)):
@@ -2308,9 +2821,9 @@ def answer_intake_session(conn: sqlite3.Connection, shop_id: str,
     elif field == "sell_unit":
         unit = _guided_sell_unit(msg)
         if unit is None:
-            if _guided_is_skip(msg) or _guided_attempted(msg):
+            if _guided_is_skip(msg):
                 return _t("g_invalid", hint=ask_intake_field(item, field))
-            return None
+            return _guided_reject_or_pass(item, field, msg)
         item["sell_unit"] = unit
         _guided_restock(item)
     elif field == "per_pack":
@@ -2318,13 +2831,14 @@ def answer_intake_session(conn: sqlite3.Connection, shop_id: str,
         pp = _guided_per_pack(msg)
         if pp is None:
             if not filled_packs:
-                if _guided_is_skip(msg) or _guided_attempted(msg):
+                if _guided_is_skip(msg):
                     return _t("g_invalid",
                               hint=ask_intake_field(item, field))
-                return None
+                return _guided_reject_or_pass(item, field, msg)
             # packs corrected; per_pack itself is re-asked below.
         else:
             item["per_pack"] = pp
+            item["per_pack_source"] = "stated"
         _guided_restock(item)
     elif field == "packs":
         pp = _guided_per_pack(msg, bare_ok=False)
@@ -2332,16 +2846,17 @@ def answer_intake_session(conn: sqlite3.Connection, shop_id: str,
         ptoks = set(re.findall(r"[a-z]+", norm.lower()))
         if pp is not None:
             item["per_pack"] = pp
+            item["per_pack_source"] = "stated"
         count = None
         if pp is None or _GUIDED_N_PACKS_RE.search(norm) or "both" in ptoks:
             count = _guided_packs_count(msg)
         if count is None:
             if pp is not None:
                 pass  # per_pack filled; packs itself is re-asked below.
-            elif _guided_is_skip(msg) or _guided_attempted(msg):
+            elif _guided_is_skip(msg):
                 return _t("g_invalid", hint=ask_intake_field(item, field))
             else:
-                return None
+                return _guided_reject_or_pass(item, field, msg)
         else:
             item["packs"] = count
             if item.get("qty") is None:
@@ -2355,9 +2870,9 @@ def answer_intake_session(conn: sqlite3.Connection, shop_id: str,
         basis = _guided_cost_basis(msg)
         total_words = _guided_cost_total_words(msg)
         if basis is None and not total_words:
-            if _guided_is_skip(msg) or _guided_attempted(msg):
+            if _guided_is_skip(msg):
                 return _t("g_invalid", hint=ask_intake_field(item, field))
-            return None
+            return _guided_reject_or_pass(item, field, msg)
         if basis is None:
             item["cost_basis"] = "pack"  # total confirmed: split over packs
         else:
@@ -2385,10 +2900,7 @@ def answer_intake_session(conn: sqlite3.Connection, shop_id: str,
                 target = "pack_sell"
             cents = _coerce_pos_int(_guided_amount_cents(msg))
             if cents is None:
-                if _guided_attempted(msg):
-                    return _t("g_invalid",
-                              hint=ask_intake_field(item, field))
-                return None
+                return _guided_reject_or_pass(item, field, msg)
             item[f"{target}_cents"] = cents
             item[f"{target}_source"] = "stated"
             if target == "sell" and item.get("sell_unit") == "both":
@@ -2396,6 +2908,11 @@ def answer_intake_session(conn: sqlite3.Connection, shop_id: str,
     else:
         return None
     nxt = _guided_next_field(item)
+    if nxt != field:
+        trail = item.get("trail")
+        if not isinstance(trail, list):
+            trail = item["trail"] = []
+        trail.append(field)  # corrections re-ask; only progress trails
     session["field"] = nxt
     save_intake_session(conn, shop_id, session)
     if nxt is None:

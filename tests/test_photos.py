@@ -105,8 +105,10 @@ def test_duplicate_photo_detected_after_save(conn, monkeypatch):
     assert buttons == ["Yes", "No"]
     handle_text(conn, SHOP, "Yes")
     _, second, _ = handle_photo(conn, SHOP, b"same-bytes")
-    assert "already saved" in second
-    assert len(calls) == 1
+    assert "already saved" in second and "restock" in second  # ask first
+    assert len(calls) == 2  # re-read once for the restock stash
+    msg, _ = handle_text(conn, SHOP, "restock")
+    assert "can't make out any products" in msg  # expiry has no stock lines
 
 
 def test_fixture_images_exist_and_hash():

@@ -3,6 +3,7 @@
 Task 1: session store + item grounding (phantom fix).
 Task 2: guided new-product flow (questions, answers, per-item preview).
 Task 3: existing-product fast path + careful matching.
+Task 5: conversation commands + photo/dup choices + agent wiring.
 """
 
 import pytest
@@ -415,3 +416,233 @@ def test_explicit_cost_basis_skips_basis_question(conn, shop):
     assert "for each pack or for one packet" not in msg
     line = get_intake_session(conn, SHOP)["items_json"][0]
     assert line["cost_cents"] == 400
+
+
+# Task 5: conversation commands --------------------------------------------
+
+
+def test_back_skip_pause_resume_cancel(conn, shop):
+    start_guided_intake(
+        conn, SHOP,
+        [_vprod("Whey Protein 2kg", 1), _vprod("Oreo Cookies 200g", 2)],
+        [], "add to stock", "t5a")
+    assert get_intake_session(conn, SHOP)["field"] == "cost"
+    # back with nothing answered -> nothing to redo
+    assert "Nothing to go back to" in \
+        answer_intake_session(conn, SHOP, "back")
+    answer_intake_session(conn, SHOP, "R16")  # cost -> sell asked
+    assert get_intake_session(conn, SHOP)["field"] == "sell"
+    msg = answer_intake_session(conn, SHOP, "back")  # redoes cost
+    assert "cost" in msg.lower()
+    assert get_intake_session(conn, SHOP)["field"] == "cost"
+    assert get_intake_session(conn, SHOP)["items_json"][0]["cost_cents"] \
+        is None
+    # "skip item" skips the whole item even at a price field (never a
+    # price skip)
+    msg = answer_intake_session(conn, SHOP, "skip item")
+    assert "Skipped" in msg and "Whey" in msg
+    session = get_intake_session(conn, SHOP)
+    assert session["current"] == 1
+    assert session["items_json"][0]["state"] == "skipped"
+    assert session["field"] == "cost"  # second item asked
+    # pause parks the session; unrelated text is the planner's turn
+    assert "Paused" in answer_intake_session(conn, SHOP, "pause")
+    assert answer_intake_session(conn, SHOP,
+                                 "how much cash do we have?") is None
+    assert get_intake_session(conn, SHOP)["status"] == "paused"
+    msg = answer_intake_session(conn, SHOP, "resume")
+    assert "Carrying on" in msg and "cost" in msg.lower()
+    assert get_intake_session(conn, SHOP)["status"] == "active"
+    # cancel asks first; other text disarms; repeat confirms
+    msg = answer_intake_session(conn, SHOP, "cancel")
+    assert "cancel' again" in msg
+    assert get_intake_session(conn, SHOP) is not None
+    answer_intake_session(conn, SHOP, "R16")  # disarms + answers cost
+    assert get_intake_session(conn, SHOP)["field"] == "sell"
+    assert "cancel' again" in answer_intake_session(conn, SHOP, "cancel")
+    msg = answer_intake_session(conn, SHOP, "cancel")
+    assert "cancelled" in msg
+    assert get_intake_session(conn, SHOP) is None
+    # cancel all skips the question
+    start_guided_intake(conn, SHOP, [_vprod("Whey Protein 2kg", 1)], [],
+                        "add to stock", "t5b")
+    msg = answer_intake_session(conn, SHOP, "cancel all")
+    assert "cancelled" in msg
+    assert get_intake_session(conn, SHOP) is None
+
+
+def test_new_photo_asks_add_or_new(conn, shop, monkeypatch):
+    from app import agent as agent_mod
+    start_guided_intake(conn, SHOP, [_vprod("Whey Protein 2kg", 1)], [],
+                        "add to stock", "t5c")
+    monkeypatch.setattr(
+        agent_mod, "read_shop_photo",
+        lambda image, shop="": {"doc_type": "other",
+                                "products": [_vprod("Oreo Cookies 200g", 2)]})
+    _, reply, buttons = agent_mod.handle_photo(conn, SHOP, b"second-photo")
+    assert "'add'" in reply and "'new'" in reply  # choice, not replace
+    assert buttons is None
+    session = get_intake_session(conn, SHOP)
+    assert session["stash"].get("kind") == "photo"  # stashed, not merged
+    assert len(session["items_json"]) == 1
+    assert get_intake_session(conn, SHOP)["field"] == "cost"  # progress kept
+    agent_mod.handle_text(conn, SHOP, "add")  # merges the stashed photo
+    session = get_intake_session(conn, SHOP)
+    assert [e["name"] for e in session["items_json"]] == \
+        ["Whey Protein 2kg", "Oreo Cookies 200g"]
+    assert not session["stash"].get("kind")  # stash consumed
+    assert session["current"] == 0  # still on the first item
+
+
+def test_new_photo_new_starts_over(conn, shop, monkeypatch):
+    from app import agent as agent_mod
+    start_guided_intake(conn, SHOP, [_vprod("Whey Protein 2kg", 1)], [],
+                        "add to stock", "t5d")
+    answer_intake_session(conn, SHOP, "R16")
+    monkeypatch.setattr(
+        agent_mod, "read_shop_photo",
+        lambda image, shop="": {"doc_type": "other",
+                                "products": [_vprod("Oreo Cookies 200g", 2)]})
+    agent_mod.handle_photo(conn, SHOP, b"other-photo")
+    agent_mod.handle_text(conn, SHOP, "new")  # restarts from the stash
+    session = get_intake_session(conn, SHOP)
+    assert [e["name"] for e in session["items_json"]] == ["Oreo Cookies 200g"]
+    assert not session["stash"].get("kind")
+
+
+def test_dup_photo_asks_restock(conn, shop, monkeypatch):
+    import hashlib
+
+    from app import agent as agent_mod
+    from app.tools import record_photo
+    record_photo(conn, SHOP, hashlib.sha256(b"dup-pic").hexdigest(), "stock")
+    monkeypatch.setattr(
+        agent_mod, "read_shop_photo",
+        lambda image, shop="": {
+            "doc_type": "other",
+            "products": [_vprod("Sasko White Bread 700g", 2)]})
+    _, reply, _ = agent_mod.handle_photo(conn, SHOP, b"dup-pic")
+    assert "already saved" in reply and "restock" in reply  # ask first
+    assert get_intake_session(conn, SHOP) is None  # nothing started yet
+    agent_mod.handle_text(conn, SHOP, "restock")  # starts a guided session
+    session = get_intake_session(conn, SHOP)
+    assert session is not None
+    assert session["items_json"][0]["name"] == "Sasko White Bread 700g"
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+
+
+def test_unrelated_question_keeps_progress(conn, shop, monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    import app.agent as agent_mod
+    import app.interpreter as interp
+    start_guided_intake(conn, SHOP, [_vprod("Whey Protein 2kg", 1)], [],
+                        "add to stock", "t5e")
+    before = json.dumps(get_intake_session(conn, SHOP), sort_keys=True)
+
+    def fake(messages):
+        body = {"understood": "cash question",
+                "tasks": [{"kind": "cash", "args": {},
+                           "quote": "cash"}],
+                "question": None, "options": []}
+        return SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content=json.dumps(body)))],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1,
+                                  total_tokens=2))
+
+    monkeypatch.setattr(interp, "propose_plan", fake)
+    msg, _ = agent_mod.handle_text(conn, SHOP, "how much cash do we have?")
+    assert "Still on item 1 of 1" in msg  # planner reply + resume line
+    after = json.dumps(get_intake_session(conn, SHOP), sort_keys=True)
+    assert after == before  # session byte-identical
+
+
+def test_invalid_reply_clarifies_no_products(conn, shop):
+    start_guided_intake(conn, SHOP, [_vprod("Whey Protein 2kg", 1)], [],
+                        "add to stock", "t5f")
+    assert get_intake_session(conn, SHOP)["field"] == "cost"
+    msg = answer_intake_session(conn, SHOP, "yesterday maybe")
+    assert "didn't catch that" in msg  # g_invalid; cost is skippable
+    session = get_intake_session(conn, SHOP)
+    assert session["field"] == "cost"  # re-asked, nothing stored
+    assert session["items_json"][0]["cost_cents"] is None
+    assert len(session["items_json"]) == 1  # no lines added
+
+
+def test_invalid_reply_at_required_field_needs_it(conn, shop):
+    start_guided_intake(conn, SHOP, [_vprod("Mystery Goods")], [],
+                        "add to stock", "t5g")
+    assert get_intake_session(conn, SHOP)["field"] == "qty"
+    msg = answer_intake_session(conn, SHOP, "yesterday maybe")
+    assert "really need" in msg  # g_required; qty cannot be skipped
+    assert get_intake_session(conn, SHOP)["field"] == "qty"
+
+
+def test_preview_correction_updates_and_reproposes(conn, shop):
+    start_guided_intake(conn, SHOP,
+                        [_vprod("Sasko White Bread 700g", 2,
+                                readable=True)],
+                        [{"product": "Sasko White Bread 700g"}],
+                        "add to stock", "t5h")
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+    msg = answer_intake_session(conn, SHOP, "sell R25")  # at-preview fix
+    assert "R25.00" in msg
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+    assert get_intake_session(conn, SHOP)["items_json"][0]["sell_cents"] == 2500
+
+
+def test_yes_delegates_to_session_confirm_qty(conn, shop):
+    from app import agent as agent_mod
+    start_guided_intake(conn, SHOP,
+                        [_vprod("Sasko White Bread 700g", None)],
+                        [{"product": "Sasko White Bread 700g"}],
+                        "add to stock", "t5i")
+    session = get_intake_session(conn, SHOP)
+    session["items_json"][0]["seen_label"] = "2"
+    save_intake_session(conn, SHOP, session)
+    assert get_pending(conn, SHOP) is None  # nothing pending: Yes delegates
+    msg, _ = agent_mod.handle_text(conn, SHOP, "yes")
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+    assert get_intake_session(conn, SHOP)["items_json"][0]["qty"] == 2.0
+    assert "nothing waiting" not in msg.lower()
+
+
+def test_start_replaces_session_and_item_pending(conn, shop):
+    start_guided_intake(conn, SHOP,
+                        [_vprod("Sasko White Bread 700g", 2)],
+                        [{"product": "Sasko White Bread 700g"}],
+                        "add to stock", "t5j")
+    first = get_pending(conn, SHOP)
+    assert first["action_type"] == "stock_intake_item"
+    start_guided_intake(conn, SHOP, [_vprod("Whey Protein 2kg", 1)], [],
+                        "add to stock", "t5k")
+    assert get_intake_session(conn, SHOP)["items_json"][0]["name"] == \
+        "Whey Protein 2kg"
+    assert get_pending(conn, SHOP) is None  # live item preview superseded
+
+
+def test_restock_without_stash_falls_through(conn, shop):
+    start_guided_intake(conn, SHOP, [_vprod("Whey Protein 2kg", 1)], [],
+                        "add to stock", "t5l")
+    assert answer_intake_session(conn, SHOP, "restock") is None  # no stash
+    assert get_intake_session(conn, SHOP)["field"] == "cost"  # untouched
+    assert answer_intake_session(conn, "nope", "restock") is None
+
+
+def test_same_photo_resend_reasks(conn, shop, monkeypatch):
+    import hashlib
+
+    from app import agent as agent_mod
+    digest = hashlib.sha256(b"same-pic").hexdigest()
+    start_guided_intake(conn, SHOP, [_vprod("Whey Protein 2kg", 1)], [],
+                        "add to stock", digest)
+    monkeypatch.setattr(
+        agent_mod, "read_shop_photo",
+        lambda image, shop="": {"doc_type": "other",
+                                "products": [_vprod("Whey Protein 2kg", 1)]})
+    _, reply, _ = agent_mod.handle_photo(conn, SHOP, b"same-pic")
+    assert "cost" in reply.lower()  # current question re-asked
+    assert not get_intake_session(conn, SHOP)["stash"].get("kind")  # no stash
+    assert len(get_intake_session(conn, SHOP)["items_json"]) == 1

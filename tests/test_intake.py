@@ -328,12 +328,17 @@ def test_undo_reverses_whole_intake(conn, shop, monkeypatch):
 
 
 def test_duplicate_photo_detected_after_intake(conn, shop, monkeypatch):
+    from app.tools import get_intake_session
     caption = _photo(monkeypatch, [_prod("Sasko", "White Bread", "700g", 2)])
     _stub(monkeypatch, _stock_add("Sasko White Bread 700g"))
     agent.handle_photo(conn, SHOP, b"same-pic", caption)
     agent.handle_text(conn, SHOP, "yes")
     _, reply, _ = agent.handle_photo(conn, SHOP, b"same-pic", caption)
-    assert "already saved" in reply
+    assert "already saved" in reply and "restock" in reply  # ask first
+    agent.handle_text(conn, SHOP, "restock")  # starts a guided session
+    session = get_intake_session(conn, SHOP)
+    assert session["items_json"][0]["name"] == "Sasko White Bread 700g"
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
 
 
 # persistence + isolation ----------------------------------------------------

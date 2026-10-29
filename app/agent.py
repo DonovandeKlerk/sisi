@@ -46,8 +46,12 @@ from app.tools import (
     _is_pack_unit,
     _pack_echo,
     add_credit,
+    answer_intake_session,
+    ask_intake_field,
     build_order,
     cancel_pending,
+    get_intake_session,
+    guided_reprompt,
     edit_order_add,
     edit_order_remove,
     get_order_draft,
@@ -82,6 +86,7 @@ from app.tools import (
     resend_last_media,
     resolve_sender,
     reset_shop,
+    save_intake_session,
     confirm_logo,
     stage_shop_logo,
     apply_staged_logo,
@@ -775,6 +780,17 @@ def _waiting_note(waiting: list[str]) -> str:
         _t("still_waiting", what=_t(_WAIT_KEY[w])) for w in waiting)
 
 
+def _intake_delegatable(conn: sqlite3.Connection, shop_id: str) -> bool:
+    """A guided session owns Yes/No/Cancel only when nothing else waits."""
+    if get_intake_session(conn, shop_id) is None:
+        return False
+    return get_pending(conn, shop_id) is None \
+        and get_plan(conn, shop_id) is None \
+        and get_staged_logo(conn, shop_id) is None \
+        and get_await_price(conn, shop_id) is None \
+        and get_await_reminder(conn, shop_id) is None
+
+
 def confirm_newest(conn: sqlite3.Connection, shop_id: str) -> str:
     """Yes: confirm the newest proposal (pending, plan, or staged logo)."""
     pick = _newest_proposal(conn, shop_id)
@@ -979,15 +995,27 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str,
             return discard_staged_logo(conn, shop_id), None
         if clear_logo_pending(conn, shop_id):
             return _t("logo_kept"), None
+        if _intake_delegatable(conn, shop_id):
+            reply = answer_intake_session(conn, shop_id, text)
+            if reply is not None:
+                return reply, None
         clear_await_price(conn, shop_id)
         return cancel_pending(conn, shop_id), None
     if word in YES_WORDS:
+        if _intake_delegatable(conn, shop_id):
+            reply = answer_intake_session(conn, shop_id, text)
+            if reply is not None:
+                return reply, None
         return confirm_newest(conn, shop_id), None
     if word in NO_WORDS:
         if _newest_proposal(conn, shop_id) is None \
                 and get_await_price(conn, shop_id) is not None:
             clear_await_price(conn, shop_id)
             return _t("ag_sale_dropped"), None
+        if _intake_delegatable(conn, shop_id):
+            reply = answer_intake_session(conn, shop_id, text)
+            if reply is not None:
+                return reply, None
         clear_await_price(conn, shop_id)
         return cancel_newest(conn, shop_id), None
     offered = try_offer_time(conn, shop_id, text)
@@ -1086,7 +1114,8 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str,
     offer = try_reminder_offer(conn, shop_id, text)
     if offer is not None:
         return offer, None
-    return _interpret(conn, shop_id, text, sent_at)
+    message, buttons = _interpret(conn, shop_id, text, sent_at)
+    return _with_intake_resume(conn, shop_id, message), buttons
 
 
 _FALLBACK_SIGNALS = re.compile(
@@ -1246,6 +1275,54 @@ _PHOTO_EMOJI = {"expiry": "📸", "book_page": "📒", "receipt": "🧾",
                 "order": "🧾"}
 
 
+def _dup_photo_reply(conn: sqlite3.Connection, shop_id: str, image: bytes,
+                     caption: str, digest: str, seen) -> tuple:
+    """Ask-first duplicate: stash the vision, offer 'restock'."""
+    from app.tools import _save_dup_stash
+    try:
+        doc = read_shop_photo(image, shop_id)
+    except VisionError:
+        doc = None
+    products = doc.get("products", []) if isinstance(doc, dict) else []
+    _save_dup_stash(conn, shop_id, {
+        "digest": digest, "caption": caption or "",
+        "kind": seen["kind"] or "", "products": [
+            p for p in products if isinstance(p, dict)],
+        "saved_at": datetime.now(timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"})
+    day = (seen["created_at"] or "")[:10]
+    reply = _t("g_dup_ask", day=day)
+    save_turn(conn, shop_id, "user", "[photo]")
+    save_turn(conn, shop_id, "assistant", reply)
+    return doc, reply, None
+
+
+def _stash_mid_session_photo(conn: sqlite3.Connection, shop_id: str,
+                             caption: str, digest: str,
+                             doc: dict | None) -> str | None:
+    """Stash a new photo that arrives mid-intake; None when not stashed."""
+    session = get_intake_session(conn, shop_id)
+    if session is None or (session.get("status") or "active") != "active":
+        return None
+    if digest and digest == (session.get("photo_digest") or ""):
+        return guided_reprompt(conn, shop_id)  # same photo: re-ask, no stash
+    if caption and (_intent_hits(_normalize(caption)) - {"stock"}):
+        return None  # explicit other business flows normally
+    if isinstance(doc, dict) and doc.get("doc_type") in ("book_page",
+                                                         "receipt"):
+        return None  # unambiguous structured docs flow normally
+    stash = session.get("stash") or {}
+    products = doc.get("products", []) if isinstance(doc, dict) else []
+    stash.update({"kind": "photo", "digest": digest or "",
+                  "caption": caption or "",
+                  "vision": [p for p in products if isinstance(p, dict)]})
+    session["stash"] = stash
+    save_intake_session(conn, shop_id, session)
+    items = session.get("items_json") or []
+    return _t("g_photo_choice", done=(session.get("current") or 0) + 1,
+              total=len(items))
+
+
 def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
                  caption: str = "", sent_at=None):
     """Route a photo by THIS message's intent (caption + vision), then propose.
@@ -1286,9 +1363,8 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
     digest = hashlib.sha256(image or b"").hexdigest()
     seen = photo_seen(conn, shop_id, digest)
     if seen is not None:
-        day = (seen["created_at"] or "")[:10]
-        emoji = _PHOTO_EMOJI.get(seen["kind"], "📸")
-        return None, _t("ag_photo_dup", emoji=emoji, day=day), None
+        return _dup_photo_reply(conn, shop_id, image or b"", caption,
+                                digest, seen)
     _store_evidence(digest, image)
     before = get_pending(conn, shop_id)
     before_id = before["id"] if before else None
@@ -1306,6 +1382,11 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
         doc = read_shop_photo(image, shop_id)
     except VisionError as e:
         doc, vision_error = None, str(e)
+    stashed = _stash_mid_session_photo(conn, shop_id, caption, digest, doc)
+    if stashed is not None:
+        save_turn(conn, shop_id, "user", "[photo]")
+        save_turn(conn, shop_id, "assistant", stashed)
+        return doc, stashed, None
     save_turn(conn, shop_id, "user", "[photo]")
     from app.interpreter import execute_plan, interpret, media_brief
     brief = media_brief(doc, caption, digest)
@@ -1464,8 +1545,11 @@ def try_line_correction(conn: sqlite3.Connection, shop_id: str, text: str) -> st
 
 def try_intake_reply(conn: sqlite3.Connection, shop_id: str,
                      text: str) -> str | None:
-    """Fill the pending stock intake from a free-form answer."""
+    """Guided session first, then the pending one-shot stock intake."""
     from app.tools import answer_intake, get_pending
+    reply = answer_intake_session(conn, shop_id, text)
+    if reply is not None:
+        return reply
     pend = get_pending(conn, shop_id)
     if pend is None or pend["action_type"] != "stock_intake":
         return None
@@ -1473,6 +1557,25 @@ def try_intake_reply(conn: sqlite3.Connection, shop_id: str,
     if _looks_multi(probe):
         return None  # new business goes to the planner, intake waits
     return answer_intake(conn, shop_id, text)
+
+
+def _with_intake_resume(conn: sqlite3.Connection, shop_id: str,
+                        message: str) -> str:
+    """Append the guided-intake resume line when a session is still open."""
+    session = get_intake_session(conn, shop_id)
+    if session is None or (session.get("status") or "active") != "active":
+        return message
+    items = session.get("items_json") or []
+    idx = session.get("current") or 0
+    if idx < 0 or idx >= len(items):
+        return message
+    field = session.get("field")
+    if field is None:
+        question = _t("g_preview_ask")
+    else:
+        question = ask_intake_field(items[idx], field)
+    return (f"{message}\n\n"
+            f"{_t('g_resume_line', i=idx + 1, n=len(items), q=question)}")
 
 
 def try_account_correction(conn: sqlite3.Connection, shop_id: str, text: str) -> str | None:
