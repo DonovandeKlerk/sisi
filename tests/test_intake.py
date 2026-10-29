@@ -375,7 +375,6 @@ def test_unrelated_question_passes_planner(conn, shop, monkeypatch):
     msg, _ = agent.handle_text(conn, SHOP, "how much is in the till?")
     assert "Cash" in msg
     assert get_pending(conn, SHOP)["action_type"] == "stock_intake"
-    assert get_pending(conn, SHOP)["action_type"] == "stock_intake"
 
 
 # legacy workflows preserved -------------------------------------------------
