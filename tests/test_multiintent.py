@@ -109,12 +109,18 @@ def test_text_and_caption_parity(conn, _mock_llm, monkeypatch):
                         (SHOP,)).fetchone()["n"] == 2
 
 
-def test_partial_transcription_uses_defaults(conn, _mock_llm):
+def test_partial_transcription_asks_for_content(conn, _mock_llm, monkeypatch):
+    import app.agent as agent
+    monkeypatch.setattr(agent, "llm_chat_full",
+                        lambda c, s, t: ("What should I remind you about?", None))
     msg, _b = handle_text(conn, SHOP,
                           "How much petty cash do we have? And remind me")
-    assert "[reads]" in msg and "Reminder set" in msg
+    # no time and no topic: the model asks; nothing is persisted
+    assert "remind you about" in msg
     assert conn.execute("SELECT COUNT(*) n FROM reminders WHERE shop_id = ?",
-                        (SHOP,)).fetchone()["n"] == 1
+                        (SHOP,)).fetchone()["n"] == 0
+    assert conn.execute("SELECT COUNT(*) n FROM await_reminder WHERE shop_id = ?",
+                        (SHOP,)).fetchone()["n"] == 0
 
 
 def test_clarification_preserves_other_tasks(conn, _mock_llm):

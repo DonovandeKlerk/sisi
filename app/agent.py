@@ -517,11 +517,18 @@ def try_reminder_command(conn: sqlite3.Connection, shop_id: str, text: str,
         return None
     if parsed["summary"].lower().startswith(_QUESTION_STARTS):
         return None  # 'remind me how much…' is a question for the books
-    from app.reminders import due_passed, reminder_spec_ok
+    from app.reminders import due_passed, reminder_spec_ok, resolve_topic
     if not reminder_spec_ok(text, parsed):
         return None  # 'remind them' is composite work, not a schedule
     if due_passed(parsed["due"], sent_at):
         return _t("rem_past", when=parsed["due"].strftime("%H:%M"))
+    topic = resolve_topic(parsed["summary"], text)
+    if topic is None:
+        sent_iso = sent_at.isoformat() if hasattr(sent_at, "isoformat") \
+            else str(sent_at or "")
+        set_await_reminder(conn, shop_id, parsed["due"].isoformat(), sent_iso)
+        return _t("rem_ask_what", when=parsed["due"].strftime("%H:%M"))
+    parsed = dict(parsed, summary=topic)
     context = detect_context(conn, shop_id, text)
     try:
         save_reminder(conn, shop_id, parsed["due"], parsed["summary"],
@@ -925,10 +932,9 @@ def try_multi_task(conn: sqlite3.Connection, shop_id: str, text: str,
     are handled here; anything else returns None for the normal path.
     Calls try_deterministic once on strictly smaller text (no recursion).
     """
-    from app.reminders import (REMIND_TRIGGERS, confirm_text, delivery_note,
+    from app.reminders import (REMIND_TRIGGERS, confirm_text,
                                detect_context, due_passed, parse_request,
-                               reminder_spec_ok, save_reminder,
-                               summary_is_bare)
+                               reminder_spec_ok, resolve_topic, save_reminder)
     bits = _split_bits(text)
     if len(bits) < 2 and not any(
             t in f" {(text or '').lower()} " for t in REMIND_TRIGGERS):
@@ -963,12 +969,8 @@ def try_multi_task(conn: sqlite3.Connection, shop_id: str, text: str,
         if due_passed(due, sent_at):
             parts.append(_t("rem_past", when=due.strftime("%H:%M")))
             continue
-        summary = parsed["summary"]
-        if summary_is_bare(summary):
-            note = delivery_note(text)
-            if note is not None:
-                summary = note
-        if summary_is_bare(summary):
+        summary = resolve_topic(parsed["summary"], text)
+        if summary is None:
             sent_iso = sent_at.isoformat() if hasattr(sent_at, "isoformat") \
                 else str(sent_at or "")
             set_await_reminder(conn, shop_id, due.isoformat(), sent_iso)

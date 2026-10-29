@@ -121,7 +121,7 @@ def _num_value(token: str) -> int:
 
 def parse_relative(text: str, now: datetime) -> datetime | None:
     """'in 5 minutes' / 'in about five minutes' from the message time."""
-    low = f" {(text or '').lower()} "
+    low = f" {_clean_fillers(text).lower()} ".replace(",", " ")
     m = _RELATIVE_RES[0].search(low)
     if m:
         return now + timedelta(minutes=_num_value(m.group(1)))
@@ -219,8 +219,16 @@ def _default_hm(text: str) -> tuple[int, int]:
     return DEFAULT_HM
 
 
+_FILLER_RE = re.compile(r"\b(um+|uh+|er+|ah+)\b[,\s]*")
+
+
+def _clean_fillers(text: str) -> str:
+    """Drop spoken hesitations ('um, remind me in, uh, 5 minutes')."""
+    return _FILLER_RE.sub(" ", text or "")
+
+
 def _strip_request_bits(text: str) -> str:
-    low = text
+    low = _clean_fillers(text).replace(",", " ")
     low = re.sub(r"\breminders?\b", " ", low)
     for trig in REMIND_TRIGGERS:
         low = re.sub(rf"\b{re.escape(trig)}\b", " ", low)
@@ -232,6 +240,13 @@ def _strip_request_bits(text: str) -> str:
     low = re.sub(r"\bin\s+(?:%s)?a\s+minute\b" % _HEDGE, " ", low)
     low = re.sub(r"\b(please|kindly|also|just)\b", " ", low)
     low = re.sub(r"\b(send|give)\s+me\b", " ", low)
+    low = re.sub(r"\b(can|could|will|would)\s+you\b", " ", low)
+    low = re.sub(r"\b(\w+)\s+\1\b", r"\1", low)
+    for _ in range(3):
+        new = re.sub(r"^(and|plus|also|so|then|well)\b[\s,]*", " ", low).strip()
+        if new == low:
+            break
+        low = new
     low = _TIME_RE.sub(" ", low)
     low = re.sub(r"\b(today|tomorrow|namhlanje|namhla|kusasa|vandag|more"
                  r"|m\u00f4re|ngomso)\b", " ", low)
@@ -277,19 +292,26 @@ def reminder_spec_ok(text: str, parsed: dict) -> bool:
     return meaningful
 
 
+_FILLER_TOKENS = frozenset(
+    "and plus also so then well can could will would shall should may "
+    "might must do does did done is are was were be been being have has "
+    "had to for of off on a an the please kindly just um uh er ah hey "
+    "hi hello there here it there".split())
+
+
 def summary_is_bare(summary: str) -> bool:
-    """True when a summary says nothing ('Reminder', 'them', '')."""
+    """True when a summary says nothing ('Reminder', 'and can you a')."""
     toks = re.findall(r"[a-z]+", (summary or "").lower())
     if not toks:
         return True
-    return all(t in PRONOUNS or t in _BARE_SUMMARIES or len(t) <= 2
-               for t in toks)
+    return all(t in PRONOUNS or t in _BARE_SUMMARIES
+               or t in _FILLER_TOKENS or len(t) <= 2 for t in toks)
 
 
 _ARRIVE_RE = re.compile(r"\barriv\w*\b|\bcoming\b|\bon\s+(?:its|the)\s+way\b",
                         re.IGNORECASE)
 _DELIVERY_ITEM_RES = (
-    re.compile(r"([a-z][a-z\- ]{0,24}?)\s+arrives?\b", re.IGNORECASE),
+    re.compile(r"([a-z][a-z\- ]{0,24}?)\s+arriv(?:e?s|ing)\b", re.IGNORECASE),
     re.compile(r"(?:ordered?|bringing|delivering|fetching)\s+"
                r"(?:some\s+|the\s+)?([a-z][a-z\- ]{0,24}?)"
                r"(?:,|\.|$|\s+is\b|\s+are\b)", re.IGNORECASE),
@@ -297,11 +319,12 @@ _DELIVERY_ITEM_RES = (
                r"(?:coming|arriving|on\b)", re.IGNORECASE),
 )
 _DELIVERY_ARTICLES = frozenset(
-    {"the", "a", "an", "some", "my", "our", "this", "that"})
+    {"the", "a", "an", "some", "my", "our", "this", "that",
+     "is", "are", "was", "be", "been", "it"})
 
 
-def delivery_note(text: str) -> str | None:
-    """'milk delivery' from supplier-arrival context, else None.
+def _delivery_item(text: str) -> str | None:
+    """The item in supplier-arrival context ('milk'), else None.
 
     Only fires on arrival language plus a concrete item; pronouns and
     bare stopwords never become a note.
@@ -319,14 +342,46 @@ def delivery_note(text: str) -> str | None:
             continue
         if any(w in PRONOUNS or len(w) < 2 for w in toks):
             continue
-        return "%s delivery" % " ".join(toks)
+        return " ".join(toks)
     return None
+
+
+def delivery_note(text: str) -> str | None:
+    """'milk delivery' from supplier-arrival context, else None."""
+    item = _delivery_item(text)
+    return f"{item} delivery" if item else None
+
+
+def _content_tokens(summary: str) -> list[str]:
+    return [t for t in re.findall(r"[a-z]+", (summary or "").lower())
+            if t not in PRONOUNS and t not in _BARE_SUMMARIES
+            and t not in _FILLER_TOKENS and len(t) > 2]
+
+
+def resolve_topic(summary: str, text: str) -> str | None:
+    """A meaningful reminder topic, or None when the owner must say more.
+
+    Conversational filler ('and can you a') resolves to the message's
+    delivery context ('milk delivery') where one is clearly supported;
+    a lone preparation verb merges with it ('Prepare for the milk
+    delivery'). Anything else contentless returns None: ask, don't save.
+    """
+    if not summary_is_bare(summary):
+        toks = _content_tokens(summary)
+        item = _delivery_item(text)
+        if item is not None and toks and all(
+                t in ("get", "ready", "prepare") for t in toks):
+            verb = "Get ready" if "get" in toks or "ready" in toks \
+                else "Prepare"
+            return f"{verb} for the {item} delivery"
+        return summary
+    return delivery_note(text)
 
 
 def parse_request(text: str, now: datetime | None = None):
     """Parse 'remind me …'. Returns {due, recurrence, summary} or None."""
     now = now_sast(now)
-    low = f" {(text or '').lower()} "
+    low = f" {_clean_fillers(text).lower()} "
     if not any(t in low for t in REMIND_TRIGGERS):
         return None
     if re.search(r"\bdraft\w*\b", low):
