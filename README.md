@@ -182,6 +182,19 @@ paying account plus a registered WhatsApp sender; then point
 when ready: it locks **all** sends to Infobip and refuses Vonage/Meta sends
 instead of silently crossing providers.
 
+Outside-window reminders (templates): Sisi fires due reminders as the
+configured template when the 24h window is shut, else holds them as
+`blocked` with a visible reason (`my reminders`, `retry reminders`). A
+shared sender **cannot** register custom templates (Infobip docs), so on
+the trial sender set `SISI_REMINDER_TEMPLATE=test_whatsapp_template_en`
+and `SISI_REMINDER_TEMPLATE_LANG=en` in `sisi-env`: that predefined
+template has one body placeholder, which is exactly what the reminder
+sender fills with the summary (body wording stays Infobip's test text).
+With your own sender, register a utility template such as "Your requested
+shop reminder: {{1}}" and swap the name. Template parameter counts must
+match or Infobip rejects the send; delivery reports arrive at
+`/webhook/infobip/dlr` and move reminders to `delivered`/`failed`.
+
 ## Honest notes
 
 - Muse Voice Transcribe does not officially support isiZulu/Afrikaans. Sisi uses an English language bias plus a keywords list of local brands and slang (Sasko, Albany, Iwisa, ibhuku, skoloto, …) and **always shows the owner what she understood before saving**.
