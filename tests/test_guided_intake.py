@@ -2,6 +2,7 @@
 
 Task 1: session store + item grounding (phantom fix).
 Task 2: guided new-product flow (questions, answers, per-item preview).
+Task 3: existing-product fast path + careful matching.
 """
 
 import pytest
@@ -187,3 +188,82 @@ def test_guided_skip_phrases_at_cost_sell(conn, shop):
     assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
     item = get_intake_session(conn, SHOP)["items_json"][0]
     assert item["cost_cents"] is None and item["sell_cents"] is None
+
+
+def test_existing_confident_goes_straight_to_preview(conn, shop):
+    start_guided_intake(conn, SHOP,
+                        [_vprod("Sasko White Bread 700g", 2,
+                                readable=True)],
+                        [{"product": "Sasko White Bread 700g"}],
+                        "add to stock", "h")
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+    assert get_intake_session(conn, SHOP)["field"] is None
+    preview = get_pending(conn, SHOP)["preview_text"]
+    assert "keeps shop price R18.50" in preview  # shoplist, not re-asked
+
+
+def test_uncertain_count_confirms_first(conn, shop):
+    msg = start_guided_intake(
+        conn, SHOP, [_vprod("Sasko White Bread 700g", None)],
+        [{"product": "Sasko White Bread 700g"}], "add to stock", "h")
+    assert get_intake_session(conn, SHOP)["field"] == "qty"
+    assert "Reply Yes" in msg  # confirm-qty phrasing, not plain ask
+
+
+def test_explicit_sell_update_allowed_on_existing(conn, shop):
+    start_guided_intake(conn, SHOP,
+                        [_vprod("Sasko White Bread 700g", None)],
+                        [{"product": "Sasko White Bread 700g"}],
+                        "add to stock", "h")
+    answer_intake_session(conn, SHOP, "sell at R25")
+    item = get_intake_session(conn, SHOP)["items_json"][0]
+    assert item["sell_cents"] == 2500  # explicit sell wins over shoplist
+    assert item["sell_source"] == "stated"
+    assert get_intake_session(conn, SHOP)["field"] == "qty"  # qty re-asked
+    msg = answer_intake_session(conn, SHOP, "2")
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+    assert "R25" in msg and "you said" in msg  # preview shows the update
+
+
+def test_existing_qty_answer_keeps_shoplist_price(conn, shop):
+    start_guided_intake(conn, SHOP,
+                        [_vprod("Sasko White Bread 700g", None)],
+                        [{"product": "Sasko White Bread 700g"}],
+                        "add to stock", "h")
+    answer_intake_session(conn, SHOP, "3")
+    item = get_intake_session(conn, SHOP)["items_json"][0]
+    assert item["sell_cents"] == 1850  # never overwritten without sell words
+    assert item["sell_source"] == "shoplist"
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+
+
+def test_existing_qty_yes_approves_seen_count(conn, shop):
+    start_guided_intake(conn, SHOP,
+                        [_vprod("Sasko White Bread 700g", None)],
+                        [{"product": "Sasko White Bread 700g"}],
+                        "add to stock", "h")
+    session = get_intake_session(conn, SHOP)
+    session["items_json"][0]["seen_label"] = "2"  # staged seen count
+    save_intake_session(conn, SHOP, session)
+    answer_intake_session(conn, SHOP, "yes")
+    item = get_intake_session(conn, SHOP)["items_json"][0]
+    assert item["qty"] == 2.0
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+
+
+def test_existing_qty_yes_without_seen_reasks(conn, shop):
+    start_guided_intake(conn, SHOP,
+                        [_vprod("Sasko White Bread 700g", None)],
+                        [{"product": "Sasko White Bread 700g"}],
+                        "add to stock", "h")
+    msg = answer_intake_session(conn, SHOP, "yes")
+    assert "didn't catch that" in msg  # nothing staged; never invent qty
+    assert get_intake_session(conn, SHOP)["field"] == "qty"
+
+
+def test_ambiguous_existing_resolves_then_previews(conn, shop):
+    start_guided_intake(conn, SHOP, [_vprod("Sasko White Bread 700g", 2)],
+                        [{"product": "Bread"}], "add to stock", "h")
+    assert get_intake_session(conn, SHOP)["field"] == "which"
+    answer_intake_session(conn, SHOP, "Sasko")
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"

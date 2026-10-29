@@ -1517,14 +1517,51 @@ def _guided_pack_context(item: dict) -> bool:
     return bool(item.get("per_pack") or item.get("packs"))
 
 
+def _guided_is_existing(item: dict) -> bool:
+    """True for a careful inventory match (unique row, resolved identity)."""
+    return item.get("product_id") is not None \
+        and not item.get("ambiguous") and not item.get("new")
+
+
+# Affirmations accepted by confirm-qty (mirrors agent.YES_WORDS; tools
+# cannot import agent). Whole-message match only.
+_GUIDED_YES_WORDS = {"yes", "y", "yebo", "yeah", "ja", "ewe", "ok",
+                     "okay", "sharp", "shap", "sure"}
+
+
+def _guided_is_yes(text: str) -> bool:
+    norm = re.sub(r"\s+", " ", (text or "").strip().lower()
+                  .strip(" .!?")).strip()
+    return norm in _GUIDED_YES_WORDS
+
+
+def _guided_seen_qty(item: dict) -> float | None:
+    """Numeric staged seen count, if any (qty itself is still None)."""
+    for raw in (item.get("seen_label"), item.get("packs_seen")):
+        try:
+            qty = float(str(raw).strip())
+        except (TypeError, ValueError):
+            continue
+        if qty > 0:
+            return qty
+    return None
+
+
 def _guided_next_field(item: dict) -> str | None:
-    """First still-open field: name -> which -> qty -> cost -> sell -> unit."""
+    """First still-open field: name -> which -> qty -> cost -> sell -> unit.
+
+    Existing products take the fast path: once identity and qty are
+    confident, the shoplist price is reused and cost/sell/unit are
+    never asked — the item goes straight to preview.
+    """
     if not (item.get("name") or "").strip() or item.get("name") == "?":
         return "name"
     if item.get("ambiguous"):
         return "which"
     if item.get("qty") is None:
         return "qty"
+    if _guided_is_existing(item):
+        return None
     if item.get("cost_cents") is None \
             and item.get("cost_source") != "skipped":
         return "cost"
@@ -1543,6 +1580,9 @@ def ask_intake_field(item: dict, field: str) -> str:
         return _t("g_ask_which",
                   names=" / ".join(item.get("ambiguous") or []))
     if field == "qty":
+        if _guided_is_existing(item):
+            return _t("g_ask_qty_confirm", name=name,
+                      seen=item.get("seen_label") or "?")
         return _t("g_ask_qty", name=name,
                   seen=item.get("seen_label") or "?")
     if field == "cost":
@@ -1663,9 +1703,14 @@ def _guided_line_detail(item: dict) -> str:
     if item.get("unit"):
         qtybit += f" {item['unit']}"
     if item.get("sell_cents") is not None:
-        key = "intake_sell_said" if item.get("sell_source") == "stated" \
-            else "intake_sell_list"
-        sellbit = _t(key, amt=cents_to_rand(item["sell_cents"]))
+        if item.get("sell_source") == "shoplist":
+            sellbit = _t("g_reuse_price",
+                         amt=cents_to_rand(item["sell_cents"]))
+        else:
+            key = "intake_sell_said" \
+                if item.get("sell_source") == "stated" \
+                else "intake_sell_list"
+            sellbit = _t(key, amt=cents_to_rand(item["sell_cents"]))
     else:
         sellbit = _t("intake_sell_q")
     costbit = _t("intake_cost", amt=cents_to_rand(item["cost_cents"])) \
@@ -1767,17 +1812,37 @@ def answer_intake_session(conn: sqlite3.Connection, shop_id: str,
                 return _t("g_invalid", hint=ask_intake_field(item, field))
             return None
     elif field == "qty":
+        target = _guided_price_target(msg, field)
+        if target in ("cost", "sell"):
+            # Named price wins (correction); qty itself is re-asked.
+            cents = _coerce_pos_int(_guided_amount_cents(msg))
+            if cents is not None:
+                item[f"{target}_cents"] = cents
+                item[f"{target}_source"] = "stated"
+                save_intake_session(conn, shop_id, session)
+                return ask_intake_field(item, field)
         qty = _guided_qty(msg)
         if qty is None:
-            if _guided_is_skip(msg) or _guided_attempted(msg):
+            if _guided_is_yes(msg):
+                seen_qty = _guided_seen_qty(item)
+                if seen_qty is not None:
+                    item["qty"] = seen_qty
+                    item["qty_source"] = "seen"
+                    item["stock_units"] = float(seen_qty)
+                else:
+                    return _t("g_invalid",
+                              hint=ask_intake_field(item, field))
+            elif _guided_is_skip(msg) or _guided_attempted(msg):
                 return _t("g_invalid", hint=ask_intake_field(item, field))
-            return None
-        item["qty"] = qty
-        item["qty_source"] = "stated"
-        pack_word = _guided_pack_word(msg)
-        if pack_word:
-            item["unit"] = pack_word
-        item["stock_units"] = float(qty)
+            else:
+                return None
+        else:
+            item["qty"] = qty
+            item["qty_source"] = "stated"
+            pack_word = _guided_pack_word(msg)
+            if pack_word:
+                item["unit"] = pack_word
+            item["stock_units"] = float(qty)
     elif field in ("cost", "sell"):
         if _guided_is_skip(msg):
             item[f"{field}_source"] = "skipped"  # stays None, never re-asked
