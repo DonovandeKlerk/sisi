@@ -93,10 +93,10 @@ def test_count_shows_over_and_short(conn):
     assert "• Till R990.00" in cash_balances(conn, SHOP)
 
 
-def test_purchase_posts_to_account_or_supplier(conn):
+def test_explicit_account_posts_to_account_or_supplier(conn):
     seed_demo(SHOP, conn)
     set_float(conn, SHOP, {"cash": 100000})
-    add_stock(conn, SHOP, "Coke 2L", 6, cost_cents=3000)
+    add_stock(conn, SHOP, "Coke 2L", 6, cost_cents=3000, account="cash")
     confirm_pending(conn, SHOP)
     assert "• Till R820.00" in cash_balances(conn, SHOP)  # 6 x R30
     add_stock(conn, SHOP, "Stoney 2L", 6, cost_cents=3000,
@@ -108,6 +108,41 @@ def test_purchase_posts_to_account_or_supplier(conn):
     confirm_pending(conn, SHOP)
     assert supplier_balance(conn, SHOP, "Jumbo") == 0
     assert "• Till R640.00" in cash_balances(conn, SHOP)
+
+
+def test_add_stock_default_posts_no_payment(conn):
+    seed_demo(SHOP, conn)
+    set_float(conn, SHOP, {"cash": 100000})
+    msg = add_stock(conn, SHOP, "Coke 2L", 6, cost_cents=3000)
+    assert "Paid" not in msg and "account" not in msg.lower()
+    assert "(cost R30.00)" in msg  # cost shown as info only
+    confirm_pending(conn, SHOP)
+    assert "• Till R1000.00" in cash_balances(conn, SHOP)  # untouched
+    assert conn.execute("SELECT COUNT(*) n FROM cash_moves"
+                        " WHERE shop_id = ? AND kind = 'purchase'",
+                        (SHOP,)).fetchone()["n"] == 0
+    row = conn.execute("SELECT stock_qty, cost_cents FROM products"
+                       " WHERE shop_id = ? AND name = ?", (SHOP, "Coke 2L")).fetchone()
+    assert (row["stock_qty"], row["cost_cents"]) == (11, 3000)
+
+
+def test_add_stock_combined_pay_cents_from_petty(conn):
+    seed_demo(SHOP, conn)
+    set_float(conn, SHOP, {"cash": 100000, "petty": 20000})
+    msg = add_stock(conn, SHOP, "Coke 2L", 6, cost_cents=3000,
+                    account="petty", pay_cents=6000)
+    assert "Paid R60.00 from Petty cash" in msg  # stated total, not cost x qty
+    confirm_pending(conn, SHOP)
+    assert "• Petty cash R140.00" in cash_balances(conn, SHOP)
+    assert "• Till R1000.00" in cash_balances(conn, SHOP)
+    row = conn.execute("SELECT stock_qty FROM products"
+                       " WHERE shop_id = ? AND name = ?", (SHOP, "Coke 2L")).fetchone()
+    assert row["stock_qty"] == 11
+    undo_last(conn, SHOP)  # one undo reverses the combined stock+payment
+    assert "• Petty cash R200.00" in cash_balances(conn, SHOP)
+    row = conn.execute("SELECT stock_qty FROM products"
+                       " WHERE shop_id = ? AND name = ?", (SHOP, "Coke 2L")).fetchone()
+    assert row["stock_qty"] == 5
 
 
 def test_sales_summary_today_and_week(conn):

@@ -247,7 +247,7 @@ def confirm_pending(conn: sqlite3.Connection, shop_id: str) -> str:
     message, kind, summary, undo = apply(conn, shop_id, payload, action_id)
     if payload.get("photo_hash"):
         photo_kind = {"expiry_note": "expiry", "book_page": "book_page",
-                      "receipt": "receipt",
+                      "receipt": "receipt", "receipt_link": "receipt",
                       "stock_intake": "stock",
                       "stock_intake_item": "stock"}.get(row["action_type"], "")
         record_photo(conn, shop_id, payload["photo_hash"], photo_kind,
@@ -267,6 +267,10 @@ def confirm_pending(conn: sqlite3.Connection, shop_id: str) -> str:
     if row["action_type"] == "receipt" and undo.get("cost_increases"):
         message += _chain_price_alert(conn, shop_id, undo["cost_increases"],
                                       undo.get("supplier") or "")
+    if row["action_type"] == "receipt_link":
+        # Linked costs never auto-chain a price change: the payment
+        # pending must survive as the next proposal.
+        message += _after_receipt_link(conn, shop_id, payload)
     return message
 
 
@@ -996,17 +1000,26 @@ def _apply_add_stock(conn: sqlite3.Connection, shop_id: str, payload: dict, acti
     )
     stock = conn.execute("SELECT stock_qty FROM products WHERE id = ?",
                          (product_id,)).fetchone()["stock_qty"]
-    if cost is not None and payload.get("account") is not None:
-        # account None = photo intake: cost is recorded on the row above,
+    if payload.get("account") is not None:
+        # account None = intake alone: cost is recorded on the row above,
         # but intake alone never pays. Pay via record_purchase instead.
-        total_cost = int(round(cost * payload["qty"]))
-        acct = payload.get("account", "cash")
-        if acct == "supplier":
-            _post_supplier(conn, shop_id, payload.get("wholesaler") or "Supplier",
-                           total_cost, action_id, note=f"stock {payload['name']}")
+        # An explicit account posts pay_cents when given, else cost x qty.
+        pay = _coerce_pos_int(payload.get("pay_cents"))
+        if pay is not None:
+            total_cost = pay
+        elif cost is not None:
+            total_cost = int(round(cost * payload["qty"]))
         else:
-            _post_cash(conn, shop_id, acct, -total_cost, "purchase", action_id,
-                       note=f"stock {payload['name']}")
+            total_cost = None
+        acct = payload.get("account")
+        if total_cost is not None and acct in ("cash", "petty", "bank",
+                                               "supplier"):
+            if acct == "supplier":
+                _post_supplier(conn, shop_id, payload.get("wholesaler") or "Supplier",
+                               total_cost, action_id, note=f"stock {payload['name']}")
+            else:
+                _post_cash(conn, shop_id, acct, -total_cost, "purchase", action_id,
+                           note=f"stock {payload['name']}")
     extras = _fmt_price_extras(cost, price, pack, payload.get("pack_name") or "pack")
     prow = conn.execute("SELECT pack_name, pack_size FROM products WHERE id = ?",
                         (product_id,)).fetchone()
@@ -1225,12 +1238,94 @@ def propose_stock_intake(conn: sqlite3.Connection, shop_id: str,
         lines.append(ln)  # earlier lines survive planner re-entry
     if not lines:
         return _t("intake_noproducts")
-    payload = {"lines": lines, "supplier": (supplier or "").strip()
-               or (prior or {}).get("supplier", ""),
-               "photo_hash": photo_hash or (prior or {}).get("photo_hash",
-                                                             "")}
+    payload = _build_intake_payload(lines, supplier, photo_hash, prior)
+    if payload.get("photo_hash"):
+        # Photo one-shot only: text multi-item adds skip receipt matching.
+        match = _find_unlinked_receipt(
+            conn, shop_id,
+            [ln.get("product_id") for ln in lines
+             if ln.get("product_id") is not None],
+            [ln.get("name") or "" for ln in lines])
+        if match is not None:
+            info = _link_receipt_info(match)
+            return _propose(
+                conn, shop_id, "link_choice",
+                {"direction": "receipt_photo_oneshot",
+                 "products": products, "items": items,
+                 "supplier": supplier, "photo_hash": photo_hash,
+                 "prior": prior, "match": match, "receipt_info": info},
+                _t("link_ask_photo", ref=info["ref"], sup=info["sup"],
+                   date=info["date"], names=info["names"]))
     return _propose(conn, shop_id, "stock_intake", payload,
                     _render_intake(conn, shop_id, payload))
+
+
+def _build_intake_payload(lines: list, supplier: str | None,
+                          photo_hash: str | None,
+                          prior: dict | None) -> dict:
+    return {"lines": lines, "supplier": (supplier or "").strip()
+            or (prior or {}).get("supplier", ""),
+            "photo_hash": photo_hash or (prior or {}).get("photo_hash", "")}
+
+
+def _rebuild_intake_lines(conn: sqlite3.Connection, shop_id: str,
+                          products: list, items: list,
+                          supplier: str | None,
+                          prior: dict | None) -> list:
+    """Rebuild one-shot lines exactly as propose_stock_intake would."""
+    products = [p for p in products or [] if isinstance(p, dict)]
+    planned = [e for e in items or []
+               if isinstance(e, dict) and str(e.get("product") or "").strip()]
+    old_lines = (prior or {}).get("lines") or []
+    old_by_name = {}
+    for ln in old_lines:
+        if isinstance(ln, dict) and ln.get("name"):
+            old_by_name.setdefault(ln["name"].lower(), ln)
+    used: set[int] = set()
+    lines = []
+    singles = len(planned) == 1 and len(products) == 1
+    for e in planned:
+        name = " ".join(str(e.get("product")).split())
+        seen = None
+        words = set(name.lower().split())
+        for i, p in enumerate(products):
+            if i in used:
+                continue
+            label = _intake_label(p).lower()
+            if words & set(label.split()):
+                seen, used = p, used | {i}
+                break
+        if seen is None and singles:
+            seen, used = products[0], {0}
+        line = _intake_line(conn, shop_id, name, e, seen, supplier)
+        old = old_by_name.pop(name.lower(), None)
+        if old is not None:
+            _intake_carry(line, old)
+        lines.append(line)
+    for i, p in enumerate(products):
+        if i in used:
+            continue
+        label = _intake_label(p)
+        lines.append(_intake_line(conn, shop_id, label or "?", {}, p,
+                                  supplier))
+    for ln in old_by_name.values():
+        lines.append(ln)
+    return lines
+
+
+def _link_receipt_info(match: dict) -> dict:
+    return {"ref": _short_list([match["receipt_no"] or "slip"], 12),
+            "sup": _short_list([match["supplier"] or "supplier"], 20),
+            "date": match["date"],
+            "names": _short_list(match["overlap_names"], 60)}
+
+
+def _photo_matched(item_pid, item_name: str, match: dict) -> bool:
+    """A photo item the receipt already covers (same overlap as matched)."""
+    if item_pid is not None and item_pid in (match.get("overlap_pids") or []):
+        return True
+    low = (item_name or "").strip().lower()
+    return any(low == n.lower() for n in match.get("overlap_names") or [])
 
 
 def _intake_carry(line, old):
@@ -1287,8 +1382,13 @@ def _apply_stock_intake(conn, shop_id, payload, action_id):
         undo["name"] = ln["name"]
         msgs.append(msg)
         undone.append(undo)
+    undo_data: dict = {"lines": undone}
+    linked_id = payload.get("linked_receipt_id")
+    if linked_id and _mark_receipt_linked(conn, linked_id, action_id):
+        # The photo-side link mark rides on this save; undo clears it.
+        undo_data["linked_receipt_id"] = linked_id
     return ("\n".join(msgs), "stock_intake",
-            f"stock intake ({len(undone)} lines)", {"lines": undone})
+            f"stock intake ({len(undone)} lines)", undo_data)
 
 
 def _pack_of(conn, pid):
@@ -1309,6 +1409,8 @@ def _pack_size_of(conn, ln=None, pid=None):
 
 
 def _undo_stock_intake(conn, shop_id, undo, action_id):
+    if undo.get("linked_receipt_id"):
+        _clear_receipt_link(conn, undo["linked_receipt_id"], action_id)
     names = []
     for one in undo.get("lines", []):
         pid = one["product_id"]
@@ -2619,6 +2721,31 @@ def start_guided_intake(conn: sqlite3.Connection, shop_id: str,
                                 supplier)
     if not built:
         return _t("intake_noproducts")
+    match = _find_unlinked_receipt(
+        conn, shop_id,
+        [it.get("product_id") for it in built
+         if it.get("product_id") is not None],
+        [it.get("name") or "" for it in built])
+    if match is not None:
+        _guided_drop_item_pending(conn, shop_id)
+        info = _link_receipt_info(match)
+        return _propose(
+            conn, shop_id, "link_choice",
+            {"direction": "receipt_photo_guided",
+             "products": [p for p in products or [] if isinstance(p, dict)],
+             "items": [e for e in items or [] if isinstance(e, dict)],
+             "caption": caption or "", "photo_hash": photo_hash or "",
+             "supplier": supplier, "match": match, "receipt_info": info},
+            _t("link_ask_photo", ref=info["ref"], sup=info["sup"],
+               date=info["date"], names=info["names"]))
+    return _open_guided_session(conn, shop_id, built, products, caption,
+                                photo_hash)
+
+
+def _open_guided_session(conn: sqlite3.Connection, shop_id: str, built: list,
+                         products: list, caption: str, photo_hash: str,
+                         linked_receipt_id: int | None = None) -> str:
+    """Create the guided session for already-built items (no re-match)."""
     _guided_drop_item_pending(conn, shop_id)  # a fresh session replaces
     session = {
         "photo_digest": photo_hash or "",
@@ -2628,7 +2755,8 @@ def start_guided_intake(conn: sqlite3.Connection, shop_id: str,
         "current": 0,
         "field": _guided_next_field(built[0]),
         "status": "active",
-        "stash": {},
+        "stash": {"linked_receipt_id": linked_receipt_id}
+        if linked_receipt_id else {},
     }
     save_intake_session(conn, shop_id, session)
     head = _t("g_head", done=0, total=len(built))
@@ -2930,6 +3058,11 @@ def _apply_stock_intake_item(conn: sqlite3.Connection, shop_id: str,
         cols = ", ".join(f"{col} = ?" for col in row_fix)
         conn.execute(f"UPDATE products SET {cols} WHERE id = ?",
                      (*row_fix.values(), undo["product_id"]))
+    linked_id = ((session or {}).get("stash") or {}).get("linked_receipt_id")
+    if linked_id and _mark_receipt_linked(conn, linked_id, action_id):
+        # First save of a linked session stamps the mark; its undo
+        # clears it. Later saves find it already stamped and skip.
+        undo["linked_receipt_id"] = linked_id
     if session is None or idx != session.get("current") \
             or idx < 0 or idx >= len(items):
         # The Yes still stands (this item is saved); only the guided
@@ -3674,12 +3807,28 @@ def answer_intake(conn: sqlite3.Connection, shop_id: str, text: str):
     return _repropose_intake(conn, shop_id, payload)
 
 
+def _clean_stock_account(account) -> str | None:
+    """Explicit payment account for add_stock, else None (no posting).
+
+    Only cash/petty/bank/supplier count as explicit; anything else
+    (including None) means intake alone, which never pays.
+    """
+    acct = str(account or "").strip().lower()
+    return acct if acct in ("cash", "petty", "bank", "supplier") else None
+
+
 def add_stock(conn: sqlite3.Connection, shop_id: str, product: str, qty: float,
               wholesaler: str | None = None, cost_cents: int | None = None,
               price_cents: int | None = None, unit: str | None = None,
-              pack_price_cents: int | None = None, account: str | None = None) -> str:
+              pack_price_cents: int | None = None, account: str | None = None,
+              pay_cents: int | None = None) -> str:
     """Add stock. qty is singles unless unit names a pack; a pack cost is
-    converted to cost per single."""
+    converted to cost per single.
+
+    account None (the default) records cost on the row but posts NO
+    payment. An explicit account posts pay_cents when given, else
+    cost x qty, and the preview discloses it; one Yes confirms both.
+    """
     ensure_shop(conn, shop_id)
     name = (product or "").strip()
     try:
@@ -3705,12 +3854,12 @@ def add_stock(conn: sqlite3.Connection, shop_id: str, product: str, qty: float,
     cost = quoted_cost / pack_size if (is_pack and quoted_cost) else quoted_cost
     price = _coerce_pos_int(price_cents)
     pack = _coerce_pos_int(pack_price_cents)
-    acct = str(account or "cash").strip().lower()
-    acct = acct if acct in ("cash", "petty", "bank", "supplier") else "cash"
+    acct = _clean_stock_account(account)
+    pay = _coerce_pos_int(pay_cents)
     payload = {"product_id": prod["id"] if prod else None, "name": prod["name"] if prod else name,
                "qty": units, "wholesaler": (wholesaler or "").strip(),
                "cost_cents": cost, "price_cents": price, "pack_price_cents": pack,
-               "pack_name": pack_name, "account": acct}
+               "pack_name": pack_name, "account": acct, "pay_cents": pay}
     with _dry_run(conn):
         _apply_add_stock(conn, shop_id, payload, _action_id())
         pid = conn.execute("SELECT id FROM products WHERE shop_id = ? AND name = ?",
@@ -3738,15 +3887,21 @@ def add_stock(conn: sqlite3.Connection, shop_id: str, product: str, qty: float,
     if no_pack:
         preview += _t("warn_singles", echo=_pack_echo(unit),
                       name=prod['name'])
-    if cost is not None:
-        total_cost = int(round(cost * units))
-        if acct == "supplier":
-            preview += _t("stock_supplier",
-                          sup=payload['wholesaler'] or 'supplier',
-                          total=cents_to_rand(total_cost))
+    if acct is not None:
+        if pay is not None:
+            total_cost = pay
+        elif cost is not None:
+            total_cost = int(round(cost * units))
         else:
-            preview += _t("stock_paid", total=cents_to_rand(total_cost),
-                          acct=_acct_name(acct))
+            total_cost = None
+        if total_cost is not None:
+            if acct == "supplier":
+                preview += _t("stock_supplier",
+                              sup=payload['wholesaler'] or 'supplier',
+                              total=cents_to_rand(total_cost))
+            else:
+                preview += _t("stock_paid", total=cents_to_rand(total_cost),
+                              acct=_acct_name(acct))
     if cost is not None and price is not None and cost > price:
         preview += _t("stock_cost_high")
     return _propose(conn, shop_id, "add_stock", payload, preview)
@@ -5300,6 +5455,235 @@ def _render_receipt_preview(conn: sqlite3.Connection, shop_id: str, payload: dic
     return "\n\n".join(blocks)
 
 
+_LINK_WINDOW_DAYS = 14
+
+
+def _link_cutoff() -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=_LINK_WINDOW_DAYS)
+            ).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def _short_list(names: list[str], limit: int) -> str:
+    """Comma-joined names capped to `limit` chars (reply lines stay short)."""
+    text = ", ".join(names)
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
+def _fuzzy_supplier(a: str | None, b: str | None) -> bool:
+    na = re.sub(r"[^a-z0-9]", "", (a or "").lower())
+    nb = re.sub(r"[^a-z0-9]", "", (b or "").lower())
+    if not na or not nb:
+        return False
+    if na in nb or nb in na:
+        return True
+    import difflib
+    return difflib.SequenceMatcher(None, na, nb).ratio() >= 0.8
+
+
+def _receipt_usable_total(payload: dict) -> int | None:
+    """Posted total for a receipt payload (usable lines only)."""
+    total = sum(e["total"] for e in payload.get("stock", [])
+                if not e.get("unresolved") and e.get("total") is not None)
+    total += sum(e.get("total") or 0 for e in payload.get("expenses", []))
+    if total:
+        return total
+    slip = payload.get("total")
+    return slip if slip else None
+
+
+def _find_intake_candidate(conn: sqlite3.Connection, shop_id: str,
+                           payload: dict) -> dict | None:
+    """Best recent intake restock matching this receipt, else None.
+
+    Shop-scoped over intake restock actions (kinds stock/stock_intake
+    with reason=restock moves, last 14 days, unreversed). Threshold:
+    >=1 same-product line AND (supplier match OR totals within 10%)
+    AND within 14d. Never auto-links; the caller asks first.
+    """
+    want = {}
+    for e in payload.get("stock", []):
+        if e.get("unresolved") or e.get("product_id") is None:
+            continue
+        want[e["product_id"]] = e
+    if not want:
+        return None
+    receipt_total = _receipt_usable_total(payload)
+    best = None
+    for act in conn.execute(
+            "SELECT * FROM actions WHERE shop_id = ? AND undone = 0"
+            " AND kind IN ('stock', 'stock_intake') AND created_at >= ?"
+            " ORDER BY created_at DESC",
+            (shop_id, _link_cutoff())).fetchall():
+        moves = conn.execute(
+            "SELECT * FROM stock_moves WHERE shop_id = ? AND action_id = ?"
+            " AND reason = 'restock'",
+            (shop_id, act["action_id"])).fetchall()
+        if not moves:
+            continue
+        have = {m["product_id"]: m["delta_qty"] for m in moves}
+        overlap = [pid for pid in want if pid in have]
+        if not overlap:
+            continue
+        sup_hit = False
+        for m in moves:
+            row = conn.execute("SELECT wholesaler FROM products WHERE id = ?",
+                               (m["product_id"],)).fetchone()
+            if row is not None and _fuzzy_supplier(payload.get("supplier"),
+                                                   row["wholesaler"]):
+                sup_hit = True
+                break
+        intake_total, priced = 0.0, False
+        for m in moves:
+            row = conn.execute("SELECT cost_cents FROM products WHERE id = ?",
+                               (m["product_id"],)).fetchone()
+            if row is not None and row["cost_cents"] is not None:
+                priced = True
+                intake_total += row["cost_cents"] * m["delta_qty"]
+        totals_hit = bool(priced and receipt_total
+                          and abs(intake_total - receipt_total)
+                          / receipt_total <= 0.10)
+        if not (sup_hit or totals_hit):
+            continue
+        qty_score = 0.0
+        for pid in overlap:
+            rq = want[pid].get("units") or 0
+            iq = have[pid] or 0
+            if rq > 0:
+                qty_score += max(0.0, 1.0 - abs(iq - rq) / rq)
+        score = len(overlap) * 10 + (5 if sup_hit else 0) \
+            + (5 if totals_hit else 0) + qty_score
+        if best is None or score > best["score"]:
+            names = []
+            for m in moves:
+                row = conn.execute("SELECT name FROM products WHERE id = ?",
+                                   (m["product_id"],)).fetchone()
+                if row is not None:
+                    names.append(f"{_fmt_qty(m['delta_qty'])}× {row['name']}")
+            items_txt = ", ".join(names[:3])
+            if len(names) > 3:
+                items_txt += f" +{len(names) - 3} more"
+            desc = (f"{_short_list([items_txt], 70)}"
+                    f" on {_fmt_date(act['created_at'][:10])}")
+            best = {"action_id": act["action_id"],
+                    "created_at": act["created_at"], "desc": desc,
+                    "score": score,
+                    "overlap": [want[pid]["name"] for pid in overlap],
+                    "supplier_hit": sup_hit, "totals_hit": totals_hit}
+    return best
+
+
+def _receipt_product_sets(conn: sqlite3.Connection, shop_id: str,
+                            data: dict) -> tuple[set, dict]:
+    """Receipt stock lines as ({product_ids}, {lower-name: display})."""
+    pids, names = set(), {}
+    for e in data.get("lines") or []:
+        if not isinstance(e, dict):
+            continue
+        pid = e.get("product_id")
+        if pid is None and (e.get("name") or "").strip():
+            prod, _ = _find_products(conn, shop_id, e["name"])
+            if prod is not None:
+                pid = prod["id"]
+        if pid is not None:
+            pids.add(pid)
+            row = conn.execute("SELECT name FROM products WHERE id = ?",
+                               (pid,)).fetchone()
+            label = row["name"] if row is not None else (e.get("name") or "")
+        else:
+            label = (e.get("name") or "").strip()
+        if label:
+            names.setdefault(label.lower(), label)
+    return pids, names
+
+
+def _find_unlinked_receipt(conn: sqlite3.Connection, shop_id: str,
+                           photo_pids: list, photo_names: list) -> dict | None:
+    """Most recent UNLINKED receipt overlapping the photo products.
+
+    Shop-scoped, reversed=0, no data_json.linked_action, last 14d.
+    Overlap is by resolved product id or product name.
+    """
+    rows = conn.execute(
+        "SELECT * FROM receipts WHERE shop_id = ? AND reversed = 0"
+        " AND created_at >= ? ORDER BY created_at DESC",
+        (shop_id, _link_cutoff())).fetchall()
+    want_pids = {p for p in photo_pids if p is not None}
+    want_names = {(n or "").strip().lower()
+                  for n in photo_names if (n or "").strip()}
+    for r in rows:
+        try:
+            data = json.loads(r["data_json"] or "{}")
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(data, dict) or data.get("linked_action"):
+            continue
+        rpids, rnames = _receipt_product_sets(conn, shop_id, data)
+        hit_pids = want_pids & rpids
+        hit_names = want_names & set(rnames)
+        if not hit_pids and not hit_names:
+            continue
+        labels = []
+        for pid in hit_pids:
+            row = conn.execute("SELECT name FROM products WHERE id = ?",
+                               (pid,)).fetchone()
+            if row is not None:
+                labels.append(row["name"])
+        labels += [rnames[n] for n in hit_names
+                   if rnames[n] not in labels]
+        if not labels:
+            continue
+        slip_date = (r["date"] or "").strip()
+        try:
+            shown = _fmt_date(slip_date) if slip_date else _fmt_date(
+                (r["created_at"] or "")[:10])
+        except ValueError:
+            shown = slip_date or (r["created_at"] or "")[:10]
+        return {"receipt_id": r["id"], "receipt_no": r["receipt_no"] or "",
+                "supplier": r["supplier"] or "", "date": shown,
+                "overlap_pids": sorted(hit_pids),
+                "overlap_names": labels[:4],
+                "match_names": sorted(set(rnames) | want_names)}
+    return None
+
+
+def _mark_receipt_linked(conn: sqlite3.Connection, receipt_id: int,
+                         linked_action: str) -> bool:
+    """Stamp data_json.linked_action unless already linked. True if stamped."""
+    row = conn.execute("SELECT data_json FROM receipts WHERE id = ?",
+                       (receipt_id,)).fetchone()
+    if row is None:
+        return False
+    try:
+        data = json.loads(row["data_json"] or "{}")
+    except (ValueError, TypeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    if data.get("linked_action"):
+        return False
+    data["linked_action"] = linked_action
+    conn.execute("UPDATE receipts SET data_json = ? WHERE id = ?",
+                 (json.dumps(data), receipt_id))
+    return True
+
+
+def _clear_receipt_link(conn: sqlite3.Connection, receipt_id: int,
+                        linked_action: str) -> None:
+    """Remove the link mark, but only when it is still ours."""
+    row = conn.execute("SELECT data_json FROM receipts WHERE id = ?",
+                       (receipt_id,)).fetchone()
+    if row is None:
+        return
+    try:
+        data = json.loads(row["data_json"] or "{}")
+    except (ValueError, TypeError):
+        return
+    if isinstance(data, dict) and data.get("linked_action") == linked_action:
+        data.pop("linked_action", None)
+        conn.execute("UPDATE receipts SET data_json = ? WHERE id = ?",
+                     (json.dumps(data), receipt_id))
+
+
 def propose_receipt(conn: sqlite3.Connection, shop_id: str, receipt: dict,
                     photo_hash: str | None = None) -> str:
     ensure_shop(conn, shop_id)
@@ -5314,6 +5698,13 @@ def propose_receipt(conn: sqlite3.Connection, shop_id: str, receipt: dict,
         if dup is not None:
             return _t("rcpt_dup", sup=supplier, no=receipt_no,
                       total=cents_to_rand(total or 0))
+    if photo_hash:
+        dup = conn.execute(
+            "SELECT * FROM receipts WHERE shop_id = ? AND image_hash = ?"
+            " AND reversed = 0", (shop_id, photo_hash)).fetchone()
+        if dup is not None:
+            return _t("rcpt_dup", sup=dup["supplier"], no=dup["receipt_no"],
+                      total=cents_to_rand(dup["total_cents"] or 0))
     account, guessed = _receipt_payment_account(str(receipt.get("payment") or ""))
     payload: dict = {"supplier": supplier, "date": receipt.get("date") or "",
                      "receipt_no": receipt_no, "total": total,
@@ -5333,6 +5724,12 @@ def propose_receipt(conn: sqlite3.Connection, shop_id: str, receipt: dict,
                                         reason=e['reason'])
                                      for e in payload["flagged"])
         return out
+    candidate = _find_intake_candidate(conn, shop_id, payload)
+    if candidate is not None:
+        return _propose(conn, shop_id, "link_choice",
+                        {"direction": "photo_receipt", "receipt": payload,
+                         "candidate": candidate},
+                        _t("link_ask_receipt", desc=candidate["desc"]))
     return _propose(conn, shop_id, "receipt", payload,
                     _render_receipt_preview(conn, shop_id, payload))
 
@@ -5407,6 +5804,388 @@ def _apply_receipt(conn: sqlite3.Connection, shop_id: str, payload: dict, action
     return (msg, "receipt", f"receipt {payload['supplier']} {cents_to_rand(total)}",
             {"moves": moves, "expense_ids": expense_ids, "receipt_id": cur.lastrowid,
              "supplier": payload["supplier"], "cost_increases": increases})
+
+
+def _render_receipt_link_preview(conn: sqlite3.Connection, shop_id: str,
+                                 payload: dict) -> str:
+    """LINK preview: per-line disposition, payment asked separately."""
+    stock = sorted(payload["stock"], key=lambda e: e["line_no"])
+    expenses = sorted(payload["expenses"], key=lambda e: e["line_no"])
+    flagged = sorted(payload["flagged"], key=lambda e: e["line_no"])
+    blocks = [_t("link_head", sup=payload["supplier"])]
+    lines = []
+    for e in stock:
+        if e.get("unresolved"):
+            flagged.append({"line_no": e["line_no"], "text": e.get("text", ""),
+                            "reason": e.get("reason", "")})
+            continue
+        if e.get("linked") and e.get("product_id") is not None:
+            avg = _receipt_avg_cost(conn, shop_id, e)
+            if avg is None:
+                lines.append(_t("link_matched_unknown", name=e["name"]))
+            else:
+                old = conn.execute("SELECT cost_cents FROM products WHERE id = ?",
+                                   (e["product_id"],)).fetchone()["cost_cents"]
+                old_txt = cents_to_rand(int(round(old))) \
+                    if old is not None else "?"
+                lines.append(_t("link_matched", name=e["name"], old=old_txt,
+                                new=cents_to_rand(int(round(avg)))))
+            continue
+        bit = _t("link_unmatched", q=_fmt_qty(e["units"]), name=e["name"])
+        if e.get("pack_word"):
+            bit += f" ({e['pack_word']})"
+        if e.get("new"):
+            bit += _t("rcpt_new")
+        avg = _receipt_avg_cost(conn, shop_id, e)
+        if avg is None:
+            bit += _t("rcpt_avg_unknown")
+        else:
+            bit += _t("rcpt_avg", avg=cents_to_rand(int(round(avg))))
+            if not e.get("new"):
+                old = conn.execute("SELECT cost_cents FROM products WHERE id = ?",
+                                   (e["product_id"],)).fetchone()["cost_cents"]
+                if old is not None and int(round(avg)) != int(round(old)):
+                    bit += _t("rcpt_was", old=cents_to_rand(int(round(old))))
+        have = 0 if e.get("new") else conn.execute(
+            "SELECT stock_qty FROM products WHERE id = ?",
+            (e["product_id"],)).fetchone()["stock_qty"]
+        bit += _t("rcpt_stock_to", a=_fmt_qty(have),
+                  b=_fmt_qty(have + e["units"]))
+        lines.append(bit)
+    for e in expenses:
+        lines.append(_t("rcpt_exp_line", cat=_cat_name(e["category"]),
+                        total=cents_to_rand(e["total"])))
+    if lines:
+        blocks.append("\n".join(lines))
+    if flagged:
+        blocks.append(_t("rcpt_flag_head") + "\n" + "\n".join(
+            _t("book_flag_line", n=e["line_no"], text=e.get("text", "")[:60],
+               reason=e["reason"])
+            for e in sorted(flagged, key=lambda e: e["line_no"])))
+    computed = sum(e["total"] for e in stock if not e.get("unresolved")
+                   and e["total"] is not None)
+    computed += sum(e["total"] for e in expenses)
+    tail = []
+    if payload.get("total") is not None:
+        if computed == payload["total"]:
+            tail.append(_t("rcpt_total_ok", total=cents_to_rand(computed)))
+        else:
+            tail.append(_t("rcpt_total_bad", lines=cents_to_rand(computed),
+                           slip=cents_to_rand(payload["total"])))
+    if payload.get("vat") is not None:
+        tail.append(_t("rcpt_vat", vat=cents_to_rand(payload["vat"])))
+    tail.append(_t("link_pay_note"))
+    blocks.append("\n".join(tail))
+    blocks.append(_t("link_hint"))
+    return "\n\n".join(blocks)
+
+
+def _apply_receipt_link(conn: sqlite3.Connection, shop_id: str, payload: dict,
+                        action_id: str):
+    """Link a receipt to an earlier intake: costs only for matched lines.
+
+    Matched lines attach costs via the receipt weighted-average path
+    with NO stock delta; unmatched lines add stock like a receipt;
+    expenses post as usual. No payment here: confirm proposes a
+    separate record_purchase pending for the receipt total.
+    """
+    matched, moves, expense_ids, increases = [], [], [], []
+    for e in payload["stock"]:
+        if e.get("unresolved"):
+            continue
+        if e.get("linked") and e.get("product_id") is not None:
+            avg = _receipt_avg_cost(conn, shop_id, e) \
+                if e.get("unit_cost") is not None else None
+            old_cost = conn.execute("SELECT cost_cents FROM products WHERE id = ?",
+                                    (e["product_id"],)).fetchone()["cost_cents"]
+            if avg is not None:
+                conn.execute("UPDATE products SET cost_cents = ? WHERE id = ?",
+                             (avg, e["product_id"]))
+            matched.append({"product_id": e["product_id"],
+                            "old_cost": old_cost})
+            if old_cost is not None and avg is not None and avg > old_cost:
+                increases.append({"product_id": e["product_id"],
+                                  "name": e["name"],
+                                  "old": old_cost, "new": avg})
+            continue
+        avg = _receipt_avg_cost(conn, shop_id, e) if e.get("unit_cost") is not None else None
+        if e.get("new"):
+            cur = conn.execute(
+                "INSERT INTO products (shop_id, name, cost_cents, stock_qty)"
+                " VALUES (?, ?, ?, ?)",
+                (shop_id, e["name"], avg, e["units"]))
+            pid, created, old_cost = cur.lastrowid, True, None
+        else:
+            pid, created = e["product_id"], False
+            old_cost = conn.execute("SELECT cost_cents FROM products WHERE id = ?",
+                                    (pid,)).fetchone()["cost_cents"]
+            if avg is not None:
+                conn.execute("UPDATE products SET cost_cents = ? WHERE id = ?",
+                             (avg, pid))
+        conn.execute("UPDATE products SET stock_qty = stock_qty + ? WHERE id = ?",
+                     (e["units"], pid))
+        conn.execute("INSERT INTO stock_moves (shop_id, product_id, delta_qty, reason,"
+                     " action_id, created_at) VALUES (?, ?, ?, 'receipt', ?, ?)",
+                     (shop_id, pid, e["units"], action_id, now_iso()))
+        moves.append({"product_id": pid, "qty": e["units"], "created": created,
+                      "old_cost": old_cost})
+        if old_cost is not None and avg is not None and avg > old_cost:
+            increases.append({"product_id": pid, "name": e["name"],
+                              "old": old_cost, "new": avg})
+    for e in payload["expenses"]:
+        cur = conn.execute(
+            "INSERT INTO expenses (shop_id, category, amount_cents, account, note, action_id,"
+            " recorded_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (shop_id, e["category"], e["total"], payload["account"],
+             f"receipt {payload['supplier']}", f"{action_id}-e{e['line_no']}", _rec()))
+        expense_ids.append(cur.lastrowid)
+    total = _receipt_usable_total(payload) or 0
+    cur = conn.execute(
+        "INSERT INTO receipts (shop_id, supplier, date, receipt_no, total_cents, vat_cents,"
+        " account, image_hash, data_json, action_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (shop_id, payload["supplier"], payload.get("date") or "", payload["receipt_no"],
+         total, payload.get("vat"), payload["account"], payload.get("photo_hash") or "",
+         json.dumps({"lines": payload["stock"] + payload["expenses"],
+                     "linked_action": payload.get("linked_action")}), action_id))
+    bits = []
+    if matched:
+        bits.append(_t("link_bit_cost", n=len(matched)))
+    if moves:
+        bits.append(_t("link_bit_stock", n=len(moves)))
+    if expense_ids:
+        bits.append(_t("rcpt_bit_exp", n=len(expense_ids)))
+    msg = _t("link_saved", sup=payload["supplier"],
+             total=cents_to_rand(total), bits=", ".join(bits))
+    return (msg, "receipt_link",
+            f"receipt-link {payload['supplier']} {cents_to_rand(total)}",
+            {"matched": matched, "moves": moves, "expense_ids": expense_ids,
+             "receipt_id": cur.lastrowid, "supplier": payload["supplier"],
+             "linked_action": payload.get("linked_action")})
+
+
+def _undo_receipt_link(conn: sqlite3.Connection, shop_id: str, undo: dict,
+                       action_id: str) -> str:
+    for m in undo.get("matched", []):
+        conn.execute("UPDATE products SET cost_cents = ? WHERE id = ?",
+                     (m.get("old_cost"), m["product_id"]))
+    for m in undo.get("moves", []):
+        if m.get("created"):
+            conn.execute("DELETE FROM products WHERE id = ?", (m["product_id"],))
+        else:
+            _restore_stock(conn, shop_id, m["product_id"], -m["qty"], action_id)
+            conn.execute("UPDATE products SET cost_cents = ? WHERE id = ?",
+                         (m.get("old_cost"), m["product_id"]))
+    for eid in undo.get("expense_ids", []):
+        conn.execute("UPDATE expenses SET reversed = 1 WHERE id = ?", (eid,))
+    conn.execute("UPDATE receipts SET reversed = 1 WHERE id = ?", (undo["receipt_id"],))
+    _reverse_moves(conn, shop_id, action_id)
+    return _t("undo_receipt_link", sup=undo.get("supplier", "supplier"))
+
+
+def _after_receipt_link(conn: sqlite3.Connection, shop_id: str,
+                        payload: dict) -> str:
+    """Propose the link's payment as a SEPARATE pending (separate Yes/undo)."""
+    total = _receipt_usable_total(payload)
+    if not total:
+        return "\n\n" + _t("link_no_total")
+    acct = payload.get("account") or "cash"
+    sup = payload.get("supplier") or ""
+    no = payload.get("receipt_no") or ""
+    note = f"receipt {sup} {no}".strip()
+    if acct == "supplier":
+        preview = record_purchase(conn, shop_id, total, account="supplier",
+                                  supplier=sup, note=note)
+    else:
+        preview = record_purchase(conn, shop_id, total, account=acct,
+                                  note=note or sup)
+    return "\n\n" + preview
+
+
+def _link_choice_ask(payload: dict) -> str:
+    if payload.get("direction") == "photo_receipt":
+        return _t("link_ask_receipt", desc=payload["candidate"]["desc"])
+    info = payload.get("receipt_info") or {}
+    return _t("link_ask_photo", ref=info.get("ref", "?"),
+              sup=info.get("sup", "?"), date=info.get("date", "?"),
+              names=info.get("names", "?"))
+
+
+def _link_choice_link_receipt(conn: sqlite3.Connection, shop_id: str,
+                              payload: dict) -> str:
+    receipt = payload["receipt"]
+    candidate = payload["candidate"]
+    moves = conn.execute(
+        "SELECT * FROM stock_moves WHERE shop_id = ? AND action_id = ?"
+        " AND reason = 'restock'",
+        (shop_id, candidate["action_id"])).fetchall()
+    have = {m["product_id"] for m in moves}
+    link = json.loads(json.dumps(receipt))
+    link["linked_action"] = candidate["action_id"]
+    for e in link["stock"]:
+        e["linked"] = (not e.get("unresolved")
+                       and e.get("product_id") in have)
+    return _propose(conn, shop_id, "receipt_link", link,
+                    _render_receipt_link_preview(conn, shop_id, link))
+
+
+def _link_choice_new_receipt(conn: sqlite3.Connection, shop_id: str,
+                             payload: dict) -> str:
+    receipt = payload["receipt"]
+    return _propose(conn, shop_id, "receipt", receipt,
+                    _render_receipt_preview(conn, shop_id, receipt))
+
+
+def _settle_link_choice(conn: sqlite3.Connection, shop_id: str,
+                        pend_id: int) -> None:
+    """Resolve an answered link_choice that proposed nothing new."""
+    conn.execute("UPDATE pending_actions SET status = 'confirmed',"
+                 " resolved_at = ? WHERE id = ? AND status = 'pending'",
+                 (now_iso(), pend_id))
+    conn.commit()
+
+
+def _link_choice_link_photo(conn: sqlite3.Connection, shop_id: str,
+                            payload: dict) -> str:
+    """link: drop receipt-covered items, continue with the rest.
+
+    The link mark rides on the intake save of this session (and its
+    clearing rides on that save's undo), so an abandoned session
+    leaves the receipt matchable and repeated photos stay idempotent.
+    All-matched photos record nothing: the mark is stamped immediately
+    (photo-side links have no money/stock effect) and the photo hash
+    is filed so a resend hits the duplicate guard.
+    """
+    pend = get_pending(conn, shop_id)
+    pend_id = pend["id"] if pend is not None else None
+    match = payload["match"]
+    info = payload.get("receipt_info") or _link_receipt_info(match)
+    if payload.get("direction") == "receipt_photo_guided":
+        built = _guided_build_items(
+            conn, shop_id, payload.get("products") or [],
+            payload.get("items") or [], payload.get("caption") or "",
+            payload.get("supplier"))
+        dropped = [it for it in built if _photo_matched(
+            it.get("product_id"), it.get("name") or "", match)]
+        rest = [it for it in built if not _photo_matched(
+            it.get("product_id"), it.get("name") or "", match)]
+        if not rest:
+            _mark_receipt_linked(conn, match["receipt_id"],
+                                 f"photo:{payload.get('photo_hash') or 'manual'}")
+            if payload.get("photo_hash"):
+                record_photo(conn, shop_id, payload["photo_hash"], "stock")
+            if pend_id is not None:
+                _settle_link_choice(conn, shop_id, pend_id)
+            names = _short_list(match["overlap_names"], 50)
+            return _t("link_already", names=names, sup=info["sup"])
+        note = _t("link_rest_note",
+                  names=_short_list([d.get("name") or "?" for d in dropped], 65))
+        out = _open_guided_session(
+            conn, shop_id, rest, payload.get("products") or [],
+            payload.get("caption") or "", payload.get("photo_hash") or "",
+            linked_receipt_id=match["receipt_id"])
+        cur = get_pending(conn, shop_id)
+        if pend_id is not None and cur is not None \
+                and cur["id"] == pend_id:
+            _settle_link_choice(conn, shop_id, pend_id)
+        return f"{note}\n\n{out}"
+    lines = _rebuild_intake_lines(
+        conn, shop_id, payload.get("products") or [],
+        payload.get("items") or [], payload.get("supplier"),
+        payload.get("prior"))
+    dropped = [ln for ln in lines if _photo_matched(
+        ln.get("product_id"), ln.get("name") or "", match)]
+    rest = [ln for ln in lines if not _photo_matched(
+        ln.get("product_id"), ln.get("name") or "", match)]
+    if not rest:
+        _mark_receipt_linked(conn, match["receipt_id"],
+                             f"photo:{payload.get('photo_hash') or 'manual'}")
+        if payload.get("photo_hash"):
+            record_photo(conn, shop_id, payload["photo_hash"], "stock")
+        if pend_id is not None:
+            _settle_link_choice(conn, shop_id, pend_id)
+        names = _short_list(match["overlap_names"], 50)
+        return _t("link_already", names=names, sup=info["sup"])
+    note = _t("link_rest_note",
+              names=_short_list([d.get("name") or "?" for d in dropped], 65))
+    rest_payload = _build_intake_payload(rest, payload.get("supplier"),
+                                         payload.get("photo_hash"),
+                                         payload.get("prior"))
+    rest_payload["linked_receipt_id"] = match["receipt_id"]
+    preview = _render_intake(conn, shop_id, rest_payload)
+    _propose(conn, shop_id, "stock_intake", rest_payload, preview)
+    return f"{note}\n\n{preview}"
+
+
+def _link_choice_new_photo(conn: sqlite3.Connection, shop_id: str,
+                           payload: dict) -> str:
+    """new: proceed with the full photo set (no re-match)."""
+    pend = get_pending(conn, shop_id)
+    pend_id = pend["id"] if pend is not None else None
+    if payload.get("direction") == "receipt_photo_guided":
+        built = _guided_build_items(
+            conn, shop_id, payload.get("products") or [],
+            payload.get("items") or [], payload.get("caption") or "",
+            payload.get("supplier"))
+        if not built:
+            if pend_id is not None:
+                _settle_link_choice(conn, shop_id, pend_id)
+            return _t("intake_noproducts")
+        out = _open_guided_session(
+            conn, shop_id, built, payload.get("products") or [],
+            payload.get("caption") or "", payload.get("photo_hash") or "")
+        cur = get_pending(conn, shop_id)
+        if pend_id is not None and cur is not None \
+                and cur["id"] == pend_id:
+            _settle_link_choice(conn, shop_id, pend_id)
+        return out
+    lines = _rebuild_intake_lines(
+        conn, shop_id, payload.get("products") or [],
+        payload.get("items") or [], payload.get("supplier"),
+        payload.get("prior"))
+    if not lines:
+        if pend_id is not None:
+            _settle_link_choice(conn, shop_id, pend_id)
+        return _t("intake_noproducts")
+    rest_payload = _build_intake_payload(lines, payload.get("supplier"),
+                                         payload.get("photo_hash"),
+                                         payload.get("prior"))
+    preview = _render_intake(conn, shop_id, rest_payload)
+    _propose(conn, shop_id, "stock_intake", rest_payload, preview)
+    return preview
+
+
+def answer_link_choice(conn: sqlite3.Connection, shop_id: str,
+                       text: str) -> tuple[str, list[str] | None] | None:
+    """Answer a pending link_choice: link|same, new, cancel, else re-ask.
+
+    Returns (message, buttons), or None when no link_choice is pending.
+    """
+    from app.agent import CANCEL_WORDS, _normalize
+    pend = get_pending(conn, shop_id)
+    if pend is None or pend["action_type"] != "link_choice":
+        return None
+    payload = json.loads(pend["payload_json"])
+    word = _normalize(text or "")
+    if word in CANCEL_WORDS:
+        conn.execute("UPDATE pending_actions SET status = 'cancelled',"
+                     " resolved_at = ? WHERE id = ?",
+                     (now_iso(), pend["id"]))
+        conn.commit()
+        return _t("not_saved"), None
+    direction = payload.get("direction")
+    if word in ("link", "same"):
+        if direction == "photo_receipt":
+            return _link_choice_link_receipt(conn, shop_id, payload), None
+        if direction in ("receipt_photo_guided", "receipt_photo_oneshot"):
+            return _link_choice_link_photo(conn, shop_id, payload), None
+        return _link_choice_ask(payload), ["link", "new"]
+    if word == "new":
+        if direction == "photo_receipt":
+            return _link_choice_new_receipt(conn, shop_id, payload), None
+        if direction in ("receipt_photo_guided", "receipt_photo_oneshot"):
+            return _link_choice_new_photo(conn, shop_id, payload), None
+        return _link_choice_ask(payload), ["link", "new"]
+    return _link_choice_ask(payload), ["link", "new"]
 
 
 def _undo_receipt(conn: sqlite3.Connection, shop_id: str, undo: dict, action_id: str) -> str:
@@ -6302,6 +7081,8 @@ def _undo_sale(conn: sqlite3.Connection, shop_id: str, undo: dict, action_id: st
 
 def _undo_stock(conn: sqlite3.Connection, shop_id: str, undo: dict, action_id: str) -> str:
     pid = undo["product_id"]
+    if undo.get("linked_receipt_id"):
+        _clear_receipt_link(conn, undo["linked_receipt_id"], action_id)
     name = conn.execute("SELECT name FROM products WHERE id = ?", (pid,)).fetchone()["name"]
     _reverse_moves(conn, shop_id, action_id)
     stock = _restore_stock(conn, shop_id, pid, -undo["qty"], action_id)
@@ -6496,6 +7277,8 @@ def _undo_row(conn: sqlite3.Connection, shop_id: str, row) -> str:
         msg = _undo_book(conn, shop_id, undo, row["action_id"])
     elif kind == "receipt":
         msg = _undo_receipt(conn, shop_id, undo, row["action_id"])
+    elif kind == "receipt_link":
+        msg = _undo_receipt_link(conn, shop_id, undo, row["action_id"])
     elif kind == "order":
         msg = _undo_order(conn, shop_id, undo)
     elif kind == "customer":
@@ -6514,6 +7297,7 @@ _APPLIERS = {
     "add_credit": _apply_add_credit,
     "book_page": _apply_book_page,
     "receipt": _apply_receipt,
+    "receipt_link": _apply_receipt_link,
     "record_payment": _apply_record_payment,
     "record_expense": _apply_record_expense,
     "record_drawing": _apply_record_drawing,
@@ -6654,13 +7438,18 @@ TOOL_DEFS = [
           " qty is singles unless unit names a pack ('2 boxes chappies'). cost_cents"
           " is per pack when unit is a pack (it is converted), per single otherwise;"
           " price_cents is always the single sell price; pack_price_cents the pack"
-          " sell price.",
+          " sell price. Stock intake alone never pays: pass account/pay_cents"
+          " ONLY when the owner explicitly states payment ('pay', 'paid',"
+          " 'from petty', 'on account'); one Yes confirms the combined preview.",
           {"product": {"type": "string"}, "qty": {"type": "number"},
            "wholesaler": {"type": "string"}, "cost_cents": {"type": "integer"},
            "price_cents": {"type": "integer"}, "unit": {"type": "string"},
            "pack_price_cents": {"type": "integer"},
            "account": {"type": "string", "description": "cash, petty, bank or"
-                       " supplier when bought on the supplier's account"}},
+                       " supplier — ONLY when the owner explicitly states"
+                       " payment for this stock"},
+           "pay_cents": {"type": "integer", "description": "TOTAL paid in cents"
+                         " — ONLY when stated; default is cost x qty"}},
           ["product", "qty"]),
     _tool("set_price", "Set a product's selling price in cents. Single price by"
           " default; for_pack=true sets the pack sell price ('chappies box R95').",

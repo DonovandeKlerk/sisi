@@ -47,6 +47,7 @@ from app.tools import (
     _pack_echo,
     add_credit,
     answer_intake_session,
+    answer_link_choice,
     ask_intake_field,
     build_order,
     cancel_pending,
@@ -942,6 +943,9 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str,
                               or word.startswith(_STAFF_BLOCKED_PREFIX)):
         from app.tools import _staff_blocked
         return _staff_blocked(), None
+    linked = try_link_choice_reply(conn, shop_id, text)
+    if linked is not None:
+        return linked
     m = re.match(r"(speak|khuluma|praat|thetha)\s+(.+)$", word)
     if m and normalize_lang(m.group(2).strip()) is not None:
         return set_owner_language(conn, shop_id, m.group(2).strip()), None
@@ -1423,7 +1427,10 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
         clear_logo_pending(conn, shop_id)
         if had_logo_pending and not staged:
             reply = (_t("logo_req_dropped") + "\n\n") + reply
-        buttons = ["Yes", "No"]
+        if after is not None and after["action_type"] == "link_choice":
+            buttons = ["link", "new"]
+        else:
+            buttons = ["Yes", "No"]
     elif not plan["tasks"] and plan.get("question"):
         save_clarify_context(conn, shop_id, digest, caption, doc)
     save_turn(conn, shop_id, "assistant", reply)
@@ -1494,7 +1501,10 @@ def handle_text(conn: sqlite3.Connection, shop_id: str, text: str,
     after = get_pending(conn, shop_id)
     after_plan = get_plan(conn, shop_id)
     if after is not None and after["id"] != before_id:
-        buttons = ["Yes", "No"]
+        if after["action_type"] == "link_choice":
+            buttons = ["link", "new"]
+        else:
+            buttons = ["Yes", "No"]
     elif after_plan is not None and after_plan["plan_id"] != before_plan_id:
         buttons = ["Yes", "No"]
     else:
@@ -1546,6 +1556,20 @@ def try_line_correction(conn: sqlite3.Connection, shop_id: str, text: str) -> st
         return correct_intake_line(conn, shop_id, int(m.group(1)),
                                    m.group(2).strip())
     return correct_book_line(conn, shop_id, int(m.group(1)), m.group(2).strip())
+
+
+def try_link_choice_reply(conn: sqlite3.Connection, shop_id: str,
+                          text: str) -> tuple[str, list[str] | None] | None:
+    """A pending link_choice owns the reply, except control commands."""
+    pend = get_pending(conn, shop_id)
+    if pend is None or pend["action_type"] != "link_choice":
+        return None
+    word = _normalize(text or "")
+    if word in MENU_WORDS or word in HELP_WORDS or word in RESET_WORDS \
+            or word in DELETE_WORDS or word in UNDO_WORDS \
+            or word in ("undo book", "resend"):
+        return None  # control commands pass through; the choice waits
+    return answer_link_choice(conn, shop_id, text)
 
 
 def try_intake_reply(conn: sqlite3.Connection, shop_id: str,

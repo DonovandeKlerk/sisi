@@ -593,17 +593,30 @@ def _exec_stock_add(conn, shop_id, args, bundle):
             bundle.get("digest") or "", prior), None
     items = _items(args.get("items"), need_qty=True)
     supplier = args.get("supplier")
+    from app.tools import _clean_stock_account
+    top_acct = _clean_stock_account(args.get("account"))
+    top_pay = _cents(args.get("pay_cents"))
     parts = []
     for it in items:
         raw = next((e for e in (args.get("items") or [])
                     if isinstance(e, dict)
                     and str(e.get("product") or "").strip() == it["product"]),
                    {})
+        # Explicit payment only: the planner passes account/pay_cents
+        # solely when the owner states payment; never defaulted here.
+        if raw.get("account") is not None:
+            acct = _clean_stock_account(raw.get("account"))
+        else:
+            acct = top_acct
+        if raw.get("pay_cents") is not None:
+            pay = _cents(raw.get("pay_cents"))
+        else:
+            pay = top_pay
         parts.append(add_stock(
             conn, shop_id, it["product"], it["qty"],
             wholesaler=str(supplier).strip() if supplier else None,
             cost_cents=_cents(raw.get("cost_cents")),
-            unit=it["unit"]))
+            unit=it["unit"], account=acct, pay_cents=pay))
     return "\n\n".join(parts), None
 
 

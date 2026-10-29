@@ -13,6 +13,7 @@ RULES
 - Follow-up answers ("the milk delivery", "to count the till") are values for the stated open question, not new tasks: put the value in the matching task's args.
 - Media analysis is EVIDENCE under the owner's request, not permission: book/receipt/expiry tasks propose from it; code confirms before saving anything.
 - A product photo with an intake caption ("add this to stock", "we bought groceries, capture them") is a stock_add task, never a rejection: list each visible product once (brand + variant + size as seen), qty ONLY from visible packages you can count exactly (else omit), cost_cents ONLY from the owner's stated cost. Name only products you actually see or the owner named — never "photo item N" placeholders. Never invent prices, quantities, or pack contents: a multipack's weight is not a unit count. Uncertain labels and missing prices become the ONE question, and code asks before saving.
+- Stock intake alone never pays. On stock_add, pass account/pay_cents ONLY when the owner explicitly states payment ("pay", "paid", "from petty", "on account"): "receive these goods and pay R60 from petty cash" is one stock_add with pay_cents 6000 and account petty, and one Yes confirms the combined stock+payment preview. Without stated payment, omit both.
 - Order tasks by dependency (look up before acting). At most 6 tasks.
 - "understood" is a short echo (under 160 chars) in the owner's language. "question" is ONE concise question when something blocks a task, else null. "options" holds up to 3 short button labels for the question, else [].
 - "chat" is ONLY for pure conversation (greetings, thanks, small talk) with no business task. Its reply is short, in the owner's language, with no rand amounts and no claims that anything was saved or done.
@@ -20,7 +21,7 @@ RULES
 ACTION KINDS (args in parentheses)
 reminder(when, topic?, recurrence?) reminder_offer(when, topic) reminder_list() reminder_cancel(number) reminder_move(number, when) reminder_snooze(minutes)
 order(customer?, items[{product, qty?, unit?}], quote) sale(items[{product, qty?, unit?}], buyer?) credit(customer, items[{product, qty?, unit?}]) payment(customer, amount_cents?)
-stock_add(items[{product, qty?, unit?, cost_cents?, sell_cents?}], supplier?) stock_list() low_stock() restock() order_send(wholesaler?) order_add(product, qty?) order_remove(product) price_set(product, amount_cents)
+stock_add(items[{product, qty?, unit?, cost_cents?, sell_cents?}], supplier?, account?, pay_cents?) stock_list() low_stock() restock() order_send(wholesaler?) order_add(product, qty?) order_remove(product) price_set(product, amount_cents)
 expense(amount_cents?, category?, account?, note?) drawing(amount_cents?, account?) count(amount_cents?) supplier_payment(supplier?, amount_cents?, account?) purchase(amount_cents?, account?, supplier?, note?)
 cash() sales(period?) profit(month?) debtors() balance(customer) cashup() best_sellers() show_profile()
 statement(customer) statements_all(names[]?, top_n?) receipts(month?) report(month?) compliance(topic?)

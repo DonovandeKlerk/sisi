@@ -21,8 +21,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Install FFmpeg (with Opus)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          ffmpeg -hide_banner -encoders | grep -i opus
+
       - name: Run full test suite
-        run: python -m pytest -q
+        run: python -m pytest -q -ra
 
   deploy:
     needs: test
