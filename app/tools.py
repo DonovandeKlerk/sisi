@@ -1915,8 +1915,24 @@ def _guided_cancel_all(conn: sqlite3.Connection, shop_id: str,
     return _t("g_cancel_done", n=n)
 
 
+def _guided_unnormalize_cost(item: dict) -> None:
+    """Restore the owner-stated whole cost before a cost/pack redo.
+
+    `propose_intake_item` normalizes per-pack cost to per-single and
+    stashes the owner-stated amount; any redo of cost/pack answers must
+    restore the stash (dropping it) and clear the flag so the next
+    propose renormalizes under the new answers. Without the stash key
+    this only clears the flag, which recomputes identically (no-op).
+    """
+    if item.get("cost_stated_cents") is not None:
+        item["cost_cents"] = item["cost_stated_cents"]
+        item.pop("cost_stated_cents", None)
+    item["cost_normalized"] = False
+
+
 def _guided_clear_field(item: dict, field: str) -> None:
     """Undo one trailed answer so its question can be re-asked."""
+    _guided_unnormalize_cost(item)  # any redo renormalizes at re-propose
     if field in ("name", "which"):
         # Identity redo: "which" answers cannot be restored, so both go
         # back to the name question; user-stated prices survive.
@@ -2772,6 +2788,8 @@ def _guided_apply_preview_correction(item: dict, msg: str) -> bool:
         if target == "sell" and item.get("sell_unit") == "both" \
                 and _guided_pack_noun(msg):
             target = "pack_sell"  # "pack price R30" corrects the pack price
+        if target == "cost":
+            _guided_unnormalize_cost(item)  # re-propose renormalizes
         if target == "cost" and _guided_cost_total(msg) \
                 and (_guided_pack_context(item) or _guided_pack_word(msg)):
             _guided_stash_cost(item, cents, msg)  # reopens cost_basis
@@ -2793,11 +2811,13 @@ def _guided_apply_preview_correction(item: dict, msg: str) -> bool:
         return True
     pp = _guided_per_pack(msg, bare_ok=False)
     if pp is not None:  # explicit "5 in each pack" only; bare "5" is qty
+        _guided_unnormalize_cost(item)  # renormalize under the new count
         item["per_pack"] = pp
         item["per_pack_source"] = "stated"
         _guided_restock(item)
         return True
     if _guided_fill_packs_from_count(item, msg):  # "2 packs", "both packs"
+        _guided_unnormalize_cost(item)  # totals split totals over packs
         if item.get("qty") is None:
             item["qty"] = item["packs"]
             item["qty_source"] = "stated"
@@ -2815,12 +2835,14 @@ def _guided_apply_preview_correction(item: dict, msg: str) -> bool:
             if pack_word:
                 item["unit"] = pack_word
             if pack_word or _is_pack_unit(item.get("unit")):
+                _guided_unnormalize_cost(item)  # packs feed cost math
                 item["packs"] = qty
                 item["pack_q"] = False
             _guided_restock(item)
             return True
     unit = _guided_sell_unit(msg)
     if unit is not None:  # "singles", "whole", "both"
+        _guided_unnormalize_cost(item)  # per-single vs per-pack reading
         item["sell_unit"] = unit
         _guided_restock(item)
         return True
@@ -3080,6 +3102,7 @@ def answer_intake_session(conn: sqlite3.Connection, shop_id: str,
                 # Per-single overrides a total; pack words only pick the
                 # pack horn (an explicit "for N packs" total stands).
                 item["cost_total"] = None
+        _guided_unnormalize_cost(item)  # fresh basis renormalizes
         if item.get("cost_stash") is not None:
             item["cost_cents"] = item["cost_stash"]
             item["cost_source"] = "stated"

@@ -1313,7 +1313,8 @@ def _stash_mid_session_photo(conn: sqlite3.Connection, shop_id: str,
     if caption and (_intent_hits(_normalize(caption)) - {"stock"}):
         return None  # explicit other business flows normally
     if isinstance(doc, dict) and doc.get("doc_type") in ("book_page",
-                                                         "receipt"):
+                                                         "receipt",
+                                                         "expiry"):
         return None  # unambiguous structured docs flow normally
     stash = session.get("stash") or {}
     products = doc.get("products", []) if isinstance(doc, dict) else []

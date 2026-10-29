@@ -1290,3 +1290,94 @@ def test_final_summary_renders_without_session(conn, shop):
     assert "Intake done" in msg  # summary from the in-hand dict...
     assert "Whey Protein 2kg" in msg and "1 saved" in msg
     assert get_intake_session(conn, SHOP) is None  # ...then cleared
+
+
+# Final-fix round: preview/back cost redo on normalized lines (C1) + I1 ------
+
+
+def _drive_singles_to_preview(conn):
+    """2 packs x 5 singles, R20/pack -> preview (400/single, normalized)."""
+    start_guided_intake(conn, SHOP, [_vprod("Simba Chips Multipack", 2)],
+                        [], "add to stock", "fix-c1")
+    answer_intake_session(conn, SHOP, "R20")
+    answer_intake_session(conn, SHOP, "sell R6")
+    answer_intake_session(conn, SHOP, "singles")
+    answer_intake_session(conn, SHOP, "five in each pack")
+    answer_intake_session(conn, SHOP, "each pack")
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+    line = get_intake_session(conn, SHOP)["items_json"][0]
+    assert line["cost_cents"] == 400  # 2000/5 normalized
+
+
+def test_preview_cost_correction_renormalizes_and_posts_packs(conn, shop):
+    from app import agent as agent_mod
+    _drive_singles_to_preview(conn)
+    answer_intake_session(conn, SHOP, "cost R30")  # owner means per pack
+    line = get_intake_session(conn, SHOP)["items_json"][0]
+    assert line["cost_cents"] == 600  # 3000/5 per single, not 3000
+    assert guided_pack_totals(line)["cost_cents"] == 600
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+    agent_mod.handle_text(conn, SHOP, "yes")
+    moves = conn.execute("SELECT kind, amount_cents FROM cash_moves"
+                         " WHERE shop_id = ? AND reversed = 0",
+                         (SHOP,)).fetchall()
+    assert [(m["kind"], m["amount_cents"]) for m in moves] == \
+        [("purchase", -6000)]  # 2 packs x R30, never 10 x R30
+
+
+def test_preview_per_pack_correction_renormalizes_cost(conn, shop):
+    _drive_singles_to_preview(conn)
+    answer_intake_session(conn, SHOP, "6 in each pack")
+    line = get_intake_session(conn, SHOP)["items_json"][0]
+    assert line["per_pack"] == 6
+    assert line["cost_cents"] == pytest.approx(2000 / 6)  # not stale 400
+    assert guided_pack_totals(line)["cost_cents"] == \
+        pytest.approx(2000 / 6)
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+
+
+def test_back_to_cost_reanswer_renormalizes(conn, shop):
+    _drive_singles_to_preview(conn)
+    for _ in range(5):  # cost_basis, per_pack, sell_unit, sell, cost
+        answer_intake_session(conn, SHOP, "back")
+    assert get_intake_session(conn, SHOP)["field"] == "cost"
+    line = get_intake_session(conn, SHOP)["items_json"][0]
+    assert line["cost_cents"] is None
+    assert line["cost_normalized"] is False  # redo cleared the flag
+    assert "cost_stated_cents" not in line  # ...and dropped the stash
+    answer_intake_session(conn, SHOP, "R30")
+    answer_intake_session(conn, SHOP, "sell R6")
+    answer_intake_session(conn, SHOP, "singles")
+    answer_intake_session(conn, SHOP, "five in each pack")
+    answer_intake_session(conn, SHOP, "each pack")
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+    line = get_intake_session(conn, SHOP)["items_json"][0]
+    assert line["cost_cents"] == 600  # 3000/5 renormalized
+    assert line["cost_stated_cents"] == 3000
+
+
+def test_expiry_photo_mid_session_flows_to_expiry_path(conn, shop,
+                                                       monkeypatch):
+    import json
+
+    from app import agent as agent_mod
+    start_guided_intake(conn, SHOP, [_vprod("Whey Protein 2kg", 1)], [],
+                        "add to stock", "fix-i1")
+    answer_intake_session(conn, SHOP, "R16")
+    before = json.dumps(get_intake_session(conn, SHOP), sort_keys=True)
+    monkeypatch.setenv("SISI_TODAY", "2026-11-01")
+    monkeypatch.setattr(
+        agent_mod, "read_shop_photo",
+        lambda image, shop="": {"doc_type": "expiry", "book": {},
+                                "receipt": {},
+                                "expiry": {"stamp_count": 1, "items": [
+                                    {"product": "Fresh Milk 1L", "qty": 2,
+                                     "expiry_date": "2026-10-30"}]}})
+    _stub_plan(monkeypatch, [{"kind": "expiry_photo", "args": {},
+                              "quote": ""}])
+    doc, reply, _ = agent_mod.handle_photo(conn, SHOP, b"expiry-pic")
+    assert doc["doc_type"] == "expiry"
+    assert "expired" in reply  # expiry check ran...
+    assert "'add'" not in reply  # ...not the stock add/new choice
+    after = json.dumps(get_intake_session(conn, SHOP), sort_keys=True)
+    assert after == before  # session byte-intact, nothing stashed
