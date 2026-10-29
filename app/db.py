@@ -151,6 +151,13 @@ CREATE TABLE IF NOT EXISTS await_price (
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
+CREATE TABLE IF NOT EXISTS await_reminder (
+  shop_id    TEXT PRIMARY KEY REFERENCES shops(shop_id),
+  due_iso    TEXT NOT NULL DEFAULT '',
+  sent_iso   TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
 CREATE TABLE IF NOT EXISTS actions (
   action_id  TEXT PRIMARY KEY,
   shop_id    TEXT NOT NULL REFERENCES shops(shop_id),

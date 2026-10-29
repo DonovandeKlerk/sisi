@@ -117,6 +117,29 @@ def _has_blocker(text: str) -> bool:
     return "r" in low and re.search(r"\br\s?\d", low) is not None
 
 
+_SELF_ORDER_RE = re.compile(
+    r"^(i|we|mina|thina|ek|ons|mna)\s+"
+    r"(?:ordered?|ordering|oda(?:ed|ing)?|bestel\w*|theng\w*)\s+",
+    re.IGNORECASE)
+_ARRIVE_RE = re.compile(
+    r"\barriv\w*\b|\bcoming\b|\bon\s+(?:its|the)\s+way\b"
+    r"|\bkom\b|\bop\s+pad\b",
+    re.IGNORECASE)
+
+
+def is_supplier_segment(text: str) -> bool:
+    """True for owner-side delivery context (never a customer order).
+
+    'I ordered milk, it's arriving in 15 minutes' is background about
+    an incoming supplier delivery — not a customer order, received
+    stock, or a completed purchase.
+    """
+    seg = (text or "").strip()
+    if _SELF_ORDER_RE.match(seg):
+        return True
+    return _ARRIVE_RE.search(seg) is not None
+
+
 # --- matching ---------------------------------------------------------------
 
 
@@ -228,9 +251,24 @@ def _make_line(conn: sqlite3.Connection, shop_id: str, customer: str,
 
 
 def _split_items(fragment: str) -> list[str]:
-    """Split '2 bread, 5 chappies and 1 coke' into item fragments."""
+    """Split '2 bread, 5 chappies and 1 coke' into item fragments.
+
+    Identical repeats ('milk, milk') are voice disfluencies, not extra
+    units: each distinct fragment is kept once.
+    """
     bits = re.split(r",|;|\band\b|\+|&", fragment, flags=re.IGNORECASE)
-    return [b.strip() for b in bits if b.strip()]
+    out: list[str] = []
+    seen: set[str] = set()
+    for bit in bits:
+        bit = bit.strip()
+        if not bit:
+            continue
+        key = re.sub(r"[^a-z0-9]", "", bit.lower())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(bit)
+    return out
 
 
 def _split_ok(conn: sqlite3.Connection, shop_id: str, fragment: str) -> bool:
@@ -249,11 +287,13 @@ def _split_ok(conn: sqlite3.Connection, shop_id: str, fragment: str) -> bool:
 def parse_order_lines(conn: sqlite3.Connection, shop_id: str,
                       text: str) -> list[dict]:
     """Parse customer order lines from free text (caption/history/caption)."""
-    from app.reminders import REMIND_TRIGGERS
+    from app.reminders import PRONOUNS, REMIND_TRIGGERS
     lines: list[dict] = []
     for seg in split_segments(text):
         if _has_blocker(seg):
             continue
+        if is_supplier_segment(seg):
+            continue  # incoming supplier delivery, not a customer order
         if re.match(r"\s*line\s+\d+\s+is\s+", seg, re.IGNORECASE):
             continue  # a correction, not a new order line
         if any(t in f" {seg.lower()} " for t in REMIND_TRIGGERS):
@@ -277,6 +317,8 @@ def parse_order_lines(conn: sqlite3.Connection, shop_id: str,
                 if m and len(m.group(1).split()) <= 3 \
                         and _split_ok(conn, shop_id, m.group(2)):
                     customer, fragment = m.group(1).strip(), m.group(2).strip()
+        if customer.strip().lower() in PRONOUNS:
+            customer = ""  # 'I'/'it'/'me' are pronouns, never customers
         for bit in _split_items(fragment):
             if _has_blocker(bit):
                 continue
@@ -353,7 +395,7 @@ def vision_to_order_lines(conn: sqlite3.Connection, shop_id: str,
 
 def _reminder_tasks(text: str, now: datetime | None = None) -> list[dict]:
     """Parse every 'remind me …' segment into reminder tasks."""
-    from app.reminders import REMIND_TRIGGERS, parse_request
+    from app.reminders import REMIND_TRIGGERS, parse_request, reminder_spec_ok
     tasks: list[dict] = []
     for seg in split_segments(text):
         low = f" {seg.lower()} "
@@ -362,6 +404,8 @@ def _reminder_tasks(text: str, now: datetime | None = None) -> list[dict]:
         parsed = parse_request(seg, now)
         if parsed is None:
             continue
+        if not reminder_spec_ok(seg, parsed):
+            continue  # 'remind them' is composite work, not a plan task
         tasks.append({"kind": "reminder", "due": parsed["due"].isoformat(),
                       "summary": parsed["summary"],
                       "recurrence": parsed["recurrence"], "segment": seg})
@@ -725,7 +769,8 @@ def build_plan(conn: sqlite3.Connection, shop_id: str, text: str,
         from app.reminders import REMIND_TRIGGERS as _TRIG
         plain = [s for s in split_segments(text)
                  if not any(t in f" {s.lower()} " for t in _TRIG)]
-        if any(_has_cue(s) and not _has_blocker(s) for s in plain):
+        if any(_has_cue(s) and not _has_blocker(s)
+               and not is_supplier_segment(s) for s in plain):
             return None, _t("ord_clarify")
         return None, None
     lines = keen

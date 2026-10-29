@@ -54,6 +54,7 @@ from app.tools import (
     set_float,
     check_expiry_photo,
     clear_await_price,
+    clear_await_reminder,
     confirm_pending,
     correct_book_line,
     correct_receipt_account,
@@ -65,7 +66,9 @@ from app.tools import (
     ensure_shop,
     find_product,
     get_await_price,
+    get_await_reminder,
     get_pending,
+    set_await_reminder,
     photo_seen,
     parse_month_name,
     propose_book_page,
@@ -514,7 +517,9 @@ def try_reminder_command(conn: sqlite3.Connection, shop_id: str, text: str,
         return None
     if parsed["summary"].lower().startswith(_QUESTION_STARTS):
         return None  # 'remind me how much…' is a question for the books
-    from app.reminders import due_passed
+    from app.reminders import due_passed, reminder_spec_ok
+    if not reminder_spec_ok(text, parsed):
+        return None  # 'remind them' is composite work, not a schedule
     if due_passed(parsed["due"], sent_at):
         return _t("rem_past", when=parsed["due"].strftime("%H:%M"))
     context = detect_context(conn, shop_id, text)
@@ -557,6 +562,94 @@ def try_reminder_offer(conn: sqlite3.Connection, shop_id: str,
         return None
     return propose_reminder_offer(conn, shop_id, found["due"].isoformat(),
                                   found["summary"])
+
+
+_ACK_WORDS = frozenset({
+    "thanks", "thank you", "thx", "ok", "okay", "sharp", "cool", "great",
+    "ngiyabonga", "dankie", "enkosi", "yebo",
+})
+
+
+def try_reminder_detail(conn: sqlite3.Connection, shop_id: str,
+                        text: str) -> str | None:
+    """Complete a reminder awaiting its topic ('the milk delivery').
+
+    Only answers the open 'what should I remind you about?' question:
+    commands, questions, and fresh reminder requests fall through to
+    normal routing and the pending reminder keeps waiting (10 min TTL).
+    """
+    from app.reminders import (_strip_request_bits, confirm_text,
+                               detect_context, due_passed, now_sast,
+                               parse_relative, parse_request,
+                               reminder_spec_ok, save_reminder,
+                               summary_is_bare, REMIND_TRIGGERS)
+    waiting = get_await_reminder(conn, shop_id)
+    if waiting is None:
+        return None
+    if _await_stale(waiting["created_at"]):
+        clear_await_reminder(conn, shop_id)
+        return None
+    word = _normalize(text or "")
+    if word in NO_WORDS:
+        clear_await_reminder(conn, shop_id)
+        return _t("rem_detail_dropped")
+    if word in YES_WORDS or word in UNDO_WORDS or word in CANCEL_WORDS \
+            or word in MENU_WORDS or word in HELP_WORDS \
+            or word in RESET_WORDS or word in DELETE_WORDS \
+            or word == "undo book" or word in _ACK_WORDS \
+            or "?" in word:
+        if word in _ACK_WORDS:
+            clear_await_reminder(conn, shop_id)
+        return None  # control words, acks, and questions pass through
+    low = f" {word} "
+    if any(t in low for t in REMIND_TRIGGERS):
+        fresh = parse_request(text, None)
+        if fresh is not None and reminder_spec_ok(text, fresh):
+            clear_await_reminder(conn, shop_id)
+            return None  # a fresh reminder command takes over
+    if _intent_hits(word):
+        return None  # anything actionable routes normally; keep waiting
+    detail = (text or "").strip()
+    if len(detail) > 200:
+        return None
+    now = now_sast(None)
+    try:
+        due = datetime.fromisoformat(waiting["due_iso"])
+    except ValueError:
+        clear_await_reminder(conn, shop_id)
+        return None
+    if due.tzinfo is None:
+        due = due.replace(tzinfo=now.tzinfo)
+    rel = parse_relative(detail, now)
+    if rel is not None:
+        due = rel
+    cleaned = _strip_request_bits(detail).strip() or detail.strip()
+    if summary_is_bare(cleaned):
+        if rel is not None:
+            set_await_reminder(conn, shop_id, due.isoformat(),
+                               waiting["sent_iso"] or "")
+        return _t("rem_ask_what", when=due.strftime("%H:%M"))
+    sent = None
+    if waiting["sent_iso"]:
+        try:
+            sent = datetime.fromisoformat(waiting["sent_iso"])
+        except ValueError:
+            sent = None
+    if sent is not None:
+        passed = due_passed(due, sent, wall=now)
+    else:
+        passed = due <= now
+    if passed:
+        clear_await_reminder(conn, shop_id)
+        return _t("rem_past", when=due.strftime("%H:%M"))
+    try:
+        context = detect_context(conn, shop_id, cleaned)
+        save_reminder(conn, shop_id, due, cleaned, context, "none")
+    except Exception as e:
+        log.warning("reminder detail save failed", exc_info=True)
+        return _t("rem_save_failed", err=type(e).__name__)
+    clear_await_reminder(conn, shop_id)
+    return confirm_text(due, cleaned, "none")
 
 
 _INTENT_FAMILIES: dict[str, tuple[str, ...]] = {
@@ -832,8 +925,10 @@ def try_multi_task(conn: sqlite3.Connection, shop_id: str, text: str,
     are handled here; anything else returns None for the normal path.
     Calls try_deterministic once on strictly smaller text (no recursion).
     """
-    from app.reminders import (REMIND_TRIGGERS, confirm_text, detect_context,
-                               due_passed, parse_request, save_reminder)
+    from app.reminders import (REMIND_TRIGGERS, confirm_text, delivery_note,
+                               detect_context, due_passed, parse_request,
+                               reminder_spec_ok, save_reminder,
+                               summary_is_bare)
     bits = _split_bits(text)
     if len(bits) < 2 and not any(
             t in f" {(text or '').lower()} " for t in REMIND_TRIGGERS):
@@ -848,6 +943,9 @@ def try_multi_task(conn: sqlite3.Connection, shop_id: str, text: str,
         parsed = parse_request(bit, sent_at)
         if parsed is None or parsed["summary"].lower().startswith(
                 _QUESTION_STARTS):
+            rest.append(bit)
+            continue
+        if not reminder_spec_ok(bit, parsed):
             rest.append(bit)
             continue
         specs.append((bit, parsed))
@@ -865,16 +963,26 @@ def try_multi_task(conn: sqlite3.Connection, shop_id: str, text: str,
         if due_passed(due, sent_at):
             parts.append(_t("rem_past", when=due.strftime("%H:%M")))
             continue
+        summary = parsed["summary"]
+        if summary_is_bare(summary):
+            note = delivery_note(text)
+            if note is not None:
+                summary = note
+        if summary_is_bare(summary):
+            sent_iso = sent_at.isoformat() if hasattr(sent_at, "isoformat") \
+                else str(sent_at or "")
+            set_await_reminder(conn, shop_id, due.isoformat(), sent_iso)
+            parts.append(_t("rem_ask_what", when=due.strftime("%H:%M")))
+            continue
         try:
-            context = detect_context(conn, shop_id, bit)
-            save_reminder(conn, shop_id, due, parsed["summary"], context,
+            context = detect_context(conn, shop_id, text)
+            save_reminder(conn, shop_id, due, summary, context,
                           parsed["recurrence"])
         except Exception as e:
             log.warning("multi reminder save failed", exc_info=True)
             parts.append(_t("rem_save_failed", err=type(e).__name__))
             continue
-        parts.append(confirm_text(due, parsed["summary"],
-                                  parsed["recurrence"]))
+        parts.append(confirm_text(due, summary, parsed["recurrence"]))
     return "\n\n".join(parts), buttons
 
 
@@ -889,14 +997,16 @@ def try_affordability(conn: sqlite3.Connection, shop_id: str,
                  or "kwanele" in word
                  or ("cover" in word and ("pay" in word or "cost" in word
                                           or bool(amounts)))
-                 or ("enough" in word and "pay" in word))
+                 or ("enough" in word and "pay" in word)
+                 or ("available" in word and "pay" in word))
     if not triggered:
         return None
-    if not amounts:
-        return _t("afford_ask")
-    need = amounts[0]
     cash = account_balance(conn, shop_id, "cash")
     petty = account_balance(conn, shop_id, "petty")
+    if not amounts:
+        return _t("afford_ask", cash=cents_to_rand(cash),
+                  petty=cents_to_rand(petty))
+    need = amounts[0]
     have = cash + petty
     if have >= need:
         return _t("afford_yes", have=cents_to_rand(have),
@@ -955,6 +1065,9 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str,
     reminder = try_reminder_command(conn, shop_id, text, sent_at)
     if reminder is not None:
         return reminder, _AFTER_REMINDERS
+    detail = try_reminder_detail(conn, shop_id, text)
+    if detail is not None:
+        return detail, None
     if word in ORDER_WORDS:
         return build_order(conn, shop_id), _AFTER_ORDER
     if word == "send it" or word.startswith("send it "):

@@ -33,7 +33,8 @@ STUCK_CLAIM_MINUTES = 10
 
 REMIND_TRIGGERS = ("remind me", "remind us", "ngikhumbuze", "ungikhumbuze",
                    "ungakhumbuli", "herinner my", "herinner", "ndikhumbuze",
-                   "khumbuza")
+                   "khumbuza", "remind")
+"""'remind' (bare) catches 'send me a reminder …', 'reminds', 'reminded'."""
 SHOP_TRIP_WORDS = ("shop", "spaza", "wholesaler", "makro", "jumbo", "boxer",
                    "shoprite", "stock", "order", "supplier", "town",
                    "winkel", "venkile", "ivenkile", "dorp", "toropo")
@@ -88,28 +89,63 @@ def _parse_time(text: str) -> tuple[int, int] | None:
     return None
 
 
+_NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+}
+"""Spoken counts in relative times ('in about five minutes')."""
+
+_NUM_ALT = r"(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten" \
+    r"|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen" \
+    r"|eighteen|nineteen|twenty|thirty|forty|fifty)"
+_HEDGE = r"(?:about|around|roughly|approximately|more\s+or\s+less)\s+"
+
 _RELATIVE_RES = (
-    re.compile(r"\bin\s+(\d+)\s*(?:minutes?|mins?)\b"),
-    re.compile(r"\bin\s+(\d+)\s*(?:hours?|hrs?|h)\b"),
-    re.compile(r"\bin\s+(?:an?\s+)?hour\b"),
-    re.compile(r"\bin\s+(?:a\s+)?half\s*(?:an?\s+)?hour\b"),
+    re.compile(r"\bin\s+(?:%s)?(%s)\s*(?:minutes?|mins?)\b" % (_HEDGE, _NUM_ALT)),
+    re.compile(r"\bin\s+(?:%s)?(%s)\s*(?:hours?|hrs?|h)\b" % (_HEDGE, _NUM_ALT)),
+    re.compile(r"\bin\s+(?:%s)?(?:an?\s+)?hour\b" % _HEDGE),
+    re.compile(r"\bin\s+(?:%s)?(?:a\s+)?half\s*(?:an?\s+)?hour\b" % _HEDGE),
+    re.compile(r"\bin\s+(?:%s)?a\s+minute\b" % _HEDGE),
 )
 
 
+def _num_value(token: str) -> int:
+    token = (token or "").strip().lower()
+    if token.isdigit():
+        return int(token)
+    return _NUMBER_WORDS.get(token, 0)
+
+
 def parse_relative(text: str, now: datetime) -> datetime | None:
-    """'in 5 minutes' / 'in 2 hours' resolved from the message time."""
+    """'in 5 minutes' / 'in about five minutes' from the message time."""
     low = f" {(text or '').lower()} "
     m = _RELATIVE_RES[0].search(low)
     if m:
-        return now + timedelta(minutes=int(m.group(1)))
+        return now + timedelta(minutes=_num_value(m.group(1)))
     m = _RELATIVE_RES[1].search(low)
     if m:
-        return now + timedelta(hours=int(m.group(1)))
+        return now + timedelta(hours=_num_value(m.group(1)))
     if _RELATIVE_RES[2].search(low):
         return now + timedelta(hours=1)
     if _RELATIVE_RES[3].search(low):
         return now + timedelta(minutes=30)
+    if _RELATIVE_RES[4].search(low):
+        return now + timedelta(minutes=1)
     return None
+
+
+def has_explicit_time(text: str) -> bool:
+    """True when the text names its own time (relative, clock, day)."""
+    now = now_sast(None)
+    if parse_relative(text, now) is not None:
+        return True
+    low = f" {(text or '').lower()} "
+    if _parse_time(low) is not None:
+        return True
+    return _parse_day(low, now)[1] in ("weekday", "today", "tomorrow")
 
 
 def parse_bare_time(text: str) -> tuple[int, int] | None:
@@ -185,11 +221,17 @@ def _default_hm(text: str) -> tuple[int, int]:
 
 def _strip_request_bits(text: str) -> str:
     low = text
+    low = re.sub(r"\breminders?\b", " ", low)
     for trig in REMIND_TRIGGERS:
         low = re.sub(rf"\b{re.escape(trig)}\b", " ", low)
-    low = re.sub(r"\bin\s+\d+\s*(?:minutes?|mins?|hours?|hrs?|h)\b", " ", low)
-    low = re.sub(r"\bin\s+(?:an?\s+)?hour\b", " ", low)
-    low = re.sub(r"\bin\s+(?:a\s+)?half\s*(?:an?\s+)?hour\b", " ", low)
+    low = re.sub(r"\bin\s+(?:%s)?(?:%s)\s*(?:minutes?|mins?|hours?|hrs?|h)\b"
+                 % (_HEDGE, _NUM_ALT), " ", low)
+    low = re.sub(r"\bin\s+(?:%s)?(?:an?\s+)?hour\b" % _HEDGE, " ", low)
+    low = re.sub(r"\bin\s+(?:%s)?(?:a\s+)?half\s*(?:an?\s+)?hour\b" % _HEDGE,
+                 " ", low)
+    low = re.sub(r"\bin\s+(?:%s)?a\s+minute\b" % _HEDGE, " ", low)
+    low = re.sub(r"\b(please|kindly|also|just)\b", " ", low)
+    low = re.sub(r"\b(send|give)\s+me\b", " ", low)
     low = _TIME_RE.sub(" ", low)
     low = re.sub(r"\b(today|tomorrow|namhlanje|namhla|kusasa|vandag|more"
                  r"|m\u00f4re|ngomso)\b", " ", low)
@@ -199,7 +241,86 @@ def _strip_request_bits(text: str) -> str:
                  r"|weekliks|maandeliks|maand|dag|week)\b", " ", low)
     low = re.sub(r"\s+", " ", low).strip(" .!?,;:")
     low = re.sub(r"^(to|that|om|ukuthi|ukuba|ukuze)\b\s*", "", low).strip()
+    low = re.sub(r"^(a|an|the)(\s+|$)", "", low).strip()
     return low
+
+
+PRONOUNS = frozenset(
+    "i me my mine we us our ours you your yours he him his she her hers "
+    "it its they them their theirs mina wena yena thina nina bona "
+    "ek my ons julle jy jou hy hom sy haar hulle hul mna".split())
+"""Words that are never a customer name or a reminder topic on their own."""
+
+_BARE_SUMMARIES = frozenset(
+    {"reminder", "reminders", "isikhumbuzi", "herinnering", "isikhumbuzo"})
+
+
+_THIRD_PERSON = frozenset(
+    "he him his she her hers it its they them their theirs "
+    "yena bona hy hom sy haar hulle hul".split())
+
+
+def reminder_spec_ok(text: str, parsed: dict) -> bool:
+    """A reminder bit is real when it names a time or a real topic.
+
+    'remind them (Friday)' needs the composite/LLM path to resolve
+    who 'them' is; 'remind me Thursday' and 'remind me in 5 minutes'
+    parse standalone.
+    """
+    toks = re.findall(r"[a-z]+", (parsed.get("summary") or "").lower())
+    meaningful = any(t not in PRONOUNS and t not in _BARE_SUMMARIES
+                     and len(t) > 2 for t in toks)
+    if has_explicit_time(text):
+        if meaningful or not any(t in _THIRD_PERSON for t in toks):
+            return True
+        return False
+    return meaningful
+
+
+def summary_is_bare(summary: str) -> bool:
+    """True when a summary says nothing ('Reminder', 'them', '')."""
+    toks = re.findall(r"[a-z]+", (summary or "").lower())
+    if not toks:
+        return True
+    return all(t in PRONOUNS or t in _BARE_SUMMARIES or len(t) <= 2
+               for t in toks)
+
+
+_ARRIVE_RE = re.compile(r"\barriv\w*\b|\bcoming\b|\bon\s+(?:its|the)\s+way\b",
+                        re.IGNORECASE)
+_DELIVERY_ITEM_RES = (
+    re.compile(r"([a-z][a-z\- ]{0,24}?)\s+arrives?\b", re.IGNORECASE),
+    re.compile(r"(?:ordered?|bringing|delivering|fetching)\s+"
+               r"(?:some\s+|the\s+)?([a-z][a-z\- ]{0,24}?)"
+               r"(?:,|\.|$|\s+is\b|\s+are\b)", re.IGNORECASE),
+    re.compile(r"([a-z][a-z\- ]{0,24}?)\s+delivery\s+(?:is\s+)?"
+               r"(?:coming|arriving|on\b)", re.IGNORECASE),
+)
+_DELIVERY_ARTICLES = frozenset(
+    {"the", "a", "an", "some", "my", "our", "this", "that"})
+
+
+def delivery_note(text: str) -> str | None:
+    """'milk delivery' from supplier-arrival context, else None.
+
+    Only fires on arrival language plus a concrete item; pronouns and
+    bare stopwords never become a note.
+    """
+    low = f" {(text or '').lower()} "
+    if _ARRIVE_RE.search(low) is None:
+        return None
+    for rx in _DELIVERY_ITEM_RES:
+        m = rx.search(text or "")
+        if not m:
+            continue
+        toks = [w for w in re.findall(r"[a-z]+", m.group(1).lower())
+               if w not in _DELIVERY_ARTICLES]
+        if not toks or len(toks) > 3:
+            continue
+        if any(w in PRONOUNS or len(w) < 2 for w in toks):
+            continue
+        return "%s delivery" % " ".join(toks)
+    return None
 
 
 def parse_request(text: str, now: datetime | None = None):
@@ -208,6 +329,8 @@ def parse_request(text: str, now: datetime | None = None):
     low = f" {(text or '').lower()} "
     if not any(t in low for t in REMIND_TRIGGERS):
         return None
+    if re.search(r"\bdraft\w*\b", low):
+        return None  # 'draft a reminder' is a message, not a schedule
     recurrence = _parse_recurrence(low)
     relative = parse_relative(low, now)
     if relative is not None:

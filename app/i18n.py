@@ -2992,28 +2992,36 @@ STRINGS["xh"].update({
 STRINGS["en"].update({
     "rem_past": "⏰ {when} has already passed — reply with a new time.",
     "rem_save_failed": "⚠️ Couldn't save that reminder ({err}). Nothing was lost — try again.",
-    "afford_ask": "💰 How much is the payment? Tell me the amount (e.g. R150) and I'll check the till.",
+    "rem_ask_what": "⏰ What should I remind you about at {when}?",
+    "rem_detail_dropped": "OK, reminder dropped.",
+    "afford_ask": "💰 Cash {cash}, petty {petty}. How much is the payment? Reply with the amount (e.g. R150).",
     "afford_yes": "✅ Yes — {have} available (cash {cash}, petty {petty}) covers {need}.",
     "afford_no": "❌ Not quite — {have} available (cash {cash}, petty {petty}) vs {need} needed.",
 })
 STRINGS["zu"].update({
     "rem_past": "⏰ u-{when} useqile — phendula ngesikhathi esisha.",
     "rem_save_failed": "⚠️ Angikwazanga ukulondoloza leso sikhumbuzo ({err}). Akukho okulahlekile — zama futhi.",
-    "afford_ask": "💰 Kubiza malini? Ngitshele inani (isb. R150) ngizobheka itill.",
+    "rem_ask_what": "⏰ Yini engikukhumbuze ngayo ngo-{when}?",
+    "rem_detail_dropped": "Kulungile, ngisilahle leso sikhumbuzo.",
+    "afford_ask": "💰 Cash {cash}, petty {petty}. Kubiza malini? Ngitshele inani (isb. R150).",
     "afford_yes": "✅ Yebo — {have} ekhona (cash {cash}, petty {petty}) yanele {need}.",
     "afford_no": "❌ Hhayi kahle — {have} ekhona (cash {cash}, petty {petty}) ibhekene no-{need} odingekayo.",
 })
 STRINGS["af"].update({
     "rem_past": "⏰ {when} is reeds verby — antwoord met 'n nuwe tyd.",
     "rem_save_failed": "⚠️ Kon daardie herinnering nie stoor nie ({err}). Niks is verloor nie — probeer weer.",
-    "afford_ask": "💰 Hoeveel is die betaling? Sê my die bedrag (bv. R150) en ek check die till.",
+    "rem_ask_what": "⏰ Waaraan moet ek jou om {when} herinner?",
+    "rem_detail_dropped": "Reg, herinnering gelos.",
+    "afford_ask": "💰 Kontant {cash}, petty {petty}. Hoeveel is die betaling? Antwoord met die bedrag (bv. R150).",
     "afford_yes": "✅ Ja — {have} beskikbaar (kontant {cash}, petty {petty}) dek {need}.",
     "afford_no": "❌ Nie heeltemal nie — {have} beskikbaar (kontant {cash}, petty {petty}) teenoor {need} benodig.",
 })
 STRINGS["xh"].update({
     "rem_past": "⏰ u-{when} sele ugqithile — phendula ngexesha elitsha.",
     "rem_save_failed": "⚠️ Andikwazanga ukugcina eso sikhumbuzo ({err}). Akukho kulahlekileyo — zama kwakhona.",
-    "afford_ask": "💰 Yimalini intlawulo? Ndixelele isixa (umz. R150) ndijonge itill.",
+    "rem_ask_what": "⏰ Yintoni endifanele ndikukhumbuze ngayo ngo-{when}?",
+    "rem_detail_dropped": "Kulungile, isikhumbuzo silahliwe.",
+    "afford_ask": "💰 Cash {cash}, petty {petty}. Yimalini intlawulo? Ndixelele isixa (umz. R150).",
     "afford_yes": "✅ Ewe — {have} ekhoyo (cash {cash}, petty {petty}) yanelisa {need}.",
     "afford_no": "❌ Hayi ncam — {have} ekhoyo (cash {cash}, petty {petty}) xa ithelekiswa no-{need} ofunekayo.",
 })

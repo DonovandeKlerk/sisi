@@ -404,6 +404,24 @@ def clear_await_price(conn: sqlite3.Connection, shop_id: str) -> None:
     conn.commit()
 
 
+def set_await_reminder(conn: sqlite3.Connection, shop_id: str, due_iso: str,
+                       sent_iso: str = "") -> None:
+    conn.execute("DELETE FROM await_reminder WHERE shop_id = ?", (shop_id,))
+    conn.execute("INSERT INTO await_reminder (shop_id, due_iso, sent_iso)"
+                 " VALUES (?, ?, ?)", (shop_id, due_iso, sent_iso or ""))
+    conn.commit()
+
+
+def get_await_reminder(conn: sqlite3.Connection, shop_id: str):
+    return conn.execute("SELECT * FROM await_reminder WHERE shop_id = ?",
+                        (shop_id,)).fetchone()
+
+
+def clear_await_reminder(conn: sqlite3.Connection, shop_id: str) -> None:
+    conn.execute("DELETE FROM await_reminder WHERE shop_id = ?", (shop_id,))
+    conn.commit()
+
+
 def _apply_add_credit(conn: sqlite3.Connection, shop_id: str, payload: dict, action_id: str):
     cust, _ = _get_or_create_customer(conn, shop_id, payload["customer"])
     cur = conn.execute(

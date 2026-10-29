@@ -179,7 +179,7 @@ def test_12_slang_composite(conn, monkeypatch, tmp_path):
     msg, _ = agent.handle_text(
         conn, SHOP, "sho Sipho's balance and remind him Friday")
     assert calls["n"] >= 1
-    assert msg == "Sharp."
+    assert msg == "Sharp."  # 'remind him Friday' needs who-resolution: LLM
 
 
 def test_13_statement_plus_reminder_beats_keyword(conn, monkeypatch, tmp_path):
