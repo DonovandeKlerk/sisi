@@ -862,18 +862,21 @@ def test_no_cash_or_supplier_writes(conn, shop):
          _vprod("Sasko White Bread 700g", 2, readable=True)],
         [{"product": "Whey Protein 2kg"}],
         "add to stock", "t6e")
-    _drive_new_to_preview(conn, "R16", "sell R21")  # stated cost posts
+    _drive_new_to_preview(conn, "R16", "sell R21")  # stated cost saved
     agent_mod.handle_text(conn, SHOP, "yes")
     assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
-    agent_mod.handle_text(conn, SHOP, "yes")  # existing, no cost: posts nil
+    agent_mod.handle_text(conn, SHOP, "yes")  # existing, no cost
     moves = conn.execute("SELECT kind, amount_cents FROM cash_moves"
                          " WHERE shop_id = ? AND reversed = 0",
                          (SHOP,)).fetchall()
-    assert [(m["kind"], m["amount_cents"]) for m in moves] == \
-        [("purchase", -1600)]  # ONLY the confirmed cost posts
-    assert account_balance(conn, SHOP, "cash") == cash_before - 1600
+    assert [(m["kind"], m["amount_cents"]) for m in moves] == []  # intake never pays
+    assert account_balance(conn, SHOP, "cash") == cash_before
     assert conn.execute("SELECT COUNT(*) n FROM supplier_moves"
                         " WHERE shop_id = ?", (SHOP,)).fetchone()["n"] == 0
+    row = conn.execute("SELECT cost_cents FROM products"
+                       " WHERE shop_id = ? AND name = ?",
+                       (SHOP, "Whey Protein 2kg")).fetchone()
+    assert row["cost_cents"] == 1600  # cost basis kept on the row
 
 
 def test_no_skips_item_and_continues(conn, shop):
@@ -1315,8 +1318,10 @@ def _drive_singles_to_preview(conn):
     assert line["cost_cents"] == 400  # 2000/5 normalized
 
 
-def test_preview_cost_correction_renormalizes_and_posts_packs(conn, shop):
+def test_preview_cost_correction_renormalizes_without_posting(conn, shop):
     from app import agent as agent_mod
+    from app.tools import account_balance
+    cash_before = account_balance(conn, SHOP, "cash")
     _drive_singles_to_preview(conn)
     answer_intake_session(conn, SHOP, "cost R30")  # owner means per pack
     line = get_intake_session(conn, SHOP)["items_json"][0]
@@ -1327,8 +1332,14 @@ def test_preview_cost_correction_renormalizes_and_posts_packs(conn, shop):
     moves = conn.execute("SELECT kind, amount_cents FROM cash_moves"
                          " WHERE shop_id = ? AND reversed = 0",
                          (SHOP,)).fetchall()
-    assert [(m["kind"], m["amount_cents"]) for m in moves] == \
-        [("purchase", -6000)]  # 2 packs x R30, never 10 x R30
+    assert [(m["kind"], m["amount_cents"]) for m in moves] == []  # intake never pays
+    assert account_balance(conn, SHOP, "cash") == cash_before
+    assert conn.execute("SELECT COUNT(*) n FROM supplier_moves"
+                        " WHERE shop_id = ?", (SHOP,)).fetchone()["n"] == 0
+    row = conn.execute("SELECT cost_cents FROM products"
+                       " WHERE shop_id = ? AND name = ?",
+                       (SHOP, "Simba Chips Multipack")).fetchone()
+    assert row["cost_cents"] == 600  # normalized cost kept on the row
 
 
 def test_preview_per_pack_correction_renormalizes_cost(conn, shop):
@@ -1396,8 +1407,10 @@ def _assert_preview_fits(conn):
         assert len(line) <= 120, line
 
 
-def test_total_cost_direct_posts_packs_times_per_pack(conn, shop):
+def test_total_cost_direct_splits_without_posting(conn, shop):
     from app import agent as agent_mod
+    from app.tools import account_balance
+    cash_before = account_balance(conn, SHOP, "cash")
     start_guided_intake(conn, SHOP, [_vprod("Simba Chips Multipack", 2)],
                         [], "add to stock", "tot-a")
     answer_intake_session(conn, SHOP, "R60 for both packs")
@@ -1409,8 +1422,14 @@ def test_total_cost_direct_posts_packs_times_per_pack(conn, shop):
     moves = conn.execute("SELECT kind, amount_cents FROM cash_moves"
                          " WHERE shop_id = ? AND reversed = 0",
                          (SHOP,)).fetchall()
-    assert [(m["kind"], m["amount_cents"]) for m in moves] == \
-        [("purchase", -6000)]  # 2 packs x R30, never 10 x R30
+    assert [(m["kind"], m["amount_cents"]) for m in moves] == []  # intake never pays
+    assert account_balance(conn, SHOP, "cash") == cash_before
+    assert conn.execute("SELECT COUNT(*) n FROM supplier_moves"
+                        " WHERE shop_id = ?", (SHOP,)).fetchone()["n"] == 0
+    row = conn.execute("SELECT cost_cents FROM products"
+                       " WHERE shop_id = ? AND name = ?",
+                       (SHOP, "Simba Chips Multipack")).fetchone()
+    assert row["cost_cents"] == 600  # 6000/2/5 split kept on the row
 
 
 def test_sell_total_singles_splits_and_shows_basis(conn, shop):
@@ -1538,6 +1557,8 @@ def test_pack_sell_total_only_renders_ptot(conn, shop):
 
 def test_cost_total_whole_renders_pack_basis(conn, shop):
     from app import agent as agent_mod
+    from app.tools import account_balance
+    cash_before = account_balance(conn, SHOP, "cash")
     start_guided_intake(conn, SHOP, [_vprod("Simba Chips Multipack", 2)],
                         [], "add to stock", "tot-m3")
     answer_intake_session(conn, SHOP, "R60 for both packs")
@@ -1550,8 +1571,10 @@ def test_cost_total_whole_renders_pack_basis(conn, shop):
     moves = conn.execute("SELECT kind, amount_cents FROM cash_moves"
                          " WHERE shop_id = ? AND reversed = 0",
                          (SHOP,)).fetchall()
-    assert [(m["kind"], m["amount_cents"]) for m in moves] == \
-        [("purchase", -6000)]
+    assert [(m["kind"], m["amount_cents"]) for m in moves] == []  # intake never pays
+    assert account_balance(conn, SHOP, "cash") == cash_before
+    assert conn.execute("SELECT COUNT(*) n FROM supplier_moves"
+                        " WHERE shop_id = ?", (SHOP,)).fetchone()["n"] == 0
     row = conn.execute("SELECT cost_cents FROM products"
                        " WHERE shop_id = ? AND name = ?",
                        (SHOP, "Simba Chips Multipack")).fetchone()
@@ -1609,8 +1632,10 @@ def test_preview_sell_total_correction_splits(conn, shop):
     assert row["price_cents"] == 400
 
 
-def test_preview_cost_total_correction_posts_packs(conn, shop):
+def test_preview_cost_total_correction_splits_without_posting(conn, shop):
     from app import agent as agent_mod
+    from app.tools import account_balance
+    cash_before = account_balance(conn, SHOP, "cash")
     _drive_singles_to_preview(conn)
     answer_intake_session(conn, SHOP, "cost R60 for both packs")
     line = get_intake_session(conn, SHOP)["items_json"][0]
@@ -1621,8 +1646,14 @@ def test_preview_cost_total_correction_posts_packs(conn, shop):
     moves = conn.execute("SELECT kind, amount_cents FROM cash_moves"
                          " WHERE shop_id = ? AND reversed = 0",
                          (SHOP,)).fetchall()
-    assert [(m["kind"], m["amount_cents"]) for m in moves] == \
-        [("purchase", -6000)]
+    assert [(m["kind"], m["amount_cents"]) for m in moves] == []  # intake never pays
+    assert account_balance(conn, SHOP, "cash") == cash_before
+    assert conn.execute("SELECT COUNT(*) n FROM supplier_moves"
+                        " WHERE shop_id = ?", (SHOP,)).fetchone()["n"] == 0
+    row = conn.execute("SELECT cost_cents FROM products"
+                       " WHERE shop_id = ? AND name = ?",
+                       (SHOP, "Simba Chips Multipack")).fetchone()
+    assert row["cost_cents"] == 600  # split cost kept on the row
 
 
 def test_plain_price_correction_clears_total(conn, shop):
@@ -1681,6 +1712,8 @@ def test_sell_total_per_pack_change_renormalizes(conn, shop):
 
 def test_loose_total_splits_over_qty(conn, shop):
     from app import agent as agent_mod
+    from app.tools import account_balance
+    cash_before = account_balance(conn, SHOP, "cash")
     start_guided_intake(conn, SHOP, [_vprod("Whey Protein 2kg", 10)],
                         [], "add to stock", "tot-l")
     answer_intake_session(conn, SHOP, "R40 total")
@@ -1705,8 +1738,10 @@ def test_loose_total_splits_over_qty(conn, shop):
     moves = conn.execute("SELECT kind, amount_cents FROM cash_moves"
                          " WHERE shop_id = ? AND reversed = 0",
                          (SHOP,)).fetchall()
-    assert [(m["kind"], m["amount_cents"]) for m in moves] == \
-        [("purchase", -4000)]
+    assert [(m["kind"], m["amount_cents"]) for m in moves] == []  # intake never pays
+    assert account_balance(conn, SHOP, "cash") == cash_before
+    assert conn.execute("SELECT COUNT(*) n FROM supplier_moves"
+                        " WHERE shop_id = ?", (SHOP,)).fetchone()["n"] == 0
 
 
 def test_preview_shows_per_pack_basis_without_total(conn, shop):

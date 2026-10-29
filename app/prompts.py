@@ -21,7 +21,7 @@ ACTION KINDS (args in parentheses)
 reminder(when, topic?, recurrence?) reminder_offer(when, topic) reminder_list() reminder_cancel(number) reminder_move(number, when) reminder_snooze(minutes)
 order(customer?, items[{product, qty?, unit?}], quote) sale(items[{product, qty?, unit?}], buyer?) credit(customer, items[{product, qty?, unit?}]) payment(customer, amount_cents?)
 stock_add(items[{product, qty?, unit?, cost_cents?, sell_cents?}], supplier?) stock_list() low_stock() restock() order_send(wholesaler?) order_add(product, qty?) order_remove(product) price_set(product, amount_cents)
-expense(amount_cents?, category?, account?, note?) drawing(amount_cents?, account?) count(amount_cents?) supplier_payment(supplier?, amount_cents?, account?)
+expense(amount_cents?, category?, account?, note?) drawing(amount_cents?, account?) count(amount_cents?) supplier_payment(supplier?, amount_cents?, account?) purchase(amount_cents?, account?, supplier?, note?)
 cash() sales(period?) profit(month?) debtors() balance(customer) cashup() best_sellers() show_profile()
 statement(customer) statements_all(names[]?, top_n?) receipts(month?) report(month?) compliance(topic?)
 book_page() receipt_doc() expiry_photo() logo()
@@ -31,6 +31,7 @@ chat(reply)
 
 "Draft a reminder for Thandi" is a draft (a message the owner forwards), never a scheduled reminder.
 Periods: today/yesterday/week/month. Categories: transport/electricity/rent/airtime/wages/other. Accounts: cash/petty/bank. set_profile field: name/address/phone. Recurrence: none/daily/weekly/monthly (only when stated).
+Money for stock ("paid R60 for stock", "R120 on my Jumbo account for stock") is a purchase task — never expense. expense is running costs only; supplier_payment settles an old account with no new stock. purchase account is cash/petty/bank, or supplier with the supplier name for on-account stock.
 """
 
 SYSTEM_PROMPT = """You are Sisi, a WhatsApp assistant for a South African spaza shop owner.
@@ -87,7 +88,9 @@ Shop spending ("paid R150 electricity", "R200 petty cash for transport") goes
 to record_expense with its category and account, never to stock or drawings.
 Owner drawings ("took R500 for myself") go to record_drawing. A counted till
 ("counted R1,240") goes to record_count. Supplier payments go to
-record_supplier_payment. Money questions go to cash_balances ("cash in
+record_supplier_payment. Paying for stock ("paid R60 cash for stock",
+"put R120 on my Jumbo account for stock") goes to record_purchase,
+never record_expense — stock intake alone never pays. Money questions go to cash_balances ("cash in
 hand?", "petty cash?"), sales_summary ("what did we sell today/this week?"),
 and profit_month ("profit this month?"). Month-end books ("month-end
 report", "report September") go to month_end_report; past receipts

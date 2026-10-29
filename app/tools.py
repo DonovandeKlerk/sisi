@@ -702,6 +702,77 @@ def record_supplier_payment(conn: sqlite3.Connection, shop_id: str, supplier: st
     )
 
 
+def _apply_record_purchase(conn: sqlite3.Connection, shop_id: str, payload: dict,
+                           action_id: str):
+    if payload.get("account") == "supplier":
+        _post_supplier(conn, shop_id, payload["supplier"],
+                       payload["amount_cents"], action_id,
+                       note=payload.get("note") or "stock purchase")
+        owed = supplier_balance(conn, shop_id, payload["supplier"])
+        return (
+            _t("pur_sup_saved", sup=payload['supplier'],
+               amt=cents_to_rand(payload['amount_cents']),
+               owed=cents_to_rand(owed)),
+            "purchase",
+            f"purchase {payload['supplier']}"
+            f" {cents_to_rand(payload['amount_cents'])}",
+            {},
+        )
+    _post_cash(conn, shop_id, payload["account"], -payload["amount_cents"],
+               "purchase", action_id,
+               note=payload.get("note") or "stock purchase")
+    left = account_balance(conn, shop_id, payload["account"])
+    acct = _acct_name(payload["account"])
+    return (
+        _t("pur_saved", amt=cents_to_rand(payload['amount_cents']),
+           acct=acct, left=cents_to_rand(left)),
+        "purchase", f"purchase {cents_to_rand(payload['amount_cents'])}",
+        {},
+    )
+
+
+def record_purchase(conn: sqlite3.Connection, shop_id: str, amount_cents: int,
+                    account: str | None = None, supplier: str | None = None,
+                    note: str | None = None) -> str:
+    """Record paying for stock. Stock levels never change here.
+
+    This is the ONLY way intake costs reach the books: photo intake
+    records cost on the product row but never pays. account is cash,
+    petty, bank, or supplier (on-account debt, needs a supplier name).
+    """
+    ensure_shop(conn, shop_id)
+    try:
+        amount = int(amount_cents)
+    except (TypeError, ValueError):
+        return _t("how_much")
+    if amount <= 0:
+        return _t("how_much")
+    name = (supplier or "").strip()
+    if str(account or "").strip().lower() == "supplier":
+        if not name:
+            return _t("sup_which")
+        owed = supplier_balance(conn, shop_id, name)
+        payload = {"amount_cents": amount, "account": "supplier",
+                   "supplier": name, "note": (note or "").strip()}
+        return _propose(
+            conn, shop_id, "record_purchase", payload,
+            _t("pur_sup_preview", sup=name, amt=cents_to_rand(amount),
+               owed=cents_to_rand(owed),
+               after=cents_to_rand(owed + amount)),
+        )
+    acct = _clean_account(account)
+    payload = {"amount_cents": amount, "account": acct, "supplier": "",
+               "note": (note or "").strip() or name}
+    with _dry_run(conn):
+        _apply_record_purchase(conn, shop_id, payload, _action_id())
+        left = account_balance(conn, shop_id, acct)
+    return _propose(
+        conn, shop_id, "record_purchase", payload,
+        _t("pur_preview", amt=cents_to_rand(amount), acct=_acct_name(acct),
+           before=cents_to_rand(left + amount), left=cents_to_rand(left)),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Write tools: sales and stock
 # ---------------------------------------------------------------------------
@@ -925,7 +996,9 @@ def _apply_add_stock(conn: sqlite3.Connection, shop_id: str, payload: dict, acti
     )
     stock = conn.execute("SELECT stock_qty FROM products WHERE id = ?",
                          (product_id,)).fetchone()["stock_qty"]
-    if cost is not None:
+    if cost is not None and payload.get("account") is not None:
+        # account None = photo intake: cost is recorded on the row above,
+        # but intake alone never pays. Pay via record_purchase instead.
         total_cost = int(round(cost * payload["qty"]))
         acct = payload.get("account", "cash")
         if acct == "supplier":
@@ -1210,7 +1283,7 @@ def _apply_stock_intake(conn, shop_id, payload, action_id):
             "qty": units, "wholesaler": payload.get("supplier") or "",
             "cost_cents": ln.get("cost_cents"), "price_cents": sell,
             "pack_price_cents": None, "pack_name": "",
-            "account": "cash"}, action_id)
+            "account": None}, action_id)  # intake never pays
         undo["name"] = ln["name"]
         msgs.append(msg)
         undone.append(undo)
@@ -2838,7 +2911,7 @@ def _apply_stock_intake_item(conn: sqlite3.Connection, shop_id: str,
         "cost_cents": totals["cost_cents"], "price_cents": price,
         "pack_price_cents": pack_price,
         "pack_name": totals["pack_name"] or "",
-        "account": "cash"}, action_id)
+        "account": None}, action_id)  # intake never pays
     # _apply_add_stock only inserts cost/price for new rows: fill the
     # pack columns here (same values it wrote for existing rows, so
     # its old_pack undo stash stays correct; new rows undo by delete).
@@ -4537,7 +4610,8 @@ def _undo_cash_only(conn: sqlite3.Connection, shop_id: str, undo: dict, action_i
                     kind: str) -> str:
     _reverse_moves(conn, shop_id, action_id)
     kind_key = {"drawing": "kind_drawing", "cash count": "kind_count",
-                "supplier payment": "kind_supplier"}.get(kind)
+                "supplier payment": "kind_supplier",
+                "purchase": "kind_purchase"}.get(kind)
     return _t("undo_cashonly",
               kind=_t(kind_key) if kind_key else kind)
 
@@ -6402,6 +6476,8 @@ def _undo_row(conn: sqlite3.Connection, shop_id: str, row) -> str:
         msg = _undo_cash_only(conn, shop_id, undo, row["action_id"], "cash count")
     elif kind == "supplier_payment":
         msg = _undo_cash_only(conn, shop_id, undo, row["action_id"], "supplier payment")
+    elif kind == "purchase":
+        msg = _undo_cash_only(conn, shop_id, undo, row["action_id"], "purchase")
     elif kind in ("sale_cash", "sale_credit"):
         msg = _undo_sale(conn, shop_id, undo, row["action_id"])
     elif kind == "stock":
@@ -6443,6 +6519,7 @@ _APPLIERS = {
     "record_drawing": _apply_record_drawing,
     "record_count": _apply_record_count,
     "record_supplier_payment": _apply_supplier_payment,
+    "record_purchase": _apply_record_purchase,
     "record_sale": _apply_record_sale,
     "add_stock": _apply_add_stock,
     "stock_intake": _apply_stock_intake,
@@ -6494,6 +6571,15 @@ TOOL_DEFS = [
     _tool("record_supplier_payment", "Pay a wholesaler/supplier account.",
           {"supplier": {"type": "string"}, "amount_cents": {"type": "integer"},
            "account": {"type": "string"}}, ["supplier", "amount_cents"]),
+    _tool("record_purchase", "Record paying for stock; stock levels never"
+          " change. Use for 'paid R60 cash for stock', 'put R120 on my"
+          " Jumbo account for stock'. Stock intake alone never pays.",
+          {"amount_cents": {"type": "integer"},
+           "account": {"type": "string",
+                       "description": "cash, petty, bank or supplier"
+                                      " (default cash)"},
+           "supplier": {"type": "string"},
+           "note": {"type": "string"}}, ["amount_cents"]),
     _tool("cash_balances", "Till, petty cash and bank balances with the total."
           " Use for 'cash in hand?', 'how much petty cash?'.", {}, []),
     _tool("sales_summary", "Cash, credit and total sales for a period.",
@@ -6613,6 +6699,7 @@ TOOL_FUNCS = {
     "record_drawing": record_drawing,
     "record_count": record_count,
     "record_supplier_payment": record_supplier_payment,
+    "record_purchase": record_purchase,
     "cash_balances": cash_balances,
     "sales_summary": sales_summary,
     "profit_month": profit_month,

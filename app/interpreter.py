@@ -657,6 +657,18 @@ def _exec_supplier_payment(conn, shop_id, args, bundle):
         account=str(args.get("account") or "") or None), None
 
 
+def _exec_purchase(conn, shop_id, args, bundle):
+    from app.tools import record_purchase
+    amount = _cents(args.get("amount_cents"))
+    if amount is None:
+        raise _TaskFail(_t("how_much"))
+    return record_purchase(
+        conn, shop_id, amount,
+        account=str(args.get("account") or "") or None,
+        supplier=str(args.get("supplier") or "") or None,
+        note=str(args.get("note") or "") or None), None
+
+
 def _exec_cash(conn, shop_id, args, bundle):
     from app.tools import cash_balances
     return cash_balances(conn, shop_id), None
@@ -955,7 +967,8 @@ _EXECUTORS = {
     "order_send": _exec_order_send, "order_add": _exec_order_add,
     "order_remove": _exec_order_remove, "price_set": _exec_price_set,
     "expense": _exec_expense, "drawing": _exec_drawing, "count": _exec_count,
-    "supplier_payment": _exec_supplier_payment, "cash": _exec_cash,
+    "supplier_payment": _exec_supplier_payment, "purchase": _exec_purchase,
+    "cash": _exec_cash,
     "sales": _exec_sales, "profit": _exec_profit, "cashup": _exec_cashup,
     "best_sellers": _exec_best_sellers, "show_profile": _exec_show_profile,
     "debtors": _exec_debtors,

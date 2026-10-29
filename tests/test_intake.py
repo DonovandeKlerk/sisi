@@ -282,6 +282,25 @@ def test_save_posts_no_payment_without_cost(conn, shop):
                         " WHERE shop_id = ?", (SHOP,)).fetchone()["n"] == 0
 
 
+def test_save_with_cost_posts_no_payment(conn, shop):
+    cash_before = account_balance(conn, SHOP, "cash")
+    _seed_oneshot(conn, [_prod("Sasko", "White Bread", "700g", 2)],
+                  ["Sasko White Bread 700g"])
+    msg, _ = agent.handle_text(conn, SHOP, "line 1: cost R18")
+    assert "cost R18.00" in msg
+    msg, _ = agent.handle_text(conn, SHOP, "yes")
+    assert "Stock saved" in msg
+    assert account_balance(conn, SHOP, "cash") == cash_before
+    assert conn.execute("SELECT COUNT(*) n FROM cash_moves"
+                        " WHERE shop_id = ?", (SHOP,)).fetchone()["n"] == 0
+    assert conn.execute("SELECT COUNT(*) n FROM supplier_moves"
+                        " WHERE shop_id = ?", (SHOP,)).fetchone()["n"] == 0
+    row = conn.execute("SELECT cost_cents FROM products"
+                       " WHERE shop_id = ? AND name = ?",
+                       (SHOP, "Sasko White Bread 700g")).fetchone()
+    assert row["cost_cents"] == 1800  # cost basis kept on the row
+
+
 def test_repeated_yes_is_idempotent(conn, shop):
     _seed_oneshot(conn, [_prod("Sasko", "White Bread", "700g", 2)],
                   ["Sasko White Bread 700g"])

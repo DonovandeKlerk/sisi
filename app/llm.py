@@ -96,7 +96,7 @@ PLAN_KINDS = (
     "reminder_move", "reminder_snooze", "order", "sale", "credit",
     "payment", "stock_add", "stock_list", "low_stock", "restock",
     "order_send", "order_add", "order_remove", "price_set", "expense",
-    "drawing", "count", "supplier_payment", "cash", "sales", "profit",
+    "drawing", "count", "supplier_payment", "purchase", "cash", "sales", "profit",
     "debtors", "balance", "statement", "statements_all", "receipts",
     "report", "compliance", "book_page", "receipt_doc", "expiry_photo",
     "logo", "affordability", "set_language", "set_profile", "float_set",
