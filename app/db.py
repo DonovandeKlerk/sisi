@@ -302,6 +302,21 @@ CREATE TABLE IF NOT EXISTS reminders (
   blocked_reason TEXT NOT NULL DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS intake_sessions (
+  shop_id    TEXT PRIMARY KEY REFERENCES shops(shop_id),
+  photo_digest TEXT NOT NULL DEFAULT '',
+  caption    TEXT NOT NULL DEFAULT '',
+  vision_json TEXT NOT NULL DEFAULT '[]',
+  items_json TEXT NOT NULL DEFAULT '[]',
+  current    INTEGER NOT NULL DEFAULT 0,
+  field      TEXT,
+  status     TEXT NOT NULL DEFAULT 'active',
+  stash_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  expires_at TEXT NOT NULL DEFAULT ''
+);
+
 CREATE INDEX IF NOT EXISTS idx_customers_shop ON customers(shop_id);
 CREATE INDEX IF NOT EXISTS idx_products_shop ON products(shop_id);
 CREATE INDEX IF NOT EXISTS idx_credit_shop ON credit_entries(shop_id);

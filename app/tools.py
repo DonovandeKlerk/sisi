@@ -1257,6 +1257,144 @@ def _undo_stock_intake(conn, shop_id, undo, action_id):
     return _t("intake_undone", names=", ".join(names))
 
 
+# ---------------------------------------------------------------------------
+# Guided intake sessions: one active photo-intake conversation per shop.
+# ---------------------------------------------------------------------------
+
+_INTAKE_SESSION_TTL = timedelta(hours=24)
+
+_INTAKE_STOPWORDS = frozenset("""
+    a an the and or of to in on for with is are be as at from by it its
+    this that these those i me my we us our you your he she they them their
+    please kindly add added stock intake shop shops here there just now all
+    if so do does don't dont not no yes get got have has had will would
+    can could should our
+    """.split())
+
+# Placeholder words a planner may invent ("Photo item 4"); never grounding.
+_INTAKE_PLACEHOLDER_WORDS = frozenset(
+    {"photo", "photos", "item", "items", "product", "products", "unknown"})
+
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _content_words(text: str) -> set[str]:
+    words = set(_WORD_RE.findall((text or "").lower()))
+    return {w for w in words
+            if len(w) > 1 and not w.isdigit() and w not in _INTAKE_STOPWORDS}
+
+
+def ground_intake_items(items: list, products: list, text: str) -> list:
+    """Drop planned items grounded in neither vision labels nor caption words.
+
+    A planned item survives only when one of its words overlaps a word from
+    the vision product labels or a caption content word. Never raises:
+    on any unexpected input the items pass through unchanged.
+    """
+    try:
+        labels: set[str] = set()
+        for prod in products or []:
+            if not isinstance(prod, dict):
+                continue
+            for key in ("brand", "variant", "size", "label", "name", "notes"):
+                labels.update(_content_words(str(prod.get(key) or "")))
+        caption_words = _content_words(text)
+        kept = []
+        for entry in items or []:
+            if not isinstance(entry, dict):
+                kept.append(entry)
+                continue
+            name = entry.get("product") or entry.get("name") or ""
+            raw = _content_words(str(name))
+            if not raw:
+                kept.append(entry)  # nothing to judge by; fail open
+                continue
+            words = raw - _INTAKE_PLACEHOLDER_WORDS
+            if words & labels or words & caption_words:
+                kept.append(entry)
+        return kept
+    except Exception:
+        return items if isinstance(items, list) else []
+
+
+def _dump_intake_json(value, default: str) -> str:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value
+    return json.dumps(value)
+
+
+def _load_intake_json(raw: str | None, default):
+    try:
+        return json.loads(raw or "") if raw else default
+    except (ValueError, TypeError):
+        return default
+
+
+def save_intake_session(conn: sqlite3.Connection, shop_id: str,
+                        session: dict) -> None:
+    """Upsert the active guided-intake session for a shop (24h expiry)."""
+    ensure_shop(conn, shop_id)
+    now = now_iso()
+    expires = (datetime.now(timezone.utc) + _INTAKE_SESSION_TTL).strftime(
+        "%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    conn.execute(
+        """INSERT INTO intake_sessions
+             (shop_id, photo_digest, caption, vision_json, items_json,
+              current, field, status, stash_json, updated_at, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(shop_id) DO UPDATE SET
+             photo_digest = excluded.photo_digest, caption = excluded.caption,
+             vision_json = excluded.vision_json, items_json = excluded.items_json,
+             current = excluded.current, field = excluded.field,
+             status = excluded.status, stash_json = excluded.stash_json,
+             updated_at = excluded.updated_at, expires_at = excluded.expires_at""",
+        (shop_id,
+         session.get("photo_digest") or "",
+         session.get("caption") or "",
+         _dump_intake_json(session.get("vision_json"), "[]"),
+         _dump_intake_json(session.get("items_json"), "[]"),
+         session.get("current") or 0,
+         session.get("field"),
+         session.get("status") or "active",
+         _dump_intake_json(session.get("stash"), "{}"),
+         now, expires),
+    )
+    conn.commit()
+
+
+def get_intake_session(conn: sqlite3.Connection, shop_id: str) -> dict | None:
+    """Return the active session dict, or None when absent/expired/done."""
+    row = conn.execute("SELECT * FROM intake_sessions WHERE shop_id = ?",
+                       (shop_id,)).fetchone()
+    if row is None:
+        return None
+    if (row["status"] or "") == "done":
+        return None
+    if row["expires_at"] and row["expires_at"] <= now_iso():
+        conn.execute("DELETE FROM intake_sessions WHERE shop_id = ?",
+                     (shop_id,))
+        conn.commit()
+        return None
+    return {
+        "photo_digest": row["photo_digest"] or "",
+        "caption": row["caption"] or "",
+        "vision_json": _load_intake_json(row["vision_json"], []),
+        "items_json": _load_intake_json(row["items_json"], []),
+        "current": row["current"] or 0,
+        "field": row["field"],
+        "status": row["status"] or "active",
+        "stash": _load_intake_json(row["stash_json"], {}),
+    }
+
+
+def clear_intake_session(conn: sqlite3.Connection, shop_id: str) -> None:
+    conn.execute("DELETE FROM intake_sessions WHERE shop_id = ?",
+                 (shop_id,))
+    conn.commit()
+
+
 _INTAKE_AMT_RE = re.compile(r"[Rr]?\s*(\d+(?:\.\d{1,2})?)")
 _INTAKE_PER_PACK_RE = re.compile(
     r"(\d+(?:\.\d+)?)\s*(?:per|in(?:side)?(?:\s+of)?(?:\s+a)?|/)\s*pack", re.IGNORECASE)
