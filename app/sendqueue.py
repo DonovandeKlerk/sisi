@@ -53,7 +53,7 @@ def _retry_after_s(response) -> float | None:
 
 def enqueue(conn: sqlite3.Connection, to: str, channel: str, kind: str,
             payload: dict, commit: bool = True) -> int:
-    """Queue one outbound message. kind: text | buttons | image | file.
+    """Queue one outbound message. kind: text | buttons | image | file | template.
 
     Long texts split into ≤1500-char rows up front, so every HTTP send —
     not just every row — leaves the per-number gap (pieces that still fit
@@ -93,12 +93,34 @@ def _waiting(conn: sqlite3.Connection, to: str):
     ).fetchone()
 
 
-def _claim(conn: sqlite3.Connection, row_id: int) -> bool:
+STUCK_SEND_S = 600.0
+"""A 'sending' claim older than this is a crashed drain: safe to requeue."""
+
+
+def _claim(conn: sqlite3.Connection, row_id: int,
+           now: float | None = None) -> bool:
+    import time as _time
     cur = conn.execute(
-        "UPDATE send_queue SET status = 'sending'"
-        " WHERE id = ? AND status = 'queued'", (row_id,))
+        "UPDATE send_queue SET status = 'sending', claimed_at = ?"
+        " WHERE id = ? AND status = 'queued'",
+        (now if now is not None else _time.time(), row_id))
     conn.commit()
     return cur.rowcount == 1
+
+
+def recover_stuck_claims(conn: sqlite3.Connection, now: float) -> int:
+    """Requeue 'sending' rows whose drain died (never active ones).
+
+    Only timestamped claims older than STUCK_SEND_S move; anything
+    younger may still be sending, and untimestamped legacy rows stay
+    parked rather than risk a duplicate.
+    """
+    cur = conn.execute("UPDATE send_queue SET status = 'queued',"
+                       " claimed_at = NULL WHERE status = 'sending'"
+                       " AND claimed_at IS NOT NULL AND claimed_at < ?",
+                       (now - STUCK_SEND_S,))
+    conn.commit()
+    return cur.rowcount
 
 
 def _pace_wait(conn: sqlite3.Connection, to: str, now: float,
@@ -119,17 +141,34 @@ def _touch_pacing(conn: sqlite3.Connection, to: str, now: float) -> None:
     conn.commit()
 
 
+def _tracked(payload_json: str) -> int | None:
+    """A send_queue row's reminder id, or None when untracked."""
+    try:
+        rid = json.loads(payload_json or "{}").get("reminder_id")
+    except ValueError:
+        return None
+    return rid if isinstance(rid, int) else None
+
+
 def _merge_texts(conn: sqlite3.Connection, to: str, head) -> tuple[str, list[int]]:
-    """Claim consecutive due text rows after head; join bodies (capped)."""
+    """Claim consecutive due text rows after head; join bodies (capped).
+
+    Delivery-tracked rows (reminders) never merge: their payload must
+    survive so the drain can record exactly what was submitted.
+    """
     from app.whatsapp import SPLIT_AT
     bodies = [json.loads(head["payload_json"]).get("body", "")]
     ids = [head["id"]]
+    if _tracked(head["payload_json"]) is not None:
+        return "\n\n".join(bodies), ids
     rows = conn.execute(
         "SELECT * FROM send_queue WHERE to_number = ? AND status = 'queued'"
         " AND kind = 'text' AND id > ? ORDER BY id", (to, head["id"])).fetchall()
     for row in rows:
         if row["id"] != ids[-1] + 1:
             break  # only truly consecutive rows merge
+        if _tracked(row["payload_json"]) is not None:
+            break
         body = json.loads(row["payload_json"]).get("body", "")
         if len("\n\n".join(bodies + [body])) > SPLIT_AT:
             break
@@ -156,18 +195,27 @@ def check_media(url: str, kind: str, timeout: float = 5.0) -> tuple[bool, str]:
         return False, repr(e)[:120]
 
 
-def _send_claimed(sender, kind: str, payload: dict, to: str) -> None:
+def _send_claimed(sender, kind: str, payload: dict, to: str):
+    """Send one claimed row. Returns the provider message id, if any."""
     from app.reports import persist_media
     if kind == "text":
-        sender.send_text(to, payload.get("body", ""))
-    elif kind == "buttons":
+        return sender.send_text(to, payload.get("body", ""))
+    if kind == "template":
+        if not hasattr(sender, "send_template"):
+            raise ValueError("template unsupported on channel")
+        return sender.send_template(to, payload.get("template", ""),
+                                    payload.get("lang", "en"),
+                                    payload.get("params", []))
+    if kind == "buttons":
         sender.send_buttons(to, payload.get("body", ""),
                             payload.get("buttons", []))
-    elif kind == "list":
+        return None
+    if kind == "list":
         sender.send_list(to, payload.get("body", ""),
                          payload.get("button_text", "Choose"),
                          payload.get("rows", []))
-    elif kind == "image":
+        return None
+    if kind == "image":
         persist_media()  # publish the file + DB row before Vonage fetches it
         ok, detail = check_media(payload.get("url", ""), "image")
         log.info("media check image %s -> %s (%s)", payload.get("url", ""),
@@ -177,7 +225,8 @@ def _send_claimed(sender, kind: str, payload: dict, to: str) -> None:
         log.info("media send image %s", payload.get("url", ""))
         sender.send_image(to, payload.get("url", ""),
                           payload.get("caption", ""))
-    elif kind == "file":
+        return None
+    if kind == "file":
         persist_media()  # publish the file + DB row before Vonage fetches it
         ok, detail = check_media(payload.get("url", ""), "file")
         log.info("media check file %s -> %s (%s)", payload.get("url", ""),
@@ -188,8 +237,16 @@ def _send_claimed(sender, kind: str, payload: dict, to: str) -> None:
         sender.send_file(to, payload.get("url", ""),
                          payload.get("filename", "sisi-file"),
                          payload.get("caption", ""))
-    else:
-        raise ValueError(f"unknown send kind {kind!r}")
+        return None
+    raise ValueError(f"unknown send kind {kind!r}")
+
+
+def _fail_tracked(conn, row, detail: str) -> None:
+    """Mark a tracked row's reminder failed (visible, retryable)."""
+    from app.reminders import mark_reminder_failed
+    rid = _tracked(row["payload_json"])
+    if rid is not None:
+        mark_reminder_failed(conn, rid, detail)
 
 
 def _park(conn: sqlite3.Connection, ids: list[int], attempts: int,
@@ -234,6 +291,7 @@ def _on_rate_limit(conn: sqlite3.Connection, to: str, row, ids: list[int],
         if kind in ("image", "file"):
             _fail_media(conn, to, row, row["channel"])
         else:
+            _fail_tracked(conn, row, "rate-limited after retries")
             log.error("text to=%s dropped after 429 retries", to)
             _drop(conn, ids)
         return
@@ -245,7 +303,7 @@ def _on_rate_limit(conn: sqlite3.Connection, to: str, row, ids: list[int],
 
 
 def _on_error(conn: sqlite3.Connection, to: str, row, ids: list[int],
-              kind: str, clock, stats: dict) -> None:
+              kind: str, clock, stats: dict, reason: str = "send failed") -> None:
     """Park the head rows with backoff, or give up past the budget."""
     attempts = row["attempts"] + 1
     if attempts > len(BACKOFF_S):
@@ -253,6 +311,7 @@ def _on_error(conn: sqlite3.Connection, to: str, row, ids: list[int],
         if kind in ("image", "file"):
             _fail_media(conn, to, row, row["channel"])
         else:
+            _fail_tracked(conn, row, reason)
             log.error("text to=%s failed after retries", to, exc_info=True)
             _drop(conn, ids)
         return
@@ -266,6 +325,8 @@ def drain(conn: sqlite3.Connection, to: str, sender, *,
     """Send every due row for one number, in order. Returns stats."""
     stats = {"sent": 0, "rate_limited": False, "failed": 0}
     start = clock()
+    recover_stuck_claims(conn, start)
+    from app.reminders import mark_reminder_submitted
     while True:
         now = clock()
         row = _head(conn, to, now)
@@ -279,7 +340,7 @@ def drain(conn: sqlite3.Connection, to: str, sender, *,
                 continue
             sleep(pause)
             continue
-        if not _claim(conn, row["id"]):
+        if not _claim(conn, row["id"], now):
             continue
         wait = _pace_wait(conn, to, clock(), pace_s)
         if wait > 0:
@@ -290,8 +351,18 @@ def drain(conn: sqlite3.Connection, to: str, sender, *,
         if kind == "text":
             body, ids = _merge_texts(conn, to, row)
             payload = {"body": body}
+            rid = _tracked(row["payload_json"])
+            if rid is not None:
+                payload["reminder_id"] = rid
+        if kind == "template" and not hasattr(sender, "send_template"):
+            _fail_tracked(conn, row, "template unsupported on channel")
+            log.error("template to=%s unsupported on sender; marked failed",
+                      to)
+            stats["failed"] += 1
+            _drop(conn, ids)
+            continue
         try:
-            _send_claimed(sender, kind, payload, to)
+            provider_id = _send_claimed(sender, kind, payload, to)
         except RateLimited as e:
             _on_rate_limit(conn, to, row, ids, kind, e.retry_after, clock,
                            stats)
@@ -302,11 +373,16 @@ def drain(conn: sqlite3.Connection, to: str, sender, *,
                 _on_rate_limit(conn, to, row, ids, kind,
                                _retry_after_s(e.response), clock, stats)
             else:
-                _on_error(conn, to, row, ids, kind, clock, stats)
+                _on_error(conn, to, row, ids, kind, clock, stats,
+                          f"HTTP {status}")
             continue
-        except Exception:
-            _on_error(conn, to, row, ids, kind, clock, stats)
+        except Exception as e:
+            _on_error(conn, to, row, ids, kind, clock, stats,
+                      type(e).__name__)
             continue
+        rid = payload.get("reminder_id")
+        if isinstance(rid, int):
+            mark_reminder_submitted(conn, rid, provider_id or "")
         _drop(conn, ids)
         _touch_pacing(conn, to, clock())
         stats["sent"] += 1

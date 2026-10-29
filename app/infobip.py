@@ -139,18 +139,29 @@ class InfobipSender(WhatsAppSender):
     def _base_payload(self, to: str) -> dict:
         return {"from": self.whatsapp_from, "to": _digits(to)}
 
-    def send_text(self, to: str, body: str) -> None:
+    def send_text(self, to: str, body: str) -> str | None:
+        """Send text; returns the provider message id of the first chunk."""
+        first: str | None = None
         for chunk in split_message(body):
-            self._post("/whatsapp/1/message/text",
-                       {**self._base_payload(to),
-                        "content": {"text": chunk}}, "text", _digits(to))
+            resp = self._post("/whatsapp/1/message/text",
+                              {**self._base_payload(to),
+                               "content": {"text": chunk}}, "text",
+                              _digits(to))
+            if first is None:
+                mid = resp.get("messageId", "")
+                first = mid if isinstance(mid, str) and mid else None
+        return first
 
     def send_template(self, to: str, name: str, language: str = "en",
-                      placeholders: list[str] | None = None) -> None:
-        """Send an approved template (for outside the 24h window)."""
+                      placeholders: list[str] | None = None) -> str | None:
+        """Send an approved template (for outside the 24h window).
+
+        Returns our generated message id so delivery reports correlate.
+        """
+        mid = uuid.uuid4().hex
         self._post("/whatsapp/1/message/template",
                    {"messages": [{**self._base_payload(to),
-                                  "messageId": uuid.uuid4().hex,
+                                  "messageId": mid,
                                   "content": {
                                       "templateName": name,
                                       "templateData": {
@@ -158,6 +169,7 @@ class InfobipSender(WhatsAppSender):
                                                    list(placeholders or [])}},
                                       "language": language}}]},
                    f"template:{name}", _digits(to))
+        return mid
 
     def send_buttons(self, to: str, body: str, buttons: list[str]) -> None:
         """Native reply buttons; numbered text when unsupported.

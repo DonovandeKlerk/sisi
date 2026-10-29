@@ -532,11 +532,14 @@ def test_reminder_recomputes_at_send_time(conn, shop):
 
 
 def test_due_reminder_fires_with_order_context(conn, shop):
+    from app.db import now_iso
     from app.reminders import send_due
     from app.reminders import now_sast
     _confirm_example(conn)
     conn.execute("UPDATE reminders SET due_at = '2000-01-01T06:30:00+02:00'"
                  " WHERE shop_id = ?", (SHOP,))
+    conn.execute("INSERT INTO messages_seen (message_id, shop_id, created_at)"
+                 " VALUES ('ord-seen-1', ?, ?)", (SHOP, now_iso()))
     conn.commit()
     fired = send_due(conn, now_sast())
     assert fired != []
@@ -631,3 +634,139 @@ def test_statement_requests_never_become_orders(conn, shop):
                  "ndicela istatimenti sikaSipho"):
         plan, question = build_plan(conn, SHOP, text)
         assert (plan, question) == (None, None), text
+
+
+def test_text_answer_resumes_clarified_photo(conn, shop, monkeypatch):
+    import hashlib
+    _mock_vision(monkeypatch, {"doc_type": "other"})
+    photo = _photo_bytes()
+    handle_photo(conn, SHOP, photo, "my order")
+    msg, buttons = handle_text(conn, SHOP, "Sipho: 2 bread")
+    assert "🧾 *Customer order*" in msg
+    assert buttons == ["Yes", "No"]
+    plan = get_plan(conn, SHOP)
+    assert plan["photo_digest"] == hashlib.sha256(photo).hexdigest()
+    assert conn.execute("SELECT COUNT(*) n FROM clarify_context"
+                        " WHERE shop_id = ?", (SHOP,)).fetchone()["n"] == 0
+
+
+def test_resume_merges_original_caption_tasks(conn, shop, monkeypatch):
+    _mock_vision(monkeypatch, {"doc_type": "other"})
+    handle_photo(conn, SHOP, _photo_bytes(),
+                 "My order. Remind me Thursday 06:30 to pack it.")
+    msg, _b = handle_text(conn, SHOP, "Sipho: 2 bread")
+    assert "🧾 *Customer order*" in msg
+    assert "⏰ *Reminder*" in msg and "06:30" in msg
+    msg, _b = handle_text(conn, SHOP, "Yes")
+    assert conn.execute("SELECT COUNT(*) n FROM reminders WHERE shop_id = ?",
+                        (SHOP,)).fetchone()["n"] == 1
+
+
+def test_resume_keeps_stored_vision_reading(conn, shop, monkeypatch):
+    from app.orders import get_clarify_context
+    _mock_vision(monkeypatch, {"doc_type": "book_page", "book": {
+        "date": "2026-10-28", "page_total_cents": None, "crossed_out": 0,
+        "lines": []}})
+    photo = _photo_bytes()
+    handle_photo(conn, SHOP, photo, "my order")  # clarify: nothing extracted
+    ctx = get_clarify_context(conn, SHOP)
+    assert ctx["vision"]["doc_type"] == "book_page"
+    msg, _b = handle_text(conn, SHOP, "Sipho: 2 bread")
+    assert "L1 Sipho: 2 × Bread = R36.00" in msg
+    import hashlib
+    assert get_plan(conn, SHOP)["photo_digest"] == hashlib.sha256(photo).hexdigest()
+
+
+def test_clarify_context_survives_restart(tmp_path, monkeypatch):
+    import sqlite3
+    from app.db import init_db
+    from app.setup import skip_setup
+    from app.tools import ensure_shop
+    db = str(tmp_path / "restart.db")
+    c1 = sqlite3.connect(db)
+    c1.row_factory = sqlite3.Row
+    init_db(c1)
+    skip_setup(c1, SHOP)
+    ensure_shop(c1, SHOP, "Restart Spaza")
+    c1.execute("INSERT INTO products (shop_id, name, price_cents)"
+               " VALUES (?, 'Bread', 1800)", (SHOP,))
+    c1.commit()
+    import app.agent as agent
+    monkeypatch.setattr(agent, "read_shop_photo",
+                        lambda image, shop="": {"doc_type": "other"})
+    photo = _photo_bytes()
+    agent.handle_photo(c1, SHOP, photo, "my order")
+    c1.close()  # worker restart: new connection, same file
+    c2 = sqlite3.connect(db)
+    c2.row_factory = sqlite3.Row
+    init_db(c2)
+    msg, _b = agent.handle_text(c2, SHOP, "Sipho: 2 bread")
+    assert "🧾 *Customer order*" in msg
+    import hashlib
+    plan = get_plan(c2, SHOP)
+    assert plan["photo_digest"] == hashlib.sha256(photo).hexdigest()
+    c2.close()
+
+
+def test_clarify_context_is_per_shop_and_expires(conn, shop, monkeypatch):
+    from app.orders import get_clarify_context
+    _mock_vision(monkeypatch, {"doc_type": "other"})
+    handle_photo(conn, SHOP, _photo_bytes(), "my order")
+    assert get_clarify_context(conn, OTHER) is None
+    conn.execute("UPDATE clarify_context SET expires_at = '2000-01-01T00:00:00Z'"
+                 " WHERE shop_id = ?", (SHOP,))
+    conn.commit()
+    assert get_clarify_context(conn, SHOP) is None
+    msg, _b = handle_text(conn, SHOP, "2 bread")
+    assert "Customer order" not in msg  # expired ctx: plain text, no plan
+
+
+def test_unrelated_text_ignores_clarify_context(conn, shop, monkeypatch):
+    _mock_vision(monkeypatch, {"doc_type": "other"})
+    handle_photo(conn, SHOP, _photo_bytes(), "my order")
+    msg, _b = handle_text(conn, SHOP, "my reminders")
+    assert "Customer order" not in msg
+    from app.orders import get_clarify_context
+    assert get_clarify_context(conn, SHOP) is not None  # still waiting
+
+
+def test_partial_failure_retries_without_duplicates(conn, shop, monkeypatch):
+    import app.tools as tools
+    real = tools.statements_named
+    calls = []
+
+    def _flaky(c, s, names):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("render boom")
+        return real(c, s, names)
+
+    monkeypatch.setattr(tools, "statements_named", _flaky)
+    handle_text(conn, SHOP, CAPTION + " Statement for Sipho.")
+    msg, _b = handle_text(conn, SHOP, "Yes")
+    assert "⚠️ *Partly saved*" in msg
+    assert "reply Yes to retry" in msg
+    assert get_plan(conn, SHOP) is not None  # still proposed, nothing lost
+    msg, _b = handle_text(conn, SHOP, "Yes")
+    assert "✅ *Order saved*" in msg
+    assert conn.execute("SELECT COUNT(*) n FROM reminders WHERE shop_id = ?",
+                        (SHOP,)).fetchone()["n"] == 1
+    assert conn.execute("SELECT COUNT(*) n FROM credit_entries WHERE shop_id = ?",
+                        (SHOP,)).fetchone()["n"] == 1  # no phantom debt
+
+
+def test_correction_keeps_other_tasks(conn, shop):
+    handle_text(conn, SHOP, CAPTION)
+    msg, _b = handle_text(conn, SHOP, "line 3 is 2 coke 2l for Bongani")
+    assert "L3 Bongani" in msg
+    assert "⏰ *Reminder*" in msg and "06:30" in msg
+    assert "🧍 *Customer summaries*" in msg
+
+
+def test_undo_after_batch_only_reverses_last_write(conn, shop):
+    _confirm_example(conn)
+    msg, _b = handle_text(conn, SHOP, "Undo")
+    assert "Reminder" in msg or "reminder" in msg
+    assert conn.execute("SELECT status FROM reminders WHERE shop_id = ?",
+                        (SHOP,)).fetchone()["status"] == "cancelled"
+    assert get_order_draft(conn, SHOP) is not None  # earlier writes intact

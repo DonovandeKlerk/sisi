@@ -68,7 +68,7 @@ class VonageSender(WhatsAppSender):
             whatsapp_from or os.environ.get("VONAGE_WHATSAPP_FROM", "") or DEFAULT_WHATSAPP_FROM
         )
 
-    def _post_text(self, to: str, body: str) -> None:
+    def _post_text(self, to: str, body: str) -> str | None:
         if not self.api_key or not self.api_secret:
             raise RuntimeError("VONAGE_API_KEY/VONAGE_API_SECRET are not set")
         data = {"from": self.whatsapp_from, "to": _digits(to), "channel": "whatsapp",
@@ -83,7 +83,9 @@ class VonageSender(WhatsAppSender):
             return resp.json()
 
         try:
-            call_with_retries(send)
+            resp = call_with_retries(send)
+            mid = resp.get("message_uuid", "") if isinstance(resp, dict) else ""
+            return mid if isinstance(mid, str) and mid else None
         except httpx.HTTPStatusError as e:
             status = e.response.status_code if e.response is not None else "?"
             if status == 429:
@@ -98,9 +100,14 @@ class VonageSender(WhatsAppSender):
             log.error("vonage reply failed to=%s err=%r", data["to"], e)
             raise
 
-    def send_text(self, to: str, body: str) -> None:
+    def send_text(self, to: str, body: str) -> str | None:
+        """Send text; returns the provider message id of the first chunk."""
+        first: str | None = None
         for chunk in split_message(body):
-            self._post_text(to, chunk)
+            mid = self._post_text(to, chunk)
+            if first is None:
+                first = mid
+        return first
 
     def _post_custom(self, to: str, custom: dict, label: str) -> None:
         """POST a message_type=custom interactive payload (buttons/list)."""
@@ -302,6 +309,16 @@ def parse_vonage_webhook(payload: dict) -> list[IncomingMessage]:
         node = msg.get("image")
         caption = node.get("caption", "") if isinstance(node, dict) else ""
         return [IncomingMessage(mid, shop_id, "media:image", None, ts,
+                                channel="vonage", media_url=_media_url(node),
+                                caption=caption if isinstance(caption, str) else "")]
+    if mtype == "video":
+        return [IncomingMessage(mid, shop_id, "media:video", None, ts,
+                                channel="vonage",
+                                media_url=_media_url(msg.get("video")))]
+    if mtype in ("file", "document"):
+        node = msg.get(mtype)
+        caption = node.get("caption", "") if isinstance(node, dict) else ""
+        return [IncomingMessage(mid, shop_id, "media:document", None, ts,
                                 channel="vonage", media_url=_media_url(node),
                                 caption=caption if isinstance(caption, str) else "")]
     if mtype == "reply":

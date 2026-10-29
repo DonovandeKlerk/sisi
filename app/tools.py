@@ -1813,6 +1813,7 @@ def delete_my_data(conn: sqlite3.Connection, shop_id: str) -> str:
         "customers",
         "actions",
         "task_plans",
+        "clarify_context",
     ):
         conn.execute(f"DELETE FROM {table} WHERE shop_id = ?", (shop_id,))
     conn.execute(
@@ -3592,7 +3593,8 @@ def _undo_price(conn: sqlite3.Connection, shop_id: str, undo: dict) -> str:
 
 def _undo_reminder(conn: sqlite3.Connection, shop_id: str, undo: dict) -> str:
     cur = conn.execute("UPDATE reminders SET status = 'cancelled'"
-                       " WHERE id = ? AND shop_id = ? AND status = 'pending'",
+                       " WHERE id = ? AND shop_id = ?"
+                       " AND status IN ('pending', 'blocked', 'failed')",
                        (undo.get("reminder_id"), shop_id))
     if cur.rowcount == 0:
         return _t("undo_reminder_gone")

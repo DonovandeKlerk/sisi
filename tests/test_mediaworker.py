@@ -239,6 +239,9 @@ def test_statement_reminder_text_carries_link(conn):
                  " VALUES (?, 'collect', '2026-10-26T05:00:00+02:00', ?, '',"
                  " 'pending')",
                  (SHOP, json.dumps({"kind": "statement", "name": "Sipho"})))
+    from app.db import now_iso
+    conn.execute("INSERT INTO messages_seen (message_id, shop_id, created_at)"
+                 " VALUES ('lnk-seen-1', ?, ?)", (SHOP, now_iso()))
     conn.commit()
     assert send_due(conn) == [1]
     payload = conn.execute("SELECT payload_json FROM send_queue"

@@ -19,6 +19,18 @@ log = logging.getLogger("sisi.reminders")
 SAST = timezone(timedelta(hours=2))
 DELAYED_AFTER = timedelta(minutes=15)
 
+WINDOW_HOURS = 24
+"""Freeform WhatsApp only inside this window after the last inbound message."""
+
+WINDOW_EXEMPT_CHANNELS = ("vonage",)
+"""Channels without an enforced 24h window (sandbox sender, no templates)."""
+
+WINDOW_GATED_CHANNELS = ("meta", "infobip")
+"""Channels where outside-window sends need an approved template."""
+
+STUCK_CLAIM_MINUTES = 10
+"""A 'sending' claim older than this is a crashed tick: safe to refire."""
+
 REMIND_TRIGGERS = ("remind me", "remind us", "ngikhumbuze", "ungikhumbuze",
                    "ungakhumbuli", "herinner my", "herinner", "ndikhumbuze",
                    "khumbuza")
@@ -304,8 +316,8 @@ def save_reminder(conn: sqlite3.Connection, shop_id: str, due: datetime,
 
 def numbered(conn: sqlite3.Connection, shop_id: str) -> list:
     return conn.execute("SELECT * FROM reminders WHERE shop_id = ?"
-                        " AND status = 'pending' ORDER BY due_at, id",
-                        (shop_id,)).fetchall()
+                        " AND status IN ('pending', 'blocked', 'failed')"
+                        " ORDER BY due_at, id", (shop_id,)).fetchall()
 
 
 def list_reminders(conn: sqlite3.Connection, shop_id: str) -> str:
@@ -322,6 +334,12 @@ def list_reminders(conn: sqlite3.Connection, shop_id: str) -> str:
             rec = RECURRENCE.get(lang, RECURRENCE["en"]).get(r["recurrence"],
                                                              r["recurrence"])
             line += t("rem_list_rec", rec=rec)
+        if r["status"] == "blocked":
+            line += " " + t("rem_st_blocked",
+                            reason=r["blocked_reason"] or t("rem_blocked_window"))
+        elif r["status"] == "failed":
+            line += " " + t("rem_st_failed",
+                            detail=r["dlr_detail"] or "?")
         lines.append(line)
     return "\n".join(lines)
 
@@ -490,24 +508,167 @@ def due_today(conn: sqlite3.Connection, shop_id: str, day: str) -> list:
                         " ORDER BY due_at, id", (shop_id, day)).fetchall()
 
 
-def send_due(conn: sqlite3.Connection, now: datetime | None = None) -> list[int]:
-    """Claim due reminders and enqueue them (text + context media).
+def _parse_seen_ts(value: str):
+    """Parse a messages_seen timestamp (ISO or legacy minute format)."""
+    v = (value or "").strip()
+    if not v:
+        return None
+    m = re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:(\d{2})(.*)$", v)
+    if m and m.group(2)[:1].isdigit():
+        try:
+            return datetime.strptime(v, "%Y-%m-%dT%H:%M:%fZ").replace(
+                tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    try:
+        dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
-    Claim, enqueue and finalize happen in one transaction per reminder, so
-    each fires exactly once. Returns the fired reminder ids.
+
+def last_inbound_at(conn: sqlite3.Connection, shop_id: str):
+    """Newest inbound message time for a shop, or None when never."""
+    row = conn.execute("SELECT MAX(created_at) m FROM messages_seen"
+                       " WHERE shop_id = ?", (shop_id,)).fetchone()
+    if row is None or not row["m"]:
+        return None
+    return _parse_seen_ts(row["m"])
+
+
+def window_open(conn: sqlite3.Connection, shop_id: str, channel: str,
+                now: datetime | None = None) -> bool:
+    """True when a freeform message may go out on this channel now."""
+    if (channel or "").strip().lower() in WINDOW_EXEMPT_CHANNELS:
+        return True
+    now = now_sast(now)
+    last = last_inbound_at(conn, shop_id)
+    if last is None:
+        return False
+    return now - last <= timedelta(hours=WINDOW_HOURS)
+
+
+def reminder_template() -> tuple[str, str] | None:
+    """Configured (name, lang) for outside-window pokes, or None."""
+    import os as _os
+    name = (_os.environ.get("SISI_REMINDER_TEMPLATE", "") or "").strip()
+    if not name:
+        return None
+    lang = (_os.environ.get("SISI_REMINDER_TEMPLATE_LANG", "") or "").strip()
+    return name, lang or "en"
+
+
+def mark_reminder_submitted(conn: sqlite3.Connection, reminder_id: int,
+                            provider_msg_id: str | None) -> None:
+    """The provider accepted the send: queued -> submitted (+ its id)."""
+    conn.execute("UPDATE reminders SET status = 'submitted',"
+                 " provider_msg_id = ?, dlr_detail = ''"
+                 " WHERE id = ? AND status = 'queued'",
+                 (provider_msg_id or "", reminder_id))
+    conn.commit()
+
+
+def mark_reminder_failed(conn: sqlite3.Connection, reminder_id: int,
+                         detail: str) -> None:
+    """Terminal send failure. Kept visible; never silently discarded."""
+    conn.execute("UPDATE reminders SET status = 'failed', dlr_detail = ?"
+                 " WHERE id = ? AND status IN ('queued', 'submitted',"
+                 " 'sending')", (detail or "send failed", reminder_id))
+    conn.commit()
+
+
+def record_dlr(conn: sqlite3.Connection, provider_msg_id: str,
+               outcome: str, detail: str = "") -> bool:
+    """Apply a delivery report. Idempotent and out-of-order safe.
+
+    outcome is 'delivered', 'failed', or 'submitted' (in-flight).
+    Delivered is terminal and wins over a stale failure; failures and
+    duplicates never resurrect or duplicate anything. Returns True
+    when the report matched one of our reminders.
+    """
+    if not provider_msg_id:
+        return False
+    row = conn.execute("SELECT id, status FROM reminders"
+                       " WHERE provider_msg_id = ? AND provider_msg_id != ''",
+                       (provider_msg_id,)).fetchone()
+    if row is None:
+        log.info("dlr for unknown message %s ignored", provider_msg_id)
+        return False
+    current = row["status"]
+    if current == "delivered":
+        return True
+    if outcome == "delivered":
+        if current in ("queued", "submitted", "sending", "failed"):
+            conn.execute("UPDATE reminders SET status = 'delivered',"
+                         " dlr_detail = '' WHERE id = ?", (row["id"],))
+            conn.commit()
+        return True
+    if outcome == "failed":
+        if current in ("queued", "submitted", "sending"):
+            conn.execute("UPDATE reminders SET status = 'failed',"
+                         " dlr_detail = ? WHERE id = ?",
+                         (detail or "delivery failed", row["id"]))
+            conn.commit()
+        return True
+    if outcome == "submitted" and current == "queued":
+        conn.execute("UPDATE reminders SET status = 'submitted' WHERE id = ?",
+                     (row["id"],))
+        conn.commit()
+    return True
+
+
+def retry_stuck(conn: sqlite3.Connection, shop_id: str,
+                now: datetime | None = None) -> str:
+    """Owner recovery: re-fire blocked/failed reminders due now."""
+    rows = conn.execute("SELECT id FROM reminders WHERE shop_id = ?"
+                        " AND status IN ('blocked', 'failed')",
+                        (shop_id,)).fetchall()
+    if not rows:
+        return t("rem_retry_none")
+    ids = [r["id"] for r in rows]
+    conn.execute("UPDATE reminders SET status = 'pending', dlr_detail = '',"
+                 " blocked_reason = ''"
+                 f" WHERE id IN ({','.join('?' for _ in ids)})", ids)
+    conn.commit()
+    fired = set(send_due(conn, now))
+    ok = len([i for i in ids if i in fired])
+    still = conn.execute("SELECT COUNT(*) n FROM reminders"
+                         f" WHERE id IN ({','.join('?' for _ in ids)})"
+                         " AND status IN ('blocked', 'failed')",
+                         ids).fetchone()["n"]
+    ok += len(ids) - ok - still  # reset to pending for a future due time
+    return t("rem_retry_done", ok=ok, stuck=still)
+
+
+def send_due(conn: sqlite3.Connection, now: datetime | None = None) -> list[int]:
+    """Fire due reminders into the send queue (state queued, never sent).
+
+    Window-closed reminders on gated channels go out as the configured
+    template when one exists, else wait as blocked with a reason.
+    Recurring reminders keep their fired instance for delivery tracking
+    and schedule the next one as a new row. Claim + enqueue happen in
+    one transaction per reminder, so each fires exactly once even when
+    ticks overlap. Returns the enqueued reminder ids.
     """
     from app.sendqueue import enqueue
     now = now_sast(now)
     fired: list[int] = []
+    stuck_before = (now - timedelta(minutes=STUCK_CLAIM_MINUTES)).isoformat()
     due_rows = conn.execute(
         "SELECT r.*, s.channel FROM reminders r"
         " JOIN shops s ON s.shop_id = r.shop_id"
-        " WHERE r.status = 'pending' AND r.due_at <= ?"
-        " ORDER BY r.due_at, r.id", (now.isoformat(),)).fetchall()
+        " WHERE ((r.status = 'pending' AND r.due_at <= ?)"
+        " OR (r.status = 'blocked' AND r.due_at <= ?)"
+        " OR (r.status = 'sending'"
+        " AND (r.sent_at = '' OR r.sent_at < ?)))"
+        " ORDER BY r.due_at, r.id",
+        (now.isoformat(), now.isoformat(), stuck_before)).fetchall()
     for row in due_rows:
-        claim = conn.execute("UPDATE reminders SET status = 'sending'"
-                             " WHERE id = ? AND status = 'pending'",
-                             (row["id"],))
+        claim = conn.execute("UPDATE reminders SET status = 'sending',"
+                             " sent_at = ? WHERE id = ?"
+                             " AND status IN ('pending', 'blocked',"
+                             " 'sending')",
+                             (now.isoformat(), row["id"]))
         if claim.rowcount == 0:
             continue
         due = datetime.fromisoformat(row["due_at"])
@@ -522,33 +683,56 @@ def send_due(conn: sqlite3.Connection, now: datetime | None = None) -> list[int]
         channel = row["channel"] or "meta"
         from app.i18n import owner_lang
         CURRENT_LANG.set(owner_lang(conn, shop_id))
-        text = fire_text(row["summary"], due, delayed)
-        ctx_text, media = render_context(conn, shop_id, context)
-        if ctx_text:
-            text += f"\n\n{ctx_text}"
-        from app.mediasend import with_media_links
-
-        text = with_media_links(text, media)
-        enqueue(conn, shop_id, channel, "text", {"body": text}, commit=False)
-        for item in media:
-            if item.get("kind") == "file":
-                enqueue(conn, shop_id, channel, "file",
-                        {"url": item.get("url", ""),
-                         "filename": item.get("filename") or "sisi-file",
-                         "caption": item.get("caption", "")}, commit=False)
+        gated = channel in WINDOW_GATED_CHANNELS
+        if gated and not window_open(conn, shop_id, channel, now):
+            tpl = reminder_template()
+            if tpl is not None and channel == "infobip":
+                enqueue(conn, shop_id, channel, "template",
+                        {"reminder_id": row["id"], "template": tpl[0],
+                         "lang": tpl[1],
+                         "params": [row["summary"][:160]]}, commit=False)
+                conn.execute("UPDATE reminders SET status = 'queued',"
+                             " blocked_reason = '' WHERE id = ?",
+                             (row["id"],))
             else:
-                enqueue(conn, shop_id, channel, "image",
-                        {"url": item.get("url", ""),
-                         "caption": item.get("caption", "")}, commit=False)
+                conn.execute("UPDATE reminders SET status = 'blocked',"
+                             " blocked_reason = ? WHERE id = ?",
+                             (t("rem_blocked_window"), row["id"]))
+                conn.commit()
+                log.info("reminder %s blocked for %s (window shut)",
+                         row["id"], shop_id)
+                continue
+        else:
+            text = fire_text(row["summary"], due, delayed)
+            ctx_text, media = render_context(conn, shop_id, context)
+            if ctx_text:
+                text += f"\n\n{ctx_text}"
+            from app.mediasend import with_media_links
+
+            text = with_media_links(text, media)
+            enqueue(conn, shop_id, channel, "text",
+                    {"body": text, "reminder_id": row["id"]}, commit=False)
+            for item in media:
+                if item.get("kind") == "file":
+                    enqueue(conn, shop_id, channel, "file",
+                            {"url": item.get("url", ""),
+                             "filename": item.get("filename") or "sisi-file",
+                             "caption": item.get("caption", "")}, commit=False)
+                else:
+                    enqueue(conn, shop_id, channel, "image",
+                            {"url": item.get("url", ""),
+                             "caption": item.get("caption", "")}, commit=False)
+            conn.execute("UPDATE reminders SET status = 'queued',"
+                         " blocked_reason = '' WHERE id = ?", (row["id"],))
         if row["recurrence"] in ("daily", "weekly", "monthly"):
             nxt = advance(due, row["recurrence"])
             while nxt <= now:
                 nxt = advance(nxt, row["recurrence"])
-            conn.execute("UPDATE reminders SET due_at = ?, status = 'pending'"
-                         " WHERE id = ?", (nxt.isoformat(), row["id"]))
-        else:
-            conn.execute("UPDATE reminders SET status = 'sent', sent_at = ?"
-                         " WHERE id = ?", (now.isoformat(), row["id"]))
+            conn.execute("INSERT INTO reminders (shop_id, due_at, summary,"
+                         " context_json, recurrence)"
+                         " VALUES (?, ?, ?, ?, ?)",
+                         (shop_id, nxt.isoformat(), row["summary"],
+                          row["context_json"], row["recurrence"]))
         conn.execute(
             "INSERT INTO flags (shop_id, key, value) VALUES (?, 'last-fired-reminder', ?)"
             " ON CONFLICT (shop_id, key) DO UPDATE SET value = excluded.value",
@@ -556,5 +740,5 @@ def send_due(conn: sqlite3.Connection, now: datetime | None = None) -> list[int]
         )
         conn.commit()
         fired.append(row["id"])
-        log.info("reminder %s fired for %s", row["id"], shop_id)
+        log.info("reminder %s queued for %s", row["id"], shop_id)
     return fired

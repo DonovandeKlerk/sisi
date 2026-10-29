@@ -135,6 +135,11 @@ def daily_plan(conn: sqlite3.Connection, shop_id: str, day: str) -> str:
         blocks.append(t("plan_due") + "\n" + "\n".join(
             t("plan_due_line", hm=r["due_at"][11:16], summary=r["summary"])
             for r in rems[:6]))
+    stuck = conn.execute("SELECT COUNT(*) n FROM reminders WHERE shop_id = ?"
+                         " AND status IN ('blocked', 'failed')",
+                         (shop_id,)).fetchone()["n"]
+    if stuck:
+        blocks.append(t("rem_plan_stuck", n=stuck))
     low = conn.execute("SELECT name, stock_qty, pack_size, pack_name FROM products"
                        " WHERE shop_id = ? AND stock_qty <= reorder_level"
                        " ORDER BY stock_qty LIMIT 6", (shop_id,)).fetchall()

@@ -32,7 +32,10 @@ from app.orders import (
     get_plan,
     get_plan_by_key,
     plan_followup_message,
+    clear_clarify_context,
     render_preview,
+    resume_plan_from_clarify,
+    save_clarify_context,
     save_plan,
 )
 
@@ -483,9 +486,13 @@ def try_reminder_command(conn: sqlite3.Connection, shop_id: str,
     """Reminder commands and direct 'remind me' requests. None otherwise."""
     from app.reminders import (cancel_numbered, confirm_text, detect_context,
                                list_reminders, move_numbered, parse_request,
-                               parse_snooze_minutes, save_reminder,
-                               snooze_last)
+                               parse_snooze_minutes, retry_stuck,
+                               save_reminder, snooze_last)
     word = _normalize(text or "")
+    if word in ("retry reminders", "retry reminder",
+                "probeer herinneringe weer", "zama izikhumbuzo futhi",
+                "phinda uzame izikhumbuzo"):
+        return retry_stuck(conn, shop_id)
     if word in ("my reminders", "reminders", "show reminders",
                 "list reminders", "my herinneringe", "herinneringe",
                 "wys herinneringe", "izikhumbuzo zam", "bonisa izikhumbuzo"):
@@ -661,19 +668,18 @@ def _parse_ts(value: str) -> datetime:
     v = (value or "").strip()
     if not v:
         return datetime.min.replace(tzinfo=timezone.utc)
+    m = re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:(\d{2})(.*)$", v)
+    if m and m.group(2)[:1].isdigit():
+        try:
+            return datetime.strptime(v, "%Y-%m-%dT%H:%M:%fZ").replace(
+                tzinfo=timezone.utc)
+        except ValueError:
+            return datetime.min.replace(tzinfo=timezone.utc)
     try:
-        if "." in v:
-            dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
-        else:
-            dt = datetime.strptime(v, "%Y-%m-%dT%H:%M:%SZ")
-        return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
-    except ValueError:
-        pass
-    try:
-        dt = datetime.strptime(v, "%Y-%m-%dT%H:%M:%fZ")
-        return dt.replace(tzinfo=timezone.utc)
+        dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
     except ValueError:
         return datetime.min.replace(tzinfo=timezone.utc)
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
 def _newest_proposal(conn: sqlite3.Connection, shop_id: str):
@@ -744,7 +750,9 @@ def cancel_newest(conn: sqlite3.Connection, shop_id: str) -> str:
 def try_order_plan(conn: sqlite3.Connection, shop_id: str,
                    text: str) -> str | None:
     """Order-bearing texts become one combined plan preview. None otherwise."""
-    plan, _question = build_plan(conn, shop_id, text or "", None, "")
+    plan, from_ctx = resume_plan_from_clarify(conn, shop_id, text or "")
+    if plan is None:
+        plan, _question = build_plan(conn, shop_id, text or "", None, "")
     if plan is None:
         return None
     existing = get_plan_by_key(conn, shop_id, plan["message_key"])
@@ -753,6 +761,8 @@ def try_order_plan(conn: sqlite3.Connection, shop_id: str,
             return _t("ord_already")
         return render_preview(conn, shop_id, existing)
     saved = save_plan(conn, shop_id, plan)
+    if from_ctx:
+        clear_clarify_context(conn, shop_id)
     return render_preview(conn, shop_id, saved)
 
 
@@ -1073,6 +1083,7 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
         save_turn(conn, shop_id, "assistant", reply)
         return None, reply, None
     if caption.lower() == "logo" or _normalize(caption) in NEW_LOGO_WORDS:
+        clear_clarify_context(conn, shop_id)
         reply = stage_shop_logo(conn, shop_id, image or b"")
         save_turn(conn, shop_id, "user", "[logo photo]")
         save_turn(conn, shop_id, "assistant", reply)
@@ -1091,6 +1102,7 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
     before = get_pending(conn, shop_id)
     before_id = before["id"] if before else None
     if not caption and logo_pending(conn, shop_id):
+        clear_clarify_context(conn, shop_id)
         reply = stage_shop_logo(conn, shop_id, image or b"")
         save_turn(conn, shop_id, "user", "[logo photo]")
         save_turn(conn, shop_id, "assistant", reply)
@@ -1107,6 +1119,7 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
     plan, question = build_plan(conn, shop_id, caption, doc, digest,
                                 message_key=digest, from_photo=True)
     if plan is not None:
+        clear_clarify_context(conn, shop_id)
         existing = get_plan_by_key(conn, shop_id, plan["message_key"])
         if existing is not None and existing["status"] == "confirmed":
             reply = _t("ord_already")
@@ -1123,9 +1136,11 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
     if question is not None:
         if logo_pending(conn, shop_id):
             question = _t("ord_logo_or_task")
+        save_clarify_context(conn, shop_id, digest, caption, doc)
         save_turn(conn, shop_id, "assistant", question)
         return doc, question, None
     if logo_pending(conn, shop_id):
+        clear_clarify_context(conn, shop_id)
         reply = stage_shop_logo(conn, shop_id, image or b"")
         save_turn(conn, shop_id, "user", "[logo photo]")
         save_turn(conn, shop_id, "assistant", reply)

@@ -123,6 +123,43 @@ def parse_webhook(payload: dict) -> list[IncomingMessage]:
     return out
 
 
+def parse_statuses(payload: dict) -> list[tuple[str, str, str]]:
+    """Pull delivery reports from a Cloud API webhook payload.
+
+    Returns [(provider_id, outcome, detail)] with outcome delivered,
+    failed, or submitted. Anything unparseable yields nothing.
+    """
+    out: list[tuple[str, str, str]] = []
+    if not isinstance(payload, dict):
+        return out
+    if payload.get("object") != "whatsapp_business_account":
+        return out
+    for entry in payload.get("entry") or []:
+        if not isinstance(entry, dict):
+            continue
+        for change in entry.get("changes") or []:
+            value = (change or {}).get("value") or {}
+            for st in value.get("statuses") or []:
+                if not isinstance(st, dict):
+                    continue
+                mid = st.get("id", "")
+                status = str(st.get("status", "")).lower()
+                if not mid or not status:
+                    continue
+                if status in ("delivered", "read"):
+                    out.append((mid, "delivered", ""))
+                elif status in ("failed", "deleted"):
+                    errors = st.get("errors") or []
+                    detail = ""
+                    if errors and isinstance(errors[0], dict):
+                        detail = str(errors[0].get("title", "")
+                                     or errors[0].get("code", ""))
+                    out.append((mid, "failed", detail or "delivery failed"))
+                elif status == "sent":
+                    out.append((mid, "submitted", ""))
+    return out
+
+
 def download_media(media_id: str, label: str = "voice note") -> bytes:
     """Fetch WhatsApp media bytes via the media-id endpoint. Raises VoiceError."""
     from app.voice import CANT_HEAR, VoiceError
@@ -181,10 +218,12 @@ class FakeSender(WhatsAppSender):
         self._lock = threading.Lock()
         self.sent: list[dict] = []
 
-    def send_text(self, to: str, body: str) -> None:
+    def send_text(self, to: str, body: str) -> str | None:
+        """In-memory send; no provider id exists in dev, so None."""
         with self._lock:
             self.sent.append({"to": to, "type": "text", "body": body})
         log.info("fake -> %s: %.80s", to, body)
+        return None
 
     def send_buttons(self, to: str, body: str, buttons: list[str]) -> None:
         with self._lock:
@@ -254,10 +293,19 @@ class CloudApiSender(WhatsAppSender):
 
         return call_with_retries(send)
 
-    def send_text(self, to: str, body: str) -> None:
+    def send_text(self, to: str, body: str) -> str | None:
+        """Send text; returns the provider message id of the first chunk."""
+        first: str | None = None
         for chunk in split_message(body):
-            self._post({"messaging_product": "whatsapp", "to": to, "type": "text",
-                        "text": {"preview_url": False, "body": chunk[:MAX_TEXT_LEN]}})
+            resp = self._post({"messaging_product": "whatsapp", "to": to,
+                               "type": "text",
+                               "text": {"preview_url": False,
+                                        "body": chunk[:MAX_TEXT_LEN]}})
+            if first is None and isinstance(resp, dict):
+                msgs = resp.get("messages") or []
+                mid = msgs[0].get("id", "") if msgs else ""
+                first = mid if isinstance(mid, str) and mid else None
+        return first
 
     def send_buttons(self, to: str, body: str, buttons: list[str]) -> None:
         action = [{"type": "reply",

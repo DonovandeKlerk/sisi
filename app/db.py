@@ -134,6 +134,15 @@ CREATE TABLE IF NOT EXISTS task_plans (
   PRIMARY KEY (shop_id, plan_id)
 );
 
+CREATE TABLE IF NOT EXISTS clarify_context (
+  shop_id      TEXT PRIMARY KEY REFERENCES shops(shop_id),
+  photo_digest TEXT NOT NULL DEFAULT '',
+  caption      TEXT NOT NULL DEFAULT '',
+  vision_json  TEXT NOT NULL DEFAULT '{}',
+  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  expires_at   TEXT NOT NULL DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS await_price (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   shop_id    TEXT NOT NULL REFERENCES shops(shop_id),
@@ -262,6 +271,7 @@ CREATE TABLE IF NOT EXISTS send_queue (
   status       TEXT NOT NULL DEFAULT 'queued',
   attempts     INTEGER NOT NULL DEFAULT 0,
   next_at      REAL,
+  claimed_at   REAL,
   created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
@@ -279,7 +289,10 @@ CREATE TABLE IF NOT EXISTS reminders (
   recurrence  TEXT NOT NULL DEFAULT 'none',
   status      TEXT NOT NULL DEFAULT 'pending',
   created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-  sent_at     TEXT NOT NULL DEFAULT ''
+  sent_at     TEXT NOT NULL DEFAULT '',
+  provider_msg_id TEXT NOT NULL DEFAULT '',
+  dlr_detail  TEXT NOT NULL DEFAULT '',
+  blocked_reason TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_customers_shop ON customers(shop_id);
@@ -338,6 +351,10 @@ def init_db(conn: sqlite3.Connection) -> None:
         "ALTER TABLE credit_entries ADD COLUMN recorded_by TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE payments ADD COLUMN recorded_by TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE expenses ADD COLUMN recorded_by TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE reminders ADD COLUMN provider_msg_id TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE reminders ADD COLUMN dlr_detail TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE reminders ADD COLUMN blocked_reason TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE send_queue ADD COLUMN claimed_at REAL",
     ):
         try:
             conn.execute(sql)

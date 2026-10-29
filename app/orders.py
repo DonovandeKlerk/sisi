@@ -558,6 +558,83 @@ def message_key_for(text: str, photo_digest: str = "") -> str:
     return hashlib.sha1(bits.encode("utf-8")).hexdigest()[:16]
 
 
+CLARIFY_TTL = timedelta(hours=24)
+"""A clarification answer resumes the same media within this long."""
+
+
+def save_clarify_context(conn: sqlite3.Connection, shop_id: str,
+                         photo_digest: str, caption: str,
+                         vision_doc: dict | None) -> None:
+    """Keep the ambiguous photo + reading so a text answer resumes it.
+
+    One row per shop (a new photo supersedes); survives restarts.
+    """
+    from app.tools import ensure_shop
+    ensure_shop(conn, shop_id)
+    expires = (datetime.now(timezone.utc) + CLARIFY_TTL).strftime(
+        "%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    try:
+        vision_json = json.dumps(vision_doc or {})
+    except (TypeError, ValueError):
+        vision_json = "{}"
+    conn.execute("INSERT INTO clarify_context (shop_id, photo_digest, caption,"
+                 " vision_json, created_at, expires_at)"
+                 " VALUES (?, ?, ?, ?, ?, ?)"
+                 " ON CONFLICT (shop_id) DO UPDATE SET photo_digest = excluded.photo_digest,"
+                 " caption = excluded.caption, vision_json = excluded.vision_json,"
+                 " created_at = excluded.created_at, expires_at = excluded.expires_at",
+                 (shop_id, photo_digest or "", (caption or "")[:500],
+                  vision_json, now_iso(), expires))
+    conn.commit()
+
+
+def get_clarify_context(conn: sqlite3.Connection, shop_id: str) -> dict | None:
+    """The live clarification context, or None when absent/expired."""
+    row = conn.execute("SELECT * FROM clarify_context WHERE shop_id = ?",
+                       (shop_id,)).fetchone()
+    if row is None:
+        return None
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    if row["expires_at"] and row["expires_at"] < now:
+        conn.execute("DELETE FROM clarify_context WHERE shop_id = ?",
+                     (shop_id,))
+        conn.commit()
+        return None
+    try:
+        vision = json.loads(row["vision_json"] or "{}")
+    except ValueError:
+        vision = {}
+    return {"photo_digest": row["photo_digest"], "caption": row["caption"],
+            "vision": vision if isinstance(vision, dict) else {}}
+
+
+def clear_clarify_context(conn: sqlite3.Connection, shop_id: str) -> None:
+    """Drop the clarification context (answered, superseded, or pivoted)."""
+    conn.execute("DELETE FROM clarify_context WHERE shop_id = ?", (shop_id,))
+    conn.commit()
+
+
+def resume_plan_from_clarify(conn: sqlite3.Connection, shop_id: str,
+                             text: str) -> tuple[dict | None, bool]:
+    """Build a plan from a clarification answer plus the stored media.
+
+    Returns (plan_or_None, context_used). The original caption's tasks
+    merge with the answer, so a multi-task request survives the
+    clarification round-trip. Non-answers leave normal routing alone.
+    """
+    ctx = get_clarify_context(conn, shop_id)
+    if ctx is None:
+        return None, False
+    if not parse_order_lines(conn, shop_id, text or "") \
+            and not _has_cue(text or ""):
+        return None, False
+    combined = "\n".join(b for b in (ctx["caption"], text or "") if b)
+    plan, _question = build_plan(
+        conn, shop_id, combined, ctx["vision"] or None,
+        ctx["photo_digest"], from_photo=True)
+    return plan, plan is not None
+
+
 # --- plan building ------------------------------------------------------------
 
 
@@ -646,13 +723,21 @@ def build_plan(conn: sqlite3.Connection, shop_id: str, text: str,
                 if ln["customer"] not in ("", "?") or _has_cue(text)]
     if not keen:
         from app.reminders import REMIND_TRIGGERS as _TRIG
-        if any(t in f" {text.lower()} " for t in _TRIG):
-            return None, None  # a plain reminder is not an order
-        if _has_cue(text) and not _has_blocker(text):
+        plain = [s for s in split_segments(text)
+                 if not any(t in f" {s.lower()} " for t in _TRIG)]
+        if any(_has_cue(s) and not _has_blocker(s) for s in plain):
             return None, _t("ord_clarify")
         return None, None
     lines = keen
     reminders = _reminder_tasks(text, now)
+    seen_rem: set[tuple[str, str, str]] = set()
+    deduped = []
+    for task in reminders:
+        key = (task["due"], task["summary"], task["recurrence"])
+        if key not in seen_rem:
+            seen_rem.add(key)
+            deduped.append(task)
+    reminders = deduped
     statements = _statement_specs(conn, shop_id, text)
     summaries = _summary_tasks(text)
     vision_brief: dict = {}
@@ -910,63 +995,99 @@ def confirm_plan(conn: sqlite3.Connection, shop_id: str) -> str:
     ensure_shop(conn, shop_id)
     lines = _refresh_line_prices(conn, shop_id, plan.get("order_lines", []))
     out = [_t("ord_saved_head")]
-    for ln in lines:
-        if ln.get("customer_id") or not ln.get("customer_new"):
-            continue
-        if _get_customer(conn, shop_id, ln["customer"]) is not None:
-            continue
-        cur = conn.execute("INSERT INTO customers (shop_id, name)"
-                           " VALUES (?, ?)", (shop_id, ln["customer"]))
-        conn.execute("INSERT INTO actions (action_id, shop_id, kind, summary,"
-                     " data_json) VALUES (?, ?, 'customer', ?, ?)",
-                     (_action_id(), shop_id,
-                      f"customer: {ln['customer']}",
-                      json.dumps({"customer_id": cur.lastrowid,
-                                  "name": ln["customer"]})))
+    errors = 0
+    try:
+        for ln in lines:
+            if ln.get("customer_id") or not ln.get("customer_new"):
+                continue
+            if _get_customer(conn, shop_id, ln["customer"]) is not None:
+                continue
+            cur = conn.execute("INSERT INTO customers (shop_id, name)"
+                               " VALUES (?, ?)", (shop_id, ln["customer"]))
+            conn.execute("INSERT INTO actions (action_id, shop_id, kind, summary,"
+                         " data_json) VALUES (?, ?, 'customer', ?, ?)",
+                         (_action_id(), shop_id,
+                          f"customer: {ln['customer']}",
+                          json.dumps({"customer_id": cur.lastrowid,
+                                      "name": ln["customer"]})))
+        conn.commit()
+    except Exception:
+        log.warning("plan %s: customers failed", plan["plan_id"],
+                    exc_info=True)
+        errors += 1
     added = sorted({ln["customer"] for ln in lines
                     if ln.get("customer_new")})
-    procure = procure_lines(conn, shop_id, lines)
-    prev = get_order_draft(conn, shop_id)
-    if procure:
-        from app.tools import _save_order_draft
-        _save_order_draft(conn, shop_id,
-                          {"lines": procure, "sent": [],
-                           "kind": "customer_order",
-                           "plan_id": plan["plan_id"]})
-        conn.execute("INSERT INTO actions (action_id, shop_id, kind, summary,"
-                     " data_json) VALUES (?, ?, 'order', ?, ?)",
-                     (_action_id(), shop_id,
-                      f"order: {len(lines)} lines",
-                      json.dumps({"plan_id": plan["plan_id"],
-                                  "previous": prev})))
-        out.append(_t("ord_saved_draft", n=len(lines)))
-    else:
-        out.append(_t("ord_saved_noprocure"))
+    try:
+        procure = procure_lines(conn, shop_id, lines)
+        prev = get_order_draft(conn, shop_id)
+        if procure:
+            from app.tools import _save_order_draft
+            _save_order_draft(conn, shop_id,
+                              {"lines": procure, "sent": [],
+                               "kind": "customer_order",
+                               "plan_id": plan["plan_id"]})
+            conn.execute("INSERT INTO actions (action_id, shop_id, kind, summary,"
+                         " data_json) VALUES (?, ?, 'order', ?, ?)",
+                         (_action_id(), shop_id,
+                          f"order: {len(lines)} lines",
+                          json.dumps({"plan_id": plan["plan_id"],
+                                      "previous": prev})))
+            conn.commit()
+            out.append(_t("ord_saved_draft", n=len(lines)))
+        else:
+            out.append(_t("ord_saved_noprocure"))
+    except Exception:
+        log.warning("plan %s: order draft failed", plan["plan_id"],
+                    exc_info=True)
+        errors += 1
     if added:
         out.append(_t("ord_saved_cust", names=", ".join(added)))
     for task in plan.get("reminders", []):
-        due = _dt.fromisoformat(task["due"])
-        context = {"kind": "customer_order", "plan_id": plan["plan_id"],
-                   "label": task.get("summary", "")[:60]}
-        save_reminder(conn, shop_id, due, task["summary"], context,
-                      task.get("recurrence", "none"))
-        out.append(confirm_text(due, task["summary"],
-                                task.get("recurrence", "none")))
+        try:
+            due = _dt.fromisoformat(task["due"])
+            if not _same_reminder_exists(conn, shop_id, task["due"],
+                                         task["summary"]):
+                context = {"kind": "customer_order",
+                           "plan_id": plan["plan_id"],
+                           "label": task.get("summary", "")[:60]}
+                save_reminder(conn, shop_id, due, task["summary"], context,
+                              task.get("recurrence", "none"))
+            out.append(confirm_text(due, task["summary"],
+                                    task.get("recurrence", "none")))
+        except Exception:
+            log.warning("plan %s: reminder failed", plan["plan_id"],
+                        exc_info=True)
+            errors += 1
     for spec in plan.get("statements", []):
-        mode = spec.get("mode", "named")
-        if mode == "all":
-            out.append(statements_for_all(conn, shop_id))
-        elif mode == "top":
-            out.append(statements_top_n(conn, shop_id,
-                                        int(spec.get("n", 0))))
-        else:
-            out.append(statements_named(conn, shop_id,
-                                        spec.get("names", [])))
-    for task in plan.get("summaries", []):
-        text = customer_summaries(conn, shop_id, lines,
-                                  task.get("label", ""))
-        if text:
-            out.append(text)
+        try:
+            mode = spec.get("mode", "named")
+            if mode == "all":
+                out.append(statements_for_all(conn, shop_id))
+            elif mode == "top":
+                out.append(statements_top_n(conn, shop_id,
+                                            int(spec.get("n", 0))))
+            else:
+                out.append(statements_named(conn, shop_id,
+                                            spec.get("names", [])))
+        except Exception:
+            log.warning("plan %s: statements failed", plan["plan_id"],
+                        exc_info=True)
+            errors += 1
+    try:
+        for task in plan.get("summaries", []):
+            text = customer_summaries(conn, shop_id, lines,
+                                      task.get("label", ""))
+            if text:
+                out.append(text)
+    except Exception:
+        log.warning("plan %s: summaries failed", plan["plan_id"],
+                    exc_info=True)
+        errors += 1
+    if errors:
+        out[0] = _t("ord_partial_head")
+        out.append(_t("ord_part_fail"))
+        conn.commit()
+        return "\n\n".join(out)
     if plan.get("photo_digest"):
         from app.tools import record_photo
         record_photo(conn, shop_id, plan["photo_digest"], "order")
@@ -977,6 +1098,16 @@ def confirm_plan(conn: sqlite3.Connection, shop_id: str) -> str:
     log.info("plan %s confirmed for %s (%d lines)", plan["plan_id"],
              shop_id, len(lines))
     return "\n\n".join(out)
+
+
+def _same_reminder_exists(conn: sqlite3.Connection, shop_id: str, due_iso: str,
+                          summary: str) -> bool:
+    """True when an identical live reminder already exists (retry-safe)."""
+    row = conn.execute("SELECT id FROM reminders WHERE shop_id = ?"
+                       " AND due_at = ? AND summary = ?"
+                       " AND status != 'cancelled' LIMIT 1",
+                       (shop_id, due_iso, summary)).fetchone()
+    return row is not None
 
 
 # --- corrections --------------------------------------------------------------

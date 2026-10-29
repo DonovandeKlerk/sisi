@@ -27,6 +27,14 @@ SHOP = "27710000022"
 MON_10AM = datetime(2026, 10, 26, 10, 0)  # Monday, naive -> SAST
 
 
+def _open_window(conn, shop, when):
+    conn.execute("INSERT INTO messages_seen (message_id, shop_id, created_at)"
+                 " VALUES (?, ?, ?)",
+                 (f"seen-{when.isoformat()}", shop, when.isoformat()))
+    conn.commit()
+
+
+
 @pytest.fixture(autouse=True)
 def _shop(conn):
     import app.setup as setup
@@ -152,6 +160,7 @@ def test_undo_cancels_reminder(conn):
 
 
 def test_exactly_once_and_delayed(conn):
+    _open_window(conn, SHOP, datetime(2026, 10, 26, 9, 30, tzinfo=SAST))
     rid = save_reminder(conn, SHOP, datetime(2026, 10, 26, 9, 0, tzinfo=SAST),
                         "open shop", {}, "none")
     assert send_due(conn, MON_10AM) == [rid]
@@ -160,17 +169,21 @@ def test_exactly_once_and_delayed(conn):
     assert "(delayed)" in queued["payload_json"]  # 1h late
     row = conn.execute("SELECT status FROM reminders WHERE id = ?",
                        (rid,)).fetchone()
-    assert row["status"] == "sent"
+    assert row["status"] == "queued"
 
 
 def test_recurrence_advances(conn):
+    _open_window(conn, SHOP, datetime(2026, 10, 26, 9, 30, tzinfo=SAST))
     rid = save_reminder(conn, SHOP, datetime(2026, 10, 26, 9, 59, tzinfo=SAST),
                         "count", {}, "daily")
     assert send_due(conn, MON_10AM) == [rid]
     row = conn.execute("SELECT due_at, status FROM reminders WHERE id = ?",
                        (rid,)).fetchone()
-    assert row["status"] == "pending"
-    assert row["due_at"] == datetime(2026, 10, 27, 9, 59,
+    assert row["status"] == "queued"  # fired instance keeps delivery state
+    nxt = conn.execute("SELECT due_at, status FROM reminders WHERE id = ?",
+                       (rid + 1,)).fetchone()
+    assert nxt["status"] == "pending"
+    assert nxt["due_at"] == datetime(2026, 10, 27, 9, 59,
                                      tzinfo=SAST).isoformat()
     assert advance(datetime(2026, 10, 26, 9, 0), "weekly") == \
         datetime(2026, 11, 2, 9, 0)
@@ -179,6 +192,7 @@ def test_recurrence_advances(conn):
 
 
 def test_snooze_after_fire(conn):
+    _open_window(conn, SHOP, datetime(2026, 10, 26, 9, 30, tzinfo=SAST))
     rid = save_reminder(conn, SHOP, datetime(2026, 10, 26, 9, 59, tzinfo=SAST),
                         "count", {}, "none")
     send_due(conn, MON_10AM)
@@ -213,6 +227,7 @@ def test_order_context_recomputed_at_send(conn):
     conn.execute("UPDATE products SET stock_qty = 100 WHERE shop_id = ?",
                  (SHOP,))  # restocked after saving
     conn.commit()
+    _open_window(conn, SHOP, datetime(2026, 10, 29, 5, 0, tzinfo=SAST))
     send_due(conn, datetime(2026, 10, 29, 5, 31))
     queued = conn.execute("SELECT payload_json FROM send_queue").fetchone()
     assert "Nothing to order" in queued["payload_json"]  # recomputed, not stale
@@ -228,6 +243,7 @@ def test_order_context_cash_vs_needed(conn):
     set_float(conn, SHOP, {"cash": 50000})
     save_reminder(conn, SHOP, datetime(2026, 10, 29, 5, 30, tzinfo=SAST),
                   "take this order to the shop", {"kind": "order"})
+    _open_window(conn, SHOP, datetime(2026, 10, 29, 5, 0, tzinfo=SAST))
     send_due(conn, datetime(2026, 10, 29, 5, 31))
     import json as _json
     queued = conn.execute("SELECT payload_json FROM send_queue").fetchone()
@@ -247,6 +263,7 @@ def test_customer_context(conn):
         {"kind": "customer", "name": "Sipho"}
     save_reminder(conn, SHOP, datetime(2026, 10, 27, 7, 0, tzinfo=SAST),
                   "collect from sipho", {"kind": "customer", "name": "Sipho"})
+    _open_window(conn, SHOP, datetime(2026, 10, 27, 6, 30, tzinfo=SAST))
     send_due(conn, datetime(2026, 10, 27, 7, 1))
     queued = conn.execute("SELECT payload_json FROM send_queue").fetchone()
     assert "Sipho owes R40.00" in queued["payload_json"]

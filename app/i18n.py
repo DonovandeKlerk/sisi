@@ -2937,3 +2937,53 @@ STRINGS["xh"].update({
     "unsupported_video": "📹 Andikwazi ukubukela iividiyo okwangoku — thumela ifoto okanye i-voice note.",
     "unsupported_doc": "📄 Andikwazi ukufunda iifayile okwangoku — thumela ifoto yephepha.",
 })
+
+
+STRINGS["en"].update({
+    "ord_partial_head": "⚠️ *Partly saved*",
+    "ord_part_fail": "❌ Some tasks failed — reply Yes to retry the rest.",
+    "rem_retry_none": "✅ No stuck reminders — all clear.",
+    "rem_retry_done": "🔁 {ok} re-queued, {stuck} still blocked (outside the 24h window).",
+    "rem_st_blocked": "⛔ blocked: {reason}",
+    "rem_st_failed": "❌ failed: {detail}",
+    "rem_st_queued": "⏳ queued",
+    "rem_st_submitted": "📤 sent, awaiting delivery",
+    "rem_blocked_window": "outside the WhatsApp 24h window (no template set)",
+    "rem_plan_stuck": "⏰ *{n} reminders stuck* outside the WhatsApp window — send 'retry reminders'.",
+})
+STRINGS["zu"].update({
+    "ord_partial_head": "⚠️ *Kulondolozwe ingxenye*",
+    "ord_part_fail": "❌ Eminye imisebenzi yehlulekile — phendula Yebo ukuzama futhi.",
+    "rem_retry_none": "✅ Azikho izikhumbuzo ezibambekile — konke kuhle.",
+    "rem_retry_done": "🔁 {ok} zibuyiselwe emgqeni, {stuck} zisavimbiwe (ngaphandle kwewindi lamahora angu-24).",
+    "rem_st_blocked": "⛔ kuvinjiwe: {reason}",
+    "rem_st_failed": "❌ yehlulekile: {detail}",
+    "rem_st_queued": "⏳ semgqeni",
+    "rem_st_submitted": "📤 kuthunyelwe, kulindwe ukufika",
+    "rem_blocked_window": "ngaphandle kwewindi lamahora angu-24 le-WhatsApp (ayikho itemplate)",
+    "rem_plan_stuck": "⏰ *Izikhumbuzo ezingu-{n} zibambekile* ngaphandle kwewindi le-WhatsApp — thumela 'retry reminders'.",
+})
+STRINGS["af"].update({
+    "ord_partial_head": "⚠️ *Gedeeltelik gestoor*",
+    "ord_part_fail": "❌ Sommige take het gefaal — antwoord Ja om weer te probeer.",
+    "rem_retry_none": "✅ Geen vasgehaakte herinneringe — alles is reg.",
+    "rem_retry_done": "🔁 {ok} weer in die ry, {stuck} steeds geblokkeer (buite die 24-uur-venster).",
+    "rem_st_blocked": "⛔ geblokkeer: {reason}",
+    "rem_st_failed": "❌ gefaal: {detail}",
+    "rem_st_queued": "⏳ in die ry",
+    "rem_st_submitted": "📤 gestuur, wag vir aflewering",
+    "rem_blocked_window": "buite die WhatsApp-24-uur-venster (geen templaat opgestel nie)",
+    "rem_plan_stuck": "⏰ *{n} herinneringe vas* buite die WhatsApp-venster — stuur 'retry reminders'.",
+})
+STRINGS["xh"].update({
+    "ord_partial_head": "⚠️ *Kugcine inxenye*",
+    "ord_part_fail": "❌ Eminye imisebenzi ayiphumelelanga — phendula Ewe ukuphinda uzame.",
+    "rem_retry_none": "✅ Akukho zikhumbuzo zibambekileyo — konke kulungile.",
+    "rem_retry_done": "🔁 {ok} zibuyiselwe emgceni, {stuck} zisavaliwe (ngaphandle kwefestile yeeyure ezingama-24).",
+    "rem_st_blocked": "⛔ kuvaliwe: {reason}",
+    "rem_st_failed": "❌ ayiphumelelanga: {detail}",
+    "rem_st_queued": "⏳ semgceni",
+    "rem_st_submitted": "📤 kuthunyelwe, kulindwe ukufika",
+    "rem_blocked_window": "ngaphandle kwefestile yeeyure ezingama-24 ze-WhatsApp (akukho template)",
+    "rem_plan_stuck": "⏰ *Izikhumbuzo ezingu-{n} zibambekile* ngaphandle kwefestile ye-WhatsApp — thumela 'retry reminders'.",
+})

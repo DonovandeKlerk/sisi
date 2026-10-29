@@ -80,6 +80,16 @@ def test_parse_text_audio_image():
     assert msgs[0].media_url == "https://m.test/i"
 
 
+def test_parse_video_and_file_are_graceful_kinds():
+    msgs = parse_vonage_webhook(_vg_payload({"message_type": "video",
+                                             "video": {"url": "https://m.test/v"}}))
+    assert len(msgs) == 1 and msgs[0].kind == "media:video"
+    msgs = parse_vonage_webhook(_vg_payload({"message_type": "file",
+                                             "file": {"url": "https://m.test/d"}},
+                                            "vg-uuid-9"))
+    assert len(msgs) == 1 and msgs[0].kind == "media:document"
+
+
 def test_parse_reply_unknown_and_garbage():
     msgs = parse_vonage_webhook(_vg_payload({"message_type": "reply",
                                              "reply": {"id": "Yes", "title": "Yes"}}))
@@ -229,6 +239,28 @@ def _scripted_llm(monkeypatch):
 
 def _post_vonage(client, message, mid="vg-uuid-1"):
     return client.post("/webhook/vonage", json=_vg_payload(message, mid))
+
+
+def test_vonage_video_gets_graceful_reply(vg_env, monkeypatch):
+    fake = _FakePost()
+    monkeypatch.setattr(vonage.httpx, "post", fake)
+    client = TestClient(app)
+    r = _post_vonage(client, {"message_type": "video",
+                              "video": {"url": "https://m.test/v"}}, "vg-vid-1")
+    assert r.status_code == 200
+    assert len(fake.calls) == 1
+    assert "can't watch videos" in fake.calls[0]["json"]["text"]
+
+
+def test_vonage_file_gets_graceful_reply(vg_env, monkeypatch):
+    fake = _FakePost()
+    monkeypatch.setattr(vonage.httpx, "post", fake)
+    client = TestClient(app)
+    r = _post_vonage(client, {"message_type": "file",
+                              "file": {"url": "https://m.test/d"}}, "vg-doc-1")
+    assert r.status_code == 200
+    assert len(fake.calls) == 1
+    assert "can't read files" in fake.calls[0]["json"]["text"]
 
 
 def test_vonage_text_end_to_end(vg_env, monkeypatch):

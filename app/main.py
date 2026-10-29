@@ -33,6 +33,7 @@ from app.whatsapp import (
     IncomingMessage,
     download_media,
     get_sender,
+    parse_statuses,
     parse_webhook,
     verify_signature,
 )
@@ -95,7 +96,10 @@ async def webhook_receive(request: Request, background_tasks: BackgroundTasks):
     except ValueError:
         return {"status": "ignored"}
     msgs = parse_webhook(payload)
-    if not msgs:
+    statuses = parse_statuses(payload)
+    if statuses:
+        _apply_dlrs(statuses)
+    if not msgs and not statuses:
         log.warning("meta inbound dropped: no messages keys=%s",
                     sorted(payload.keys()) if isinstance(payload, dict) else "?")
     for msg in msgs:
@@ -108,6 +112,27 @@ async def webhook_receive(request: Request, background_tasks: BackgroundTasks):
             log.warning("mark-read failed", exc_info=True)
         _dispatch(background_tasks, msg)
     return {"status": "ok"}
+
+
+def _apply_dlrs(reports: list[tuple[str, str, str]]) -> None:
+    """Correlate delivery reports to reminders. Never raises."""
+    if not reports:
+        return
+    try:
+        from app.reminders import record_dlr
+        conn = connect()
+        try:
+            init_db(conn)
+            for provider_id, outcome, detail in reports:
+                try:
+                    record_dlr(conn, provider_id, outcome, detail)
+                except Exception:
+                    log.warning("dlr apply failed id=%s", provider_id,
+                                exc_info=True)
+        finally:
+            conn.close()
+    except Exception:
+        log.warning("dlr batch failed", exc_info=True)
 
 
 def _dispatch(background_tasks: BackgroundTasks, msg: IncomingMessage) -> None:
@@ -157,8 +182,38 @@ async def webhook_vonage_receive(request: Request, background_tasks: BackgroundT
 
 
 @app.post("/webhook/vonage/status")
-async def webhook_vonage_status():
+async def webhook_vonage_status(request: Request):
+    """Vonage delivery receipts -> reminder states. Always 200."""
+    try:
+        payload = json.loads(await request.body() or b"{}")
+    except ValueError:
+        return {"status": "ignored"}
+    try:
+        reports = parse_vonage_status(payload)
+        if reports:
+            _apply_dlrs(reports)
+    except Exception:
+        log.warning("vonage status parse failed", exc_info=True)
     return {"status": "ok"}
+
+
+def parse_vonage_status(payload: dict) -> list[tuple[str, str, str]]:
+    """Pull [(provider_id, outcome, detail)] from a Vonage receipt."""
+    if not isinstance(payload, dict):
+        return []
+    msg = payload.get("message")
+    node = msg if isinstance(msg, dict) else payload
+    mid = node.get("message_uuid") or payload.get("message_uuid") or ""
+    status = str(node.get("status") or payload.get("status") or "").lower()
+    if not mid or not status:
+        return []
+    if status in ("delivered", "read", "seen"):
+        return [(mid, "delivered", "")]
+    if status in ("failed", "undelivered", "rejected", "expired"):
+        err = node.get("error") or {}
+        detail = err.get("detail", "") if isinstance(err, dict) else ""
+        return [(mid, "failed", detail or f"vonage {status}")]
+    return [(mid, "submitted", "")]
 
 
 @app.post("/webhook/infobip/dlr")
@@ -173,6 +228,7 @@ async def webhook_infobip_dlr(request: Request):
         return {"status": "ignored"}
     try:
         results = payload.get("results", []) if isinstance(payload, dict) else []
+        reports: list[tuple[str, str, str]] = []
         if isinstance(results, list):
             for r in results:
                 if not isinstance(r, dict):
@@ -181,6 +237,20 @@ async def webhook_infobip_dlr(request: Request):
                 name = status.get("name") if isinstance(status, dict) else status
                 log.info("infobip dlr id=%s to=%s status=%s", r.get("messageId"),
                          r.get("to"), name)
+                mid = r.get("messageId", "")
+                upper = str(name or "").upper()
+                if not mid:
+                    continue
+                if "DELIVER" in upper or upper in ("READ", "SEEN"):
+                    reports.append((mid, "delivered", ""))
+                elif "PENDING" in upper or "SENT" in upper or "PAID" in upper:
+                    reports.append((mid, "submitted", ""))
+                else:
+                    desc = status.get("description", "") \
+                        if isinstance(status, dict) else ""
+                    reports.append((mid, "failed", desc or str(name or "failed")))
+        if reports:
+            _apply_dlrs(reports)
     except Exception:
         log.warning("infobip dlr parse failed", exc_info=True)
     return {"status": "ok"}
