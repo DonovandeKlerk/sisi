@@ -335,24 +335,24 @@ def test_both_prices_collected_for_applier(conn, shop):
 
 
 def test_total_cost_asks_basis(conn, shop):
+    # Contract change: a total with a known count assigns directly as a
+    # combined total (packs + basis pinned) — no basis question anymore.
     start_guided_intake(conn, SHOP, [_vprod("Simba Chips Multipack", 2)],
                         [], "add to stock", "mp4")
     msg = answer_intake_session(conn, SHOP, "R20 for both packs")
-    assert "for each pack or for one packet" in msg
+    assert "selling price" in msg  # straight to sell, no basis question
     item = get_intake_session(conn, SHOP)["items_json"][0]
-    assert item["cost_cents"] is None  # assigned nothing
-    assert get_intake_session(conn, SHOP)["field"] == "cost_basis"
-    assert item["packs"] == 2  # "both" cross-filled
-    answer_intake_session(conn, SHOP, "both together")
-    item = get_intake_session(conn, SHOP)["items_json"][0]
-    assert item["cost_cents"] == 2000 and item["cost_basis"] == "pack"
+    assert item["cost_cents"] == 2000 and item["cost_source"] == "stated"
+    assert item["cost_total"] and item["cost_basis"] == "pack"
+    assert item["packs"] == 2
     assert get_intake_session(conn, SHOP)["field"] == "sell"
     answer_intake_session(conn, SHOP, "sell R6")
     answer_intake_session(conn, SHOP, "singles")
-    answer_intake_session(conn, SHOP, "5")
+    msg = answer_intake_session(conn, SHOP, "5")
     assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
     line = get_intake_session(conn, SHOP)["items_json"][0]
     assert line["stock_units"] == 10 and line["cost_cents"] == 200
+    assert "cost R2.00 each (R20.00 total)" in msg
 
 
 def test_pack_context_carveout_existing(conn, shop):
@@ -390,12 +390,15 @@ def test_packs_question_for_unseen_multipack(conn, shop):
 
 
 def test_total_cost_pack_words_keep_split(conn, shop):
+    # Contract change: pack-word totals assign directly as combined
+    # totals (packs + basis pinned) — no basis answer anymore.
     start_guided_intake(conn, SHOP, [_vprod("Simba Chips Multipack", 2)],
                         [], "add to stock", "mp8")
     answer_intake_session(conn, SHOP, "R60 for both packs")
-    answer_intake_session(conn, SHOP, "per pack")  # pack horn, total stands
     item = get_intake_session(conn, SHOP)["items_json"][0]
     assert item["cost_cents"] == 6000 and item["cost_basis"] == "pack"
+    assert item["cost_total"] and item["cost_source"] == "stated"
+    assert get_intake_session(conn, SHOP)["field"] == "sell"
     answer_intake_session(conn, SHOP, "sell R6")
     answer_intake_session(conn, SHOP, "singles")
     answer_intake_session(conn, SHOP, "5")
@@ -1119,17 +1122,20 @@ def test_review_second_yes_mid_session_saves_nothing(conn, shop):
 
 
 def test_review_total_cost_single_basis_overrides(conn, shop):
+    # Contract change: the basis question is gone for known-count
+    # totals; a per-single reading overrides via preview correction.
     start_guided_intake(conn, SHOP, [_vprod("Simba Chips Multipack", 2)],
                         [], "add to stock", "t7e")
-    msg = answer_intake_session(conn, SHOP, "R20 for both packs")
-    assert "for each pack or for one packet" in msg
-    answer_intake_session(conn, SHOP, "each packet")  # per-single: total out
-    item = get_intake_session(conn, SHOP)["items_json"][0]
-    assert item["cost_cents"] == 2000 and item["cost_basis"] == "single"
-    assert not item["cost_total"]
+    answer_intake_session(conn, SHOP, "R20 for both packs")
     answer_intake_session(conn, SHOP, "sell R6")
     answer_intake_session(conn, SHOP, "singles")
     answer_intake_session(conn, SHOP, "5")
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+    answer_intake_session(conn, SHOP,
+                          "cost R20 each packet")  # per-single: total out
+    item = get_intake_session(conn, SHOP)["items_json"][0]
+    assert item["cost_cents"] == 2000 and item["cost_basis"] == "single"
+    assert not item["cost_total"]
     assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
     line = get_intake_session(conn, SHOP)["items_json"][0]
     assert line["stock_units"] == 10 and line["cost_cents"] == 2000
@@ -1381,3 +1387,357 @@ def test_expiry_photo_mid_session_flows_to_expiry_path(conn, shop,
     assert "'add'" not in reply  # ...not the stock add/new choice
     after = json.dumps(get_intake_session(conn, SHOP), sort_keys=True)
     assert after == before  # session byte-intact, nothing stashed
+
+
+# Stated-price total basis: combined totals split, never per-unit --------
+
+def _assert_preview_fits(conn):
+    for line in get_pending(conn, SHOP)["preview_text"].splitlines():
+        assert len(line) <= 120, line
+
+
+def test_total_cost_direct_posts_packs_times_per_pack(conn, shop):
+    from app import agent as agent_mod
+    start_guided_intake(conn, SHOP, [_vprod("Simba Chips Multipack", 2)],
+                        [], "add to stock", "tot-a")
+    answer_intake_session(conn, SHOP, "R60 for both packs")
+    answer_intake_session(conn, SHOP, "sell R6")
+    answer_intake_session(conn, SHOP, "singles")
+    answer_intake_session(conn, SHOP, "5")
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+    agent_mod.handle_text(conn, SHOP, "yes")
+    moves = conn.execute("SELECT kind, amount_cents FROM cash_moves"
+                         " WHERE shop_id = ? AND reversed = 0",
+                         (SHOP,)).fetchall()
+    assert [(m["kind"], m["amount_cents"]) for m in moves] == \
+        [("purchase", -6000)]  # 2 packs x R30, never 10 x R30
+
+
+def test_sell_total_singles_splits_and_shows_basis(conn, shop):
+    from app import agent as agent_mod
+    start_guided_intake(conn, SHOP, [_vprod("Simba Chips Multipack", 2)],
+                        [], "add to stock", "tot-b")
+    answer_intake_session(conn, SHOP, "R20")
+    answer_intake_session(conn, SHOP, "sell R40 for both packs")
+    item = get_intake_session(conn, SHOP)["items_json"][0]
+    assert item["sell_cents"] == 4000  # stated whole kept, never per-unit
+    assert item["sell_total"] and item["sell_source"] == "stated"
+    assert get_intake_session(conn, SHOP)["field"] == "sell_unit"  # no preset
+    answer_intake_session(conn, SHOP, "singles")
+    answer_intake_session(conn, SHOP, "5")
+    assert get_intake_session(conn, SHOP)["field"] == "cost_basis"
+    msg = answer_intake_session(conn, SHOP, "each pack")
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+    line = get_intake_session(conn, SHOP)["items_json"][0]
+    assert line["stock_units"] == 10 and line["sell_cents"] == 4000
+    assert guided_pack_totals(line)["price_cents"] == 400  # 4000/2/5
+    assert "sells R4.00 each (R40.00 total)" in msg
+    _assert_preview_fits(conn)
+    agent_mod.handle_text(conn, SHOP, "yes")
+    row = conn.execute("SELECT price_cents FROM products"
+                       " WHERE shop_id = ? AND name = ?",
+                       (SHOP, "Simba Chips Multipack")).fetchone()
+    assert row["price_cents"] == 400  # split single, never the R40 whole
+
+
+def test_sell_total_whole_is_per_pack(conn, shop):
+    from app import agent as agent_mod
+    start_guided_intake(conn, SHOP, [_vprod("Simba Chips Multipack", 2)],
+                        [], "add to stock", "tot-c")
+    answer_intake_session(conn, SHOP, "R20")
+    answer_intake_session(conn, SHOP, "sell R40 for both packs")
+    msg = answer_intake_session(conn, SHOP, "whole")
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+    line = get_intake_session(conn, SHOP)["items_json"][0]
+    assert guided_pack_totals(line)["pack_price_cents"] == 2000  # 4000/2
+    assert "sells R20.00 per pack (R40.00 total)" in msg
+    _assert_preview_fits(conn)
+    agent_mod.handle_text(conn, SHOP, "yes")
+    row = conn.execute("SELECT price_cents, pack_price_cents FROM products"
+                       " WHERE shop_id = ? AND name = ?",
+                       (SHOP, "Simba Chips Multipack")).fetchone()
+    assert row["pack_price_cents"] == 2000 and row["price_cents"] is None
+
+
+def test_sell_total_both_asks_pack_sell(conn, shop):
+    start_guided_intake(conn, SHOP, [_vprod("Simba Chips Multipack", 2)],
+                        [], "add to stock", "tot-d")
+    answer_intake_session(conn, SHOP, "R20")
+    answer_intake_session(conn, SHOP, "sell R40 for both packs")
+    answer_intake_session(conn, SHOP, "both")
+    answer_intake_session(conn, SHOP, "5")
+    msg = answer_intake_session(conn, SHOP, "each pack")
+    assert "per pack" in msg  # pack price still asked
+    assert get_intake_session(conn, SHOP)["field"] == "pack_sell"
+    msg = answer_intake_session(conn, SHOP, "R25")
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+    line = get_intake_session(conn, SHOP)["items_json"][0]
+    assert line["sell_cents"] == 4000 and line["pack_sell_cents"] == 2500
+    totals = guided_pack_totals(line)
+    assert totals["price_cents"] == 400 and totals["pack_price_cents"] == 2500
+    assert "sells R4.00 each (R40.00 total) + R25.00 per pack" in msg
+    _assert_preview_fits(conn)
+
+
+def test_pack_sell_total_both_splits_saves_and_renders(conn, shop):
+    from app import agent as agent_mod
+    start_guided_intake(conn, SHOP, [_vprod("Simba Chips Multipack", 2)],
+                        [], "add to stock", "tot-m1")
+    answer_intake_session(conn, SHOP, "R20")
+    answer_intake_session(conn, SHOP, "sell R40 for both packs")
+    answer_intake_session(conn, SHOP, "both")
+    answer_intake_session(conn, SHOP, "5")
+    answer_intake_session(conn, SHOP, "each pack")
+    assert get_intake_session(conn, SHOP)["field"] == "pack_sell"
+    msg = answer_intake_session(conn, SHOP, "R50 for both packs")
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+    line = get_intake_session(conn, SHOP)["items_json"][0]
+    assert line["pack_sell_cents"] == 5000 and line["pack_sell_total"]
+    totals = guided_pack_totals(line)
+    assert totals["price_cents"] == 400  # 4000/2/5
+    assert totals["pack_price_cents"] == 2500  # 5000/2, never 5000
+    assert "sells R4.00 each + R25.00 per pack " \
+        "(R40.00+R50.00 totals)" in msg
+    _assert_preview_fits(conn)
+    conn.execute("UPDATE shops SET language = 'zu' WHERE shop_id = ?",
+                 (SHOP,))
+    propose_intake_item(conn, SHOP, 0)  # longest shape in a long locale
+    _assert_preview_fits(conn)
+    conn.execute("UPDATE shops SET language = 'en' WHERE shop_id = ?",
+                 (SHOP,))
+    agent_mod.handle_text(conn, SHOP, "yes")
+    row = conn.execute("SELECT price_cents, pack_price_cents FROM products"
+                       " WHERE shop_id = ? AND name = ?",
+                       (SHOP, "Simba Chips Multipack")).fetchone()
+    assert row["price_cents"] == 400
+    assert row["pack_price_cents"] == 2500
+
+
+def test_pack_sell_total_only_renders_ptot(conn, shop):
+    from app import agent as agent_mod
+    start_guided_intake(conn, SHOP, [_vprod("Simba Chips Multipack", 2)],
+                        [], "add to stock", "tot-m2")
+    answer_intake_session(conn, SHOP, "R20")
+    answer_intake_session(conn, SHOP, "sell R4")
+    answer_intake_session(conn, SHOP, "both")
+    answer_intake_session(conn, SHOP, "5")
+    answer_intake_session(conn, SHOP, "each pack")
+    msg = answer_intake_session(conn, SHOP, "R50 for both packs")
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+    line = get_intake_session(conn, SHOP)["items_json"][0]
+    assert not line.get("sell_total") and line["pack_sell_total"]
+    assert "sells R4.00 each + R25.00 per pack (R50.00 total)" in msg
+    _assert_preview_fits(conn)
+    agent_mod.handle_text(conn, SHOP, "yes")
+    row = conn.execute("SELECT price_cents, pack_price_cents FROM products"
+                       " WHERE shop_id = ? AND name = ?",
+                       (SHOP, "Simba Chips Multipack")).fetchone()
+    assert row["price_cents"] == 400
+    assert row["pack_price_cents"] == 2500
+
+
+def test_cost_total_whole_renders_pack_basis(conn, shop):
+    from app import agent as agent_mod
+    start_guided_intake(conn, SHOP, [_vprod("Simba Chips Multipack", 2)],
+                        [], "add to stock", "tot-m3")
+    answer_intake_session(conn, SHOP, "R60 for both packs")
+    answer_intake_session(conn, SHOP, "sell R25")
+    msg = answer_intake_session(conn, SHOP, "whole")
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+    assert "cost R30.00 per pack (R60.00 total)" in msg
+    _assert_preview_fits(conn)
+    agent_mod.handle_text(conn, SHOP, "yes")
+    moves = conn.execute("SELECT kind, amount_cents FROM cash_moves"
+                         " WHERE shop_id = ? AND reversed = 0",
+                         (SHOP,)).fetchall()
+    assert [(m["kind"], m["amount_cents"]) for m in moves] == \
+        [("purchase", -6000)]
+    row = conn.execute("SELECT cost_cents FROM products"
+                       " WHERE shop_id = ? AND name = ?",
+                       (SHOP, "Simba Chips Multipack")).fetchone()
+    assert row["cost_cents"] == 3000  # 6000/2 per pack, never 6000
+
+
+def test_cost_total_unknown_packs_stash_and_release(conn, shop):
+    start_guided_intake(conn, SHOP, [_vprod("Whey Protein 2kg", 1)],
+                        [], "add to stock", "tot-e")
+    msg = answer_intake_session(conn, SHOP, "R40 total for the packs")
+    item = get_intake_session(conn, SHOP)["items_json"][0]
+    assert item["cost_cents"] is None  # nothing assigned yet
+    assert item["cost_stash"] == 4000 and item["cost_total"]
+    assert get_intake_session(conn, SHOP)["field"] == "packs"
+    assert "How many packs" in msg
+    answer_intake_session(conn, SHOP, "2")
+    item = get_intake_session(conn, SHOP)["items_json"][0]
+    assert item["cost_cents"] == 4000 and item["cost_source"] == "stated"
+    assert item["cost_total"] and item["cost_basis"] == "pack"
+    assert item["cost_stash"] is None and item["packs"] == 2
+    assert get_intake_session(conn, SHOP)["field"] == "sell"
+
+
+def test_sell_total_unknown_packs_stash_and_release(conn, shop):
+    start_guided_intake(conn, SHOP, [_vprod("Whey Protein 2kg", 1)],
+                        [], "add to stock", "tot-f")
+    answer_intake_session(conn, SHOP, "R20")
+    msg = answer_intake_session(conn, SHOP, "sell R40 total for the packs")
+    item = get_intake_session(conn, SHOP)["items_json"][0]
+    assert item["sell_cents"] is None
+    assert item["sell_stash"] == 4000 and item["sell_total"]
+    assert get_intake_session(conn, SHOP)["field"] == "packs"
+    assert "How many packs" in msg
+    answer_intake_session(conn, SHOP, "2")
+    item = get_intake_session(conn, SHOP)["items_json"][0]
+    assert item["sell_cents"] == 4000 and item["sell_source"] == "stated"
+    assert item["sell_total"] and item["sell_stash"] is None
+    assert get_intake_session(conn, SHOP)["field"] == "sell_unit"
+
+
+def test_preview_sell_total_correction_splits(conn, shop):
+    from app import agent as agent_mod
+    _drive_singles_to_preview(conn)
+    msg = answer_intake_session(conn, SHOP, "sell R40 for both packs")
+    line = get_intake_session(conn, SHOP)["items_json"][0]
+    assert line["sell_cents"] == 4000 and line["sell_total"]
+    assert guided_pack_totals(line)["price_cents"] == 400
+    assert "sells R4.00 each (R40.00 total)" in msg
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+    _assert_preview_fits(conn)
+    agent_mod.handle_text(conn, SHOP, "yes")
+    row = conn.execute("SELECT price_cents FROM products"
+                       " WHERE shop_id = ? AND name = ?",
+                       (SHOP, "Simba Chips Multipack")).fetchone()
+    assert row["price_cents"] == 400
+
+
+def test_preview_cost_total_correction_posts_packs(conn, shop):
+    from app import agent as agent_mod
+    _drive_singles_to_preview(conn)
+    answer_intake_session(conn, SHOP, "cost R60 for both packs")
+    line = get_intake_session(conn, SHOP)["items_json"][0]
+    assert line["cost_cents"] == 600  # 6000/2/5 per single
+    assert guided_pack_totals(line)["cost_cents"] == 600
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+    agent_mod.handle_text(conn, SHOP, "yes")
+    moves = conn.execute("SELECT kind, amount_cents FROM cash_moves"
+                         " WHERE shop_id = ? AND reversed = 0",
+                         (SHOP,)).fetchall()
+    assert [(m["kind"], m["amount_cents"]) for m in moves] == \
+        [("purchase", -6000)]
+
+
+def test_plain_price_correction_clears_total(conn, shop):
+    start_guided_intake(conn, SHOP, [_vprod("Simba Chips Multipack", 2)],
+                        [], "add to stock", "tot-i")
+    answer_intake_session(conn, SHOP, "R20")
+    answer_intake_session(conn, SHOP, "sell R40 for both packs")
+    answer_intake_session(conn, SHOP, "singles")
+    answer_intake_session(conn, SHOP, "5")
+    answer_intake_session(conn, SHOP, "each pack")
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+    msg = answer_intake_session(conn, SHOP, "sell R6 each")
+    line = get_intake_session(conn, SHOP)["items_json"][0]
+    assert line["sell_cents"] == 600 and not line["sell_total"]
+    assert line["sell_stash"] is None
+    assert guided_pack_totals(line)["price_cents"] == 600  # never split
+    assert "sells R6.00 each (you said)" in msg
+
+
+def test_sell_total_unit_change_recomputes(conn, shop):
+    start_guided_intake(conn, SHOP, [_vprod("Simba Chips Multipack", 2)],
+                        [], "add to stock", "tot-j")
+    answer_intake_session(conn, SHOP, "R20")
+    answer_intake_session(conn, SHOP, "sell R40 for both packs")
+    answer_intake_session(conn, SHOP, "singles")
+    answer_intake_session(conn, SHOP, "5")
+    answer_intake_session(conn, SHOP, "each pack")
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+    msg = answer_intake_session(conn, SHOP, "whole")
+    line = get_intake_session(conn, SHOP)["items_json"][0]
+    assert guided_pack_totals(line)["pack_price_cents"] == 2000
+    assert "sells R20.00 per pack (R40.00 total)" in msg
+    msg = answer_intake_session(conn, SHOP, "singles")
+    line = get_intake_session(conn, SHOP)["items_json"][0]
+    assert guided_pack_totals(line)["price_cents"] == 400
+    assert "sells R4.00 each (R40.00 total)" in msg
+    _assert_preview_fits(conn)
+
+
+def test_sell_total_per_pack_change_renormalizes(conn, shop):
+    start_guided_intake(conn, SHOP, [_vprod("Simba Chips Multipack", 2)],
+                        [], "add to stock", "tot-k")
+    answer_intake_session(conn, SHOP, "R20")
+    answer_intake_session(conn, SHOP, "sell R60 for both packs")
+    answer_intake_session(conn, SHOP, "singles")
+    answer_intake_session(conn, SHOP, "5")
+    answer_intake_session(conn, SHOP, "each pack")
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+    answer_intake_session(conn, SHOP, "6 in each pack")
+    line = get_intake_session(conn, SHOP)["items_json"][0]
+    assert line["per_pack"] == 6
+    assert line["sell_cents"] == 6000  # stated whole, never normalized
+    assert guided_pack_totals(line)["price_cents"] == 500  # 6000/2/6
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+
+
+def test_loose_total_splits_over_qty(conn, shop):
+    from app import agent as agent_mod
+    start_guided_intake(conn, SHOP, [_vprod("Whey Protein 2kg", 10)],
+                        [], "add to stock", "tot-l")
+    answer_intake_session(conn, SHOP, "R40 total")
+    item = get_intake_session(conn, SHOP)["items_json"][0]
+    assert item["cost_cents"] == 4000 and item["cost_total"]
+    answer_intake_session(conn, SHOP, "sell R60 total")
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+    line = get_intake_session(conn, SHOP)["items_json"][0]
+    assert line["stock_units"] == 10
+    assert guided_pack_totals(line)["cost_cents"] == 400
+    assert guided_pack_totals(line)["price_cents"] == 600
+    preview = get_pending(conn, SHOP)["preview_text"]
+    assert "cost R4.00 each (R40.00 total)" in preview
+    assert "sells R6.00 each (R60.00 total)" in preview
+    _assert_preview_fits(conn)
+    agent_mod.handle_text(conn, SHOP, "yes")
+    row = conn.execute("SELECT price_cents, cost_cents, stock_qty FROM products"
+                       " WHERE shop_id = ? AND name = ?",
+                       (SHOP, "Whey Protein 2kg")).fetchone()
+    assert (row["price_cents"], row["cost_cents"], row["stock_qty"]) == \
+        (600, 400, 10)
+    moves = conn.execute("SELECT kind, amount_cents FROM cash_moves"
+                         " WHERE shop_id = ? AND reversed = 0",
+                         (SHOP,)).fetchall()
+    assert [(m["kind"], m["amount_cents"]) for m in moves] == \
+        [("purchase", -4000)]
+
+
+def test_preview_shows_per_pack_basis_without_total(conn, shop):
+    _drive_singles_to_preview(conn)
+    preview = get_pending(conn, SHOP)["preview_text"]
+    assert "cost R4.00 each (R20.00/pack)" in preview
+    assert "sells R6.00 each (you said)" in preview
+    _assert_preview_fits(conn)
+
+
+def test_plain_cost_basis_answers_still_apply(conn, shop):
+    # Extra pin: the basis question survives for plain amounts, and its
+    # answers keep their meanings (total-words confirm pack).
+    start_guided_intake(conn, SHOP, [_vprod("Simba Chips Multipack", 2)],
+                        [], "add to stock", "tot-n1")
+    answer_intake_session(conn, SHOP, "R20")
+    answer_intake_session(conn, SHOP, "sell R6")
+    answer_intake_session(conn, SHOP, "singles")
+    answer_intake_session(conn, SHOP, "5")
+    assert get_intake_session(conn, SHOP)["field"] == "cost_basis"
+    answer_intake_session(conn, SHOP, "both together")
+    item = get_intake_session(conn, SHOP)["items_json"][0]
+    assert item["cost_basis"] == "pack" and not item["cost_total"]
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
+    start_guided_intake(conn, SHOP, [_vprod("Simba Chips Multipack", 2)],
+                        [], "add to stock", "tot-n2")
+    answer_intake_session(conn, SHOP, "R20")
+    answer_intake_session(conn, SHOP, "sell R6")
+    answer_intake_session(conn, SHOP, "singles")
+    answer_intake_session(conn, SHOP, "5")
+    answer_intake_session(conn, SHOP, "each packet")
+    item = get_intake_session(conn, SHOP)["items_json"][0]
+    assert item["cost_basis"] == "single" and not item["cost_total"]
+    assert get_pending(conn, SHOP)["action_type"] == "stock_intake_item"
