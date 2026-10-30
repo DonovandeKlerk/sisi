@@ -29,15 +29,16 @@ def ledger(conn):
                          (SHOP,)).lastrowid
     for i, (day, qty, total) in enumerate([("2026-10-05", 2, 4000),
                                            ("2026-10-12", 1, 2000)]):
+        # Live record_sale shape: one sale + one credit, SAME action id.
         conn.execute(
             "INSERT INTO sales (shop_id, product_id, product_name, qty, total_cents,"
             " customer_id, action_id, created_at) VALUES (?, ?, 'Bread', ?, ?, ?, ?, ?)",
-            (SHOP, bread, qty, total, sipho, f"st-sale-{i}",
+            (SHOP, bread, qty, total, sipho, f"st-pair-{i}",
              f"{day}T10:00:00.000Z"))
         conn.execute(
             "INSERT INTO credit_entries (shop_id, customer_id, amount_cents,"
             " items_text, action_id, created_at) VALUES (?, ?, ?, 'Bread', ?, ?)",
-            (SHOP, sipho, total, f"st-ce-{i}", f"{day}T10:00:00.000Z"))
+            (SHOP, sipho, total, f"st-pair-{i}", f"{day}T10:00:00.000Z"))
     conn.execute(
         "INSERT INTO payments (shop_id, customer_id, amount_cents, action_id,"
         " created_at) VALUES (?, ?, 1000, 'st-pay-0', '2026-10-20T10:00:00.000Z')",
@@ -148,3 +149,75 @@ def test_reminder_queues_card(conn, ledger):
     assert "Forward this yourself" in out
     assert "Statement card below" in out
     assert take_media(SHOP)
+
+
+def test_credit_only_line_shows_alongside_sales(conn, ledger):
+    # Live 17:24 bug: an add_credit entry (no sale row by design) was
+    # invisible on statements for customers WITH sales rows, while the
+    # total included it. Sipho now has 2 paired lines + 1 credit line.
+    conn.execute(
+        "INSERT INTO credit_entries (shop_id, customer_id, amount_cents,"
+        " items_text, action_id, created_at) VALUES (?, ?, 4200,"
+        " '2x Chappies, 1x Stoney 2L', 'live-add-credit',"
+        " '2026-10-30T15:24:14.000Z')", (SHOP, ledger))
+    conn.commit()
+    data = reports.statement_data(conn, SHOP, "Sipho")
+    assert data["total"] == 9200
+    assert len(data["items"]) == 3
+    assert data["items"][-1]["item"] == "2x Chappies, 1x Stoney 2L"
+    assert data["items"][-1]["cents"] == 4200
+    # Lines minus payments reconcile with the total.
+    assert (sum(i["cents"] for i in data["items"])
+            - sum(p["cents"] for p in data["payments"])) == data["total"]
+
+
+def test_seed_ce_convention_dedupes(conn, ledger):
+    conn.execute(
+        "INSERT INTO credit_entries (shop_id, customer_id, amount_cents,"
+        " items_text, action_id, created_at) VALUES (?, ?, 4000, 'Bread',"
+        " 'st-pair-0-ce', '2026-10-05T10:00:00.000Z')", (SHOP, ledger))
+    conn.commit()
+    data = reports.statement_data(conn, SHOP, "Sipho")
+    assert len(data["items"]) == 2  # still one line per paired event
+
+
+def test_book_page_convention_dedupes(conn, ledger):
+    bread = conn.execute("SELECT id FROM products WHERE shop_id = ?",
+                         (SHOP,)).fetchone()["id"]
+    conn.execute(
+        "INSERT INTO sales (shop_id, product_id, product_name, qty, total_cents,"
+        " customer_id, action_id, created_at) VALUES (?, ?, 'Bread', 1, 2000,"
+        " ?, 'book9-sc0', '2026-10-15T12:00:00.000Z')", (SHOP, bread, ledger))
+    conn.execute(
+        "INSERT INTO credit_entries (shop_id, customer_id, amount_cents,"
+        " items_text, action_id, created_at) VALUES (?, ?, 2000, 'Bread',"
+        " 'book9-c0', '2026-10-15T12:00:00.000Z')", (SHOP, ledger))
+    conn.commit()
+    data = reports.statement_data(conn, SHOP, "Sipho")
+    assert len(data["items"]) == 3  # book pair shows once
+    assert [i["date"] for i in data["items"]] == ["2026-10-05", "2026-10-12",
+                                                  "2026-10-15"]
+
+
+def test_credit_only_customer_still_lists(conn, ledger):
+    z = conn.execute("INSERT INTO customers (shop_id, name) VALUES (?, 'Zodwa')",
+                     (SHOP,)).lastrowid
+    conn.execute(
+        "INSERT INTO credit_entries (shop_id, customer_id, amount_cents,"
+        " items_text, action_id, created_at) VALUES (?, ?, 3000, 'groceries',"
+        " 'solo-1', '2026-10-20T10:00:00.000Z')", (SHOP, z))
+    conn.commit()
+    data = reports.statement_data(conn, SHOP, "Zodwa")
+    assert [(i["item"], i["cents"]) for i in data["items"]] == [("groceries", 3000)]
+    assert data["total"] == 3000
+
+
+def test_merged_lines_sort_chronologically(conn, ledger):
+    conn.execute(
+        "INSERT INTO credit_entries (shop_id, customer_id, amount_cents,"
+        " items_text, action_id, created_at) VALUES (?, ?, 500, 'sweets',"
+        " 'mid-1', '2026-10-08T10:00:00.000Z')", (SHOP, ledger))
+    conn.commit()
+    data = reports.statement_data(conn, SHOP, "Sipho")
+    assert [i["date"] for i in data["items"]] == ["2026-10-05", "2026-10-08",
+                                                  "2026-10-12"]

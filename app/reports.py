@@ -669,6 +669,25 @@ def _money_bar(story, st, parts, width=440):
     story.append(d)
 
 
+def _credit_covered_by_sale(aid: str, sale_actions: set) -> bool:
+    """True when a credit entry duplicates a sale line already shown.
+
+    add_credit writes NO sale row (by design) so its entries must show;
+    every other credit writer pairs with a sale that carries the detail:
+    same action (live credit sales), "{X}-ce" (seed), "{A}-c{i}" (book
+    pages pair with "{A}-sc{i}").
+    """
+    aid = aid or ""
+    if aid in sale_actions:
+        return True
+    if aid.endswith("-ce") and aid[:-3] in sale_actions:
+        return True
+    head, sep, tail = aid.rpartition("-c")
+    if sep and tail.isdigit() and f"{head}-sc{tail}" in sale_actions:
+        return True
+    return False
+
+
 def statement_data(conn, shop_id: str, customer: str) -> dict | None:
     """Ledger-truth statement: item lines, payments, outstanding total."""
     tools.ensure_shop(conn, shop_id)
@@ -676,25 +695,32 @@ def statement_data(conn, shop_id: str, customer: str) -> dict | None:
     if cust is None:
         return None
     rows = conn.execute(
-        "SELECT s.created_at, s.product_name, s.qty, s.total_cents,"
+        "SELECT s.created_at, s.product_name, s.qty, s.total_cents, s.action_id,"
         " p.pack_name, p.pack_size FROM sales s"
         " LEFT JOIN products p ON p.id = s.product_id"
         " WHERE s.shop_id = ? AND s.customer_id = ? AND s.reversed = 0"
         " ORDER BY s.created_at", (shop_id, cust["id"])).fetchall()
+    sale_actions = {r["action_id"] for r in rows}
     items = [{
         "date": (r["created_at"] or "")[:10],
+        "_ts": r["created_at"] or "",
         "item": r["product_name"],
         "qty": tools._fmt_on_hand(r["qty"] or 0, r["pack_name"], r["pack_size"]),
         "cents": r["total_cents"],
     } for r in rows]
-    if not items:
-        for e in conn.execute(
-                "SELECT created_at, items_text, amount_cents FROM credit_entries"
-                " WHERE shop_id = ? AND customer_id = ? AND reversed = 0"
-                " ORDER BY created_at", (shop_id, cust["id"])).fetchall():
-            items.append({"date": (e["created_at"] or "")[:10],
-                          "item": e["items_text"] or _t("stmt_item_credit"),
-                          "qty": "", "cents": e["amount_cents"]})
+    for e in conn.execute(
+            "SELECT created_at, items_text, amount_cents, action_id FROM credit_entries"
+            " WHERE shop_id = ? AND customer_id = ? AND reversed = 0"
+            " ORDER BY created_at", (shop_id, cust["id"])).fetchall():
+        if _credit_covered_by_sale(e["action_id"], sale_actions):
+            continue
+        items.append({"date": (e["created_at"] or "")[:10],
+                      "_ts": e["created_at"] or "",
+                      "item": e["items_text"] or _t("stmt_item_credit"),
+                      "qty": "", "cents": e["amount_cents"]})
+    items.sort(key=lambda it: it["_ts"])
+    for it in items:
+        del it["_ts"]
     pays = [{
         "date": (r["created_at"] or "")[:10], "cents": r["amount_cents"],
     } for r in conn.execute(
