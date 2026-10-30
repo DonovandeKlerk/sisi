@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sqlite3
 from contextvars import ContextVar
 from datetime import date, datetime, timezone
@@ -22,7 +23,7 @@ log = logging.getLogger("sisi.db")
 if TYPE_CHECKING:  # pragma: no cover
     from turso_serverless.connection import Connection as _TursoConnection
 
-DbConnection = Union["sqlite3.Connection", "_TursoConnection"]
+DbConnection = Union["sqlite3.Connection", "_TursoConnection", "TursoReconnect"]
 
 try:
     from turso_serverless.dbapi import Error as _TursoError
@@ -476,18 +477,103 @@ def enforce_read_only(conn: DbConnection) -> None:
     conn.set_authorizer(_auth)
 
 
+_STREAM_LOST = re.compile(r"stream (not found|expired|closed)",
+                            re.IGNORECASE)
+
+
+class TursoReconnect:
+    """A Turso connection that survives idle stream expiry.
+
+    Turso serverless streams die after ~a minute without statements; any
+    flow holding one connection across slow model calls (a photo spans
+    vision + planner) trips over the next query with HTTP 404 'stream
+    not found'. On that error — and only that — with no transaction
+    open, reconnect once and retry the statement: nothing uncommitted
+    can be lost because the driver confirms nothing was pending. With
+    an open transaction the writes are already gone server-side, so
+    fail loud instead of pretending success. sqlite3 is never wrapped.
+    """
+
+    _OWN = frozenset({"_url", "_token", "_conn"})
+
+    def __init__(self, url: str, token: str):
+        object.__setattr__(self, "_url", url)
+        object.__setattr__(self, "_token", token)
+        object.__setattr__(self, "_conn", self._fresh())
+
+    def _fresh(self):
+        from turso_serverless import connect as _turso_connect
+        conn = _turso_connect(self._url, auth_token=self._token)
+        # The driver's Row is already sqlite3.Row-like (index + name
+        # access); its factory protocol takes (cursor, row), so pass
+        # the prebuilt row straight through.
+        conn.row_factory = lambda _cur, row: row
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+
+    @staticmethod
+    def _stream_lost(exc: BaseException) -> bool:
+        return _STREAM_LOST.search(str(exc)) is not None
+
+    def _clean(self) -> bool:
+        try:
+            return not self._conn.in_transaction
+        except Exception:
+            return False  # unknown state: fail loud, never drop writes
+
+    def _run(self, op, *args, **kwargs):
+        try:
+            return op(self._conn, *args, **kwargs)
+        except Exception as e:
+            if not self._stream_lost(e) or not self._clean():
+                raise
+            log.warning("turso stream expired mid-request; reconnecting")
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = self._fresh()
+            return op(self._conn, *args, **kwargs)
+
+    def execute(self, sql, parameters=()):
+        return self._run(lambda c: c.execute(sql, parameters))
+
+    def executemany(self, sql, parameters):
+        return self._run(lambda c: c.executemany(sql, parameters))
+
+    def executescript(self, sql_script):
+        return self._run(lambda c: c.executescript(sql_script))
+
+    def commit(self):
+        return self._run(lambda c: c.commit())
+
+    def rollback(self):
+        return self._run(lambda c: c.rollback())
+
+    def close(self):
+        try:
+            self._conn.close()
+        except Exception as e:
+            if not self._stream_lost(e):
+                raise
+
+    def __setattr__(self, name, value):
+        if name in TursoReconnect._OWN:
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._conn, name, value)
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return getattr(object.__getattribute__(self, "_conn"), name)
+
+
 def connect(path: str | Path | None = None) -> DbConnection:
     if path is None:
         url, token = turso_creds()
         if url and token:
-            from turso_serverless import connect as _turso_connect
-            conn = _turso_connect(url, auth_token=token)
-            # The driver's Row is already sqlite3.Row-like (index + name
-            # access); its factory protocol takes (cursor, row), so pass
-            # the prebuilt row straight through.
-            conn.row_factory = lambda _cur, row: row
-            conn.execute("PRAGMA foreign_keys = ON")
-            return conn
+            return TursoReconnect(url, token)
     db_path = Path(path) if path else get_db_path()
     if str(db_path) != ":memory:":
         db_path.parent.mkdir(parents=True, exist_ok=True)

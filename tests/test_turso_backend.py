@@ -203,3 +203,122 @@ def test_enforce_read_only_noop_on_turso_conn(caplog):
     with caplog.at_level(logging.WARNING, logger="sisi.db"):
         enforce_read_only(conn)  # must not raise; proactive gates apply
     assert "backstop unavailable" in caplog.text
+
+
+# --- idle stream expiry: transparent reconnect --------------------------------
+# Live bug (30 Oct 2026): a book photo died with
+#   OperationalError: HTTP status 404: stream not found
+# on the first query after the vision call. Turso serverless streams
+# expire after ~a minute idle; a photo holds one connection across
+# vision + planner. The wrapper reconnects once and retries — but only
+# with no transaction open, so uncommitted writes can never vanish
+# silently. The REAL driver Connection runs over FakeSessions here.
+
+
+STREAM_GONE = RuntimeError("HTTP status 404: stream not found: a1b6:1d57")
+
+
+def _wrap(monkeypatch, first, *rest):
+    """TursoReconnect whose reconnections come from prepared sessions."""
+    import app.db as dbmod
+
+    made = []
+
+    def fake_fresh(self):
+        sess = first if not made else rest[len(made) - 1]
+        made.append(sess)
+        conn = Connection(sess)
+        conn.row_factory = lambda _cur, row: row
+        return conn
+
+    monkeypatch.setattr(dbmod.TursoReconnect, "_fresh", fake_fresh)
+    return dbmod.TursoReconnect("https://x", "tok"), made
+
+
+def test_stream_expiry_reconnects_and_retries(monkeypatch):
+    first = FakeSession({"SELECT a": (["a"], [(1,)])})
+    first.failures["SELECT"] = STREAM_GONE
+    second = FakeSession({"SELECT a": (["a"], [(7,)])})
+    wrap, made = _wrap(monkeypatch, first, second)
+    row = wrap.execute("SELECT a FROM t").fetchone()
+    assert row["a"] == 7  # served by the retry on the fresh stream
+    assert len(made) == 2
+    assert first.statements == ["SELECT a FROM t"]
+    assert second.statements == ["SELECT a FROM t"]
+
+
+def test_stream_expiry_refused_when_dirty(monkeypatch):
+    first = FakeSession()
+    wrap, made = _wrap(monkeypatch, first, FakeSession())
+    wrap.execute("INSERT INTO t (a) VALUES (1)")  # opens a transaction
+    assert wrap.in_transaction is True
+    first.failures["SELECT"] = STREAM_GONE
+    with pytest.raises(TursoOperationalError, match="stream not found"):
+        wrap.execute("SELECT 1")
+    assert len(made) == 1  # no reconnect: the write may already be lost
+
+
+def test_other_errors_not_retried(monkeypatch):
+    first = FakeSession()
+    first.failures["INSERT"] = RuntimeError("UNIQUE constraint failed: t.a")
+    wrap, made = _wrap(monkeypatch, first, FakeSession())
+    with pytest.raises(TursoIntegrityError):
+        wrap.execute("INSERT INTO t (a) VALUES (1)")
+    assert len(made) == 1
+
+
+def test_retry_failure_raises(monkeypatch):
+    first = FakeSession()
+    first.failures["SELECT"] = STREAM_GONE
+    second = FakeSession()
+    second.failures["SELECT"] = STREAM_GONE
+    wrap, made = _wrap(monkeypatch, first, second)
+    with pytest.raises(TursoOperationalError, match="stream not found"):
+        wrap.execute("SELECT 1")
+    assert len(made) == 2  # exactly one reconnect, then fail loud
+
+
+def test_commit_failure_when_dirty_raises(monkeypatch):
+    first = FakeSession()
+    wrap, made = _wrap(monkeypatch, first, FakeSession())
+    wrap.execute("INSERT INTO t (a) VALUES (1)")
+    first.failures["COMMIT"] = STREAM_GONE
+    with pytest.raises(TursoOperationalError, match="stream not found"):
+        wrap.commit()
+    assert len(made) == 1  # never pretend an empty commit succeeded
+
+
+def test_commit_clean_roundtrip(monkeypatch):
+    first = FakeSession()
+    wrap, _made = _wrap(monkeypatch, first)
+    wrap.execute("INSERT INTO t (a) VALUES (1)")
+    wrap.commit()
+    assert first.statements[-1] == "COMMIT"
+    assert wrap.in_transaction is False
+
+
+def test_wrapper_passthrough_and_close(monkeypatch):
+    first = FakeSession()
+    wrap, _made = _wrap(monkeypatch, first)
+    wrap.row_factory = lambda _cur, row: row
+    assert wrap.in_transaction is False
+    assert not hasattr(wrap, "set_authorizer")  # read-only probe stays False
+    wrap.close()
+    assert first.closed is True
+
+
+def test_sqlite_connect_unwrapped():
+    import sqlite3
+
+    import app.db as dbmod
+    assert isinstance(dbmod.connect(":memory:"), sqlite3.Connection)
+
+
+def test_turso_connect_uses_wrapper(monkeypatch):
+    import app.db as dbmod
+
+    monkeypatch.setattr(dbmod, "turso_creds",
+                        lambda: ("https://x", "tok"))
+    monkeypatch.setattr(dbmod.TursoReconnect, "_fresh",
+                        lambda self: _conn(FakeSession()))
+    assert isinstance(dbmod.connect(), dbmod.TursoReconnect)
