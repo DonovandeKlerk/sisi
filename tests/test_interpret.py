@@ -210,6 +210,54 @@ def test_model_failure_is_recoverable(conn, shop, sent, monkeypatch):
     assert _counts(conn)["pending_actions"] == 0
 
 
+def test_malformed_quote_and_options_survive(conn, shop, sent, monkeypatch):
+    # Live bug (30 Oct 2026): a book photo died with "Something went
+    # wrong" twice. Non-string quotes / non-list options crashed
+    # validate_plan with AttributeError/TypeError, escaping interpret's
+    # ValueError-only guard. interpret promises never to raise.
+    _script(monkeypatch, [{
+        "understood": "x",
+        "tasks": [{"kind": "cash", "quote": {"span": "till"},
+                   "args": {}}],
+        "question": None, "options": 5}])
+    before = _counts(conn)
+    msg, _ = agent.handle_text(conn, SHOP, "sell bread", sent)
+    assert msg.strip()  # graceful reply, no raise ...
+    assert _counts(conn) == before  # ... and zero writes
+
+
+def test_validate_plan_coerces_bad_shapes():
+    from app.interpreter import validate_plan
+    plan = validate_plan({
+        "understood": "x",
+        "tasks": [{"kind": "cash", "quote": {"span": "till"},
+                   "args": {}},
+                  {"kind": "cash", "quote": 123, "args": {}}],
+        "question": None, "options": 5})
+    assert [t["quote"] for t in plan["tasks"]] == ["", ""]
+    assert plan["options"] == []
+    plan = validate_plan({"tasks": [], "options": {"a": 1}})
+    assert plan["options"] == []
+
+
+def test_book_photo_bad_quote_graceful(conn, shop, sent, monkeypatch):
+    _script(monkeypatch, [{
+        "understood": "book page",
+        "tasks": [{"kind": "book_page", "quote": ["line", 1],
+                   "args": {}}],
+        "question": None, "options": []}])
+    monkeypatch.setattr(
+        agent, "read_shop_photo",
+        lambda image, shop_id="": {
+            "doc_type": "book_page",
+            "book": {"date": "2026-10-30", "lines": []},
+            "receipt": {}, "products": []})
+    _doc, reply, _buttons = agent.handle_photo(conn, SHOP, b"fake-photo",
+                                               "", sent)
+    assert reply.strip()  # graceful reply, never the friendly crash text
+    assert "Something went wrong" not in reply
+
+
 def test_partial_failure_keeps_good_task(conn, shop, sent, monkeypatch):
     _script(monkeypatch, [_plan(
         [_t("cash"), _t("statement", {"customer": "I"})],

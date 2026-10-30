@@ -236,11 +236,15 @@ def validate_plan(body: dict | None) -> dict:
         if task.get("kind") not in PLAN_KINDS:
             continue
         args = task.get("args")
+        quote = task.get("quote")
         clean.append({"kind": task["kind"],
-                      "quote": _trim(task.get("quote"), 300),
+                      "quote": _trim(quote, 300)
+                      if isinstance(quote, str) else "",
                       "args": args if isinstance(args, dict) else {}})
     question = body.get("question")
-    options = body.get("options") or []
+    options = body.get("options")
+    if not isinstance(options, list):
+        options = []
     return {
         "understood": _clean_understood(body.get("understood")),
         "tasks": clean,
@@ -282,7 +286,7 @@ def interpret(conn: sqlite3.Connection, shop_id: str, text: str, *,
                 "question": _t("llm_dropped"), "options": []}
     try:
         plan = validate_plan(_parse_plan_body(content))
-    except ValueError:
+    except Exception:  # noqa: BLE001 - any malformed plan asks, never crashes
         log.warning("planner output invalid: %r", (content or "")[:200])
         return {"understood": "", "tasks": [],
                 "question": _t("llm_say_again"), "options": []}
