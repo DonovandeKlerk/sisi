@@ -686,7 +686,12 @@ def try_reminder_detail(conn: sqlite3.Connection, shop_id: str,
 
 
 _INTENT_FAMILIES: dict[str, tuple[str, ...]] = {
-    "statement": ("statement", "receipt", "slip", "invoice", "risiti"),
+    "statement": ("statement", "receipt", "slip", "invoice", "risiti",
+                  "isitatimende", "sitatimende", "itatimende",
+                  "istatimenti", "staat", "strokie", "afskrif",
+                  "irisithi", "iresithi", "isiliphu", "something to send",
+                  "to send to", "send it to", "send this to",
+                  "make a picture", "picture for"),
     "reminder": ("remind", "reminder", "khumbuz", "herinner", "snooze"),
     "debtor": ("owe", "owes", "owing", "debt", "balance", "kwelet", "tyala",
                "skuld"),
@@ -905,6 +910,43 @@ def try_affordability(conn: sqlite3.Connection, shop_id: str,
               need=cents_to_rand(need))
 
 
+_SALE_ACTION_WORDS = ("bought", "took", "taken", "add", "added", "put",
+                      "puts", "putting", "gave", "sold", "sell", "sells")
+"""Goods-moving verbs. Imperative request verbs (give, send, get, show,
+make) are NOT here: 'give me a receipt' is the statement itself, not a
+sibling sale."""
+_SALE_ACTION_STEMS = ("thatha", "thathe")
+"""Nguni take/took: substring match so concords (uthathe) still hit."""
+_QTY_WORDS = ("one", "two", "three", "four", "five", "six", "seven",
+              "eight", "nine", "ten", "eleven", "twelve", "dozen", "half",
+              "couple", "few", "several")
+_DEBTOR_COUNT_NOUNS = ("creditors?", "debtors?", "debiteure", "customers?",
+                       "clients?", "people", "persons?", "statements?",
+                       "receipts?", "slips?", "pages?", "copies?",
+                       "abakwelet\\w*", "abatyali\\w*")
+
+
+def _statement_has_sibling(low: str) -> bool:
+    """A statement trigger plus a goods-moving verb or a quantity.
+
+    'Sipho took milk and bread, send his statement' is sale +
+    statement: the fast path must yield so the planner splits them.
+    Bare balance mentions ('he owes R200, send the receipt') stay
+    single-intent, as do debtor counts ('statements for 4 creditors').
+    """
+    scrubbed = re.sub(r"\badds? up\b|\badded up\b", " ", low)
+    if any(re.search(rf"\b{v}\b", scrubbed) for v in _SALE_ACTION_WORDS):
+        return True
+    if any(stem in scrubbed for stem in _SALE_ACTION_STEMS):
+        return True
+    scrubbed = re.sub(
+        r"\b(\d+|" + "|".join(_QTY_WORDS) + r")\s+("
+        + "|".join(_DEBTOR_COUNT_NOUNS) + r")\b", " ", scrubbed)
+    if re.search(r"\b\d+\b|\b(" + "|".join(_QTY_WORDS) + r")\b", scrubbed):
+        return True
+    return False
+
+
 def _looks_multi(text: str) -> bool:
     """Two+ intent families (or clauses): the planner splits the work.
 
@@ -930,8 +972,11 @@ def _looks_multi(text: str) -> bool:
         if fam != "reminder" and any(s in low for s in sigs):
             fams.add(fam)
     if "statement" in fams:
-        # debtors/credit name the statement's subject, not a sibling task
-        fams -= {"debtor", "credit"}
+        if _statement_has_sibling(low):
+            fams.add("sale")  # goods move too: the planner splits them
+        else:
+            # debtors/credit name the statement's subject, not a sibling
+            fams -= {"debtor", "credit"}
     if ":" in bits[0]:
         fams.add("order")  # 'Sipho: 2 bread' has no keyword
     return len(fams) >= 2

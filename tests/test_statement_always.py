@@ -93,6 +93,108 @@ def test_non_statement_guards(conn, ledger):
     assert try_statement_request(conn, SHOP, "send it") is None
 
 
+# --- sale + statement multi-intent -------------------------------------------
+# Live bug (30 Oct 2026): "sipho also took one litre milk, one Marie
+# biscuits and two Chappies, add that to his account and send his
+# statement" rendered ONLY the statement — the fast path swallowed the
+# three sale items. Sale verbs and quantities now force planner routing.
+
+
+def _script(monkeypatch, tmp_path, plans):
+    import json
+    from types import SimpleNamespace
+
+    import app.interpreter as interp
+    import app.llm as llm
+    monkeypatch.setattr(llm, "TOKEN_LOG", tmp_path / "usage.log")
+    calls = {"n": 0}
+
+    def fake(messages):
+        calls["n"] += 1
+        body = plans[min(calls["n"] - 1, len(plans) - 1)]
+        return SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content=json.dumps(body)))],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1,
+                                  total_tokens=2))
+
+    monkeypatch.setattr(interp, "propose_plan", fake)
+    return calls
+
+
+@pytest.mark.parametrize("text", [
+    "sipho also took one litre milk one marie biscuits and two chappies"
+    " please also add that to his account and send me his statement",
+    "Sipho took 2 bread, send his statement",
+    "add 2 bread to Sipho's account and send his statement",
+    "2 bread on Sipho's account, send his statement",
+    "Sipho bought milk, and his statement please",
+    "put one bread on the book and send Sipho's statement",
+    "uSipho uthathe ubisi, ngicela isitatimende sakhe",
+])
+def test_sale_plus_statement_is_multi(text):
+    from app.agent import _looks_multi
+    assert _looks_multi(text) is True, text
+
+
+@pytest.mark.parametrize("text", [
+    "statement for Sipho",
+    "receipt for Sipho",
+    "Sipho's statement",
+    "give me a receipt for Sipho",
+    "what does Sipho owe, make a picture",
+    "send it to Sipho",
+    "something to send Sipho",
+    "ngicela isitatimende sikaSipho",
+    VOICE_TRANSCRIPT,
+    "statements for 4 creditors",
+    "state vir 4 debiteure",
+    "statements for 2 creditors",
+    "statements for 9 creditors",
+    "izitatimende zabantu abayi-4 abakweletayo",
+    "statements for everyone who owes",
+    "all statements",
+    "receipts for Sipho and Thandi",
+    "add up Sipho's statement",
+    "statement for Sipho, 2 pages",
+    "Sipho owes R200, send the receipt",
+])
+def test_pure_statements_stay_single(text):
+    from app.agent import _looks_multi
+    assert _looks_multi(text) is False, text
+
+
+def test_sale_plus_statement_reaches_planner(conn, ledger, monkeypatch,
+                                            tmp_path):
+    conn.execute(
+        "INSERT INTO products (shop_id, name, price_cents, cost_cents, stock_qty)"
+        " VALUES (?, 'Milk', 2800, 2200, 30)", (SHOP,))
+    conn.execute("UPDATE shops SET language = 'en' WHERE shop_id = ?",
+                 (SHOP,))
+    conn.commit()
+    calls = _script(monkeypatch, tmp_path, [{
+        "understood": "sale plus statement", "question": None, "options": [],
+        "tasks": [
+            {"kind": "sale", "args": {
+                "buyer": "Sipho",
+                "items": [{"product": "Bread", "qty": 2},
+                          {"product": "Milk", "qty": 1}]}, "quote": ""},
+            {"kind": "statement", "args": {"customer": "Sipho"},
+             "quote": ""}]}])
+    msg, buttons = handle_text(
+        conn, SHOP, "sipho took two bread and one milk, add that to his"
+        " account and send me his statement")
+    assert calls["n"] == 1  # planner ran; fast path did not hijack
+    assert "Save sale? (2 items)" in msg  # every item proposed ...
+    assert "I'll send that once you confirm" in msg  # ... statement held
+    assert "Outstanding" not in msg
+    assert buttons == ["Yes", "No"]
+    assert take_media(SHOP) == []
+    msg, _ = handle_text(conn, SHOP, "yes")
+    assert "Sale saved" in msg and "Outstanding R108.00" in msg
+    assert take_media(SHOP) != []
+
+
 def test_image_sent_before_text(conn, monkeypatch):
     import app.main as main
     from app.main import _handle_message
