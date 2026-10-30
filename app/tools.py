@@ -7200,6 +7200,41 @@ def resend_last_media(conn: sqlite3.Connection, shop_id: str) -> str:
     return _t("resend_again")
 
 
+def remember_last_reply(conn: sqlite3.Connection, shop_id: str,
+                        text: str) -> None:
+    """Store the latest outbound reply so 'resend' can recover it.
+
+    Called for every computed reply (text or buttons); the button titles
+    are not kept, so a resent reply arrives as plain text. Empty replies
+    and generic crash fallbacks are never stored.
+    """
+    if not (text or "").strip():
+        return
+    conn.execute("INSERT INTO flags (shop_id, key, value) VALUES (?, ?, ?)"
+                 " ON CONFLICT (shop_id, key) DO UPDATE SET value = excluded.value",
+                 (shop_id, "last-reply", text))
+    conn.commit()
+
+
+def resend_last_reply(conn: sqlite3.Connection, shop_id: str) -> str:
+    """'resend': failed media first, else the last text reply verbatim."""
+    ensure_shop(conn, shop_id)
+    row = conn.execute("SELECT value FROM flags WHERE shop_id = ?"
+                       " AND key = 'last-failed-media'", (shop_id,)).fetchone()
+    if row is not None:
+        try:
+            failed = json.loads(row["value"])
+        except ValueError:
+            failed = {}
+        if failed.get("kind") in ("image", "file") and failed.get("url"):
+            return resend_last_media(conn, shop_id)
+    row = conn.execute("SELECT value FROM flags WHERE shop_id = ?"
+                       " AND key = 'last-reply'", (shop_id,)).fetchone()
+    if row is not None and (row["value"] or "").strip():
+        return row["value"]
+    return _t("resend_nothing")
+
+
 def get_order_draft(conn: sqlite3.Connection, shop_id: str) -> dict | None:
     row = conn.execute("SELECT payload_json FROM order_drafts WHERE shop_id = ?",
                        (shop_id,)).fetchone()

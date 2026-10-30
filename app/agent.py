@@ -88,6 +88,7 @@ from app.tools import (
     customer_statement,
     record_sale,
     resend_last_media,
+    resend_last_reply,
     resolve_sender,
     reset_shop,
     resume_deferred_link,
@@ -1104,7 +1105,7 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str,
                 "statements for everyone", "all statements"):
         return statements_for_all(conn, shop_id), None
     if word == "resend":
-        return resend_last_media(conn, shop_id), None
+        return resend_last_reply(conn, shop_id), None
     if word == "logo":
         image = _fresh_photo(shop_id)
         if image is None:

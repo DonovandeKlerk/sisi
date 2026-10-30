@@ -448,6 +448,14 @@ def _handle_message(sender, msg: IncomingMessage) -> None:
 
         reply = with_media_links(reply, items)
         reply = _with_consent(conn, msg.shop_id, reply)
+        from app.agent import _normalize as _agent_word
+        if _agent_word(msg.text or "") != "resend":
+            # Resends return the stored reply verbatim; storing them
+            # again would let a media-resend ack clobber text recovery.
+            # Same normalization as the agent route, so filler-word
+            # variants ("resend please") are excluded too.
+            from app.tools import remember_last_reply
+            remember_last_reply(conn, msg.shop_id, reply)
         for item in [i for i in items if i.get("first")]:
             out.send_media_item(msg.shop_id, item)
         if buttons:
