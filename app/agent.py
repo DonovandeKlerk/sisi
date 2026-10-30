@@ -87,6 +87,7 @@ from app.tools import (
     confirm_reset_shop,
     customer_statement,
     record_sale,
+    record_sale_multi,
     resend_last_media,
     resend_last_reply,
     resend_recovery,
@@ -1272,6 +1273,10 @@ def try_price_reply(conn: sqlite3.Connection, shop_id: str, text: str) -> str | 
     if spec["tool"] == "sale":
         return record_sale(conn, shop_id, product, spec["qty"],
                            buyer=spec.get("buyer"), unit=spec.get("unit"))
+    if spec["tool"] == "sale_multi":
+        # The price answer revives the whole batch, not just one line.
+        return record_sale_multi(conn, shop_id, spec["items"],
+                                 buyer=spec.get("buyer"))
     return add_credit(conn, shop_id, spec["customer"], spec["items"])
 
 

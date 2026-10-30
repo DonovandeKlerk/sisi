@@ -298,23 +298,25 @@ def _propose(conn: sqlite3.Connection, shop_id: str, action_type: str, payload: 
 
 def _run_plan_followups(conn: sqlite3.Connection, shop_id: str,
                         payload: dict) -> str:
-    """Run reads the plan held back until this proposal resolved.
+    """Run tasks the plan held back until this proposal resolved.
 
-    Called on both confirm and cancel: the reads render the settled
-    ledger either way. Followup buttons are dropped (confirm/cancel
-    replies carry no buttons); queued media flushes with the reply as
-    usual. One followup never kills the rest.
+    Called on both confirm and cancel: reads render the settled ledger
+    either way, and chained writes propose in turn (each still needs its
+    own Yes). Followup buttons are dropped (confirm/cancel replies carry
+    no buttons); queued media flushes with the reply as usual. One
+    followup never kills the rest.
     """
-    followups = payload.get("plan_followups") or []
+    followups = [f for f in payload.get("plan_followups") or []
+                 if isinstance(f, dict)]
     if not followups:
         return ""
     from app.interpreter import _EXECUTORS, _TaskFail
     bundle = {"text": "", "sent_at": None, "sibling_kinds": set(),
               "quote": ""}
+    entry = get_pending(conn, shop_id)
+    entry_id = entry["id"] if entry else None
     parts = []
-    for fol in followups:
-        if not isinstance(fol, dict):
-            continue
+    for i, fol in enumerate(followups):
         run = _EXECUTORS.get(fol.get("kind"))
         if run is None:
             continue
@@ -327,6 +329,19 @@ def _run_plan_followups(conn: sqlite3.Connection, shop_id: str,
             text = _t("task_failed", kind=fol.get("kind"),
                       err=type(e).__name__)
         parts.append(text)
+        rest = followups[i + 1:]
+        if rest:
+            cur = get_pending(conn, shop_id)
+            if cur is not None and cur["id"] != entry_id:
+                # This followup proposed something new (a chained write):
+                # the rest waits behind it instead of rendering early.
+                pl = json.loads(cur["payload_json"])
+                pl["plan_followups"] = rest
+                conn.execute("UPDATE pending_actions SET payload_json = ?"
+                             " WHERE id = ?", (json.dumps(pl), cur["id"]))
+                conn.commit()
+                parts.append(_t("plan_deferred"))
+                break
     return ("\n\n" + "\n\n".join(parts)) if parts else ""
 
 
@@ -933,7 +948,83 @@ def record_purchase(conn: sqlite3.Connection, shop_id: str, amount_cents: int,
 # ---------------------------------------------------------------------------
 
 
+def _apply_record_sale_multi(conn: sqlite3.Connection, shop_id: str, payload: dict,
+                             action_id: str):
+    """Apply a multi-line sale: every line under one action.
+
+    sales/credit_entries both key action_id UNIQUE, so lines take the
+    book-page suffix convention ({A}-sc{i} sales, {A}-c{i} credits) that
+    the statement pairing already recognises — no double count.
+    """
+    lines = payload["lines"]
+    total = payload.get("total_cents") or sum(ln["total_cents"] for ln in lines)
+    customer_id = None
+    credit_ids: list = []
+    if payload.get("buyer"):
+        cust, _ = _get_or_create_customer(conn, shop_id, payload["buyer"])
+        customer_id = cust["id"]
+        for i, ln in enumerate(lines):
+            cur = conn.execute(
+                "INSERT INTO credit_entries (shop_id, customer_id, amount_cents,"
+                " items_text, action_id, recorded_by)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (shop_id, customer_id, ln["total_cents"],
+                 f"{ln.get('short') or ln['product']} (sale)",
+                 f"{action_id}-c{i}", _rec()),
+            )
+            credit_ids.append(cur.lastrowid)
+    undo_lines = []
+    rendered = []
+    for i, ln in enumerate(lines):
+        cur = conn.execute(
+            "INSERT INTO sales (shop_id, product_id, product_name, qty, total_cents,"
+            " customer_id, action_id, recorded_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (shop_id, ln["product_id"], ln["product"], ln["qty"],
+             ln["total_cents"], customer_id, f"{action_id}-sc{i}", _rec()),
+        )
+        conn.execute("UPDATE products SET stock_qty = stock_qty - ? WHERE id = ?",
+                     (ln["qty"], ln["product_id"]))
+        conn.execute(
+            "INSERT INTO stock_moves (shop_id, product_id, delta_qty, reason, action_id)"
+            " VALUES (?, ?, ?, 'sale', ?)",
+            (shop_id, ln["product_id"], -ln["qty"], action_id),
+        )
+        stock = conn.execute("SELECT stock_qty FROM products WHERE id = ?",
+                             (ln["product_id"],)).fetchone()["stock_qty"]
+        undo_lines.append({"sale_id": cur.lastrowid,
+                           "product_id": ln["product_id"], "qty": ln["qty"]})
+        label = ln.get("label") or f"{_fmt_qty(ln['qty'])} × {ln['product']}"
+        rendered.append(_t("sale_line", label=label,
+                           total=cents_to_rand(ln["total_cents"])) + " " +
+                        _t("sale_left_inline",
+                           hand=_fmt_on_hand(stock, ln.get("pack_name"),
+                                             ln.get("pack_size"))))
+    shown = "\n".join(rendered)
+    undo = {"lines": undo_lines, "credit_ids": credit_ids,
+            "total_cents": total}
+    if payload.get("buyer"):
+        bal = balance_cents(conn, shop_id, customer_id)
+        return (
+            _t("sale_saved_credit_multi", lines=shown, buyer=payload["buyer"],
+               amt=cents_to_rand(total), bal=cents_to_rand(bal)),
+            "sale_credit",
+            f"sale {len(lines)} items to {payload['buyer']}",
+            undo,
+        )
+    _post_cash(conn, shop_id, "cash", total, "sale", action_id,
+               ref_type="sale", ref_id=undo_lines[0]["sale_id"])
+    return (
+        _t("sale_saved_cash_multi", lines=shown,
+           amt=cents_to_rand(total)),
+        "sale_cash",
+        f"sale {len(lines)} items cash",
+        undo,
+    )
+
+
 def _apply_record_sale(conn: sqlite3.Connection, shop_id: str, payload: dict, action_id: str):
+    if isinstance(payload.get("lines"), list) and payload["lines"]:
+        return _apply_record_sale_multi(conn, shop_id, payload, action_id)
     customer_id = None
     credit_id = None
     if payload.get("buyer"):
@@ -992,6 +1083,25 @@ def _apply_record_sale(conn: sqlite3.Connection, shop_id: str, payload: dict, ac
     )
 
 
+def _sale_pause(conn: sqlite3.Connection, shop_id: str, status: str, detail: str,
+                buyer_name: str | None, unit: str | None, spec: dict) -> str:
+    """Question text for an unresolvable sale line; never guesses a price."""
+    if status == "ambiguous":
+        return detail
+    _store_await_price(conn, shop_id, detail, spec)
+    if status == "unknown":
+        cap = detail[:1].upper() + detail[1:]
+        if buyer_name:
+            tail = _t("sale_tail_credit", buyer=buyer_name)
+        else:
+            tail = _t("sale_tail_cash")
+        return _t("sale_unknown", cap=cap, low=detail.lower(), tail=tail)
+    if _is_pack_unit(unit):
+        return _t("pack_price_ask", ask=_ask_price(detail),
+                  echo=_pack_echo(unit))
+    return _ask_price(detail)
+
+
 def record_sale(conn: sqlite3.Connection, shop_id: str, product: str, qty: float = 1,
                 buyer: str | None = None, unit: str | None = None) -> str:
     """Propose a sale. buyer=None means cash; a name means credit sale.
@@ -1007,22 +1117,10 @@ def record_sale(conn: sqlite3.Connection, shop_id: str, product: str, qty: float
         return _t("how_many")
     buyer_name = buyer.strip() if buyer and buyer.strip() else None
     line, status, detail = _resolve_priced_line(conn, shop_id, product or "", qty, unit)
-    if status == "ambiguous":
-        return detail
-    if status in ("unknown", "unpriced"):
-        _store_await_price(conn, shop_id, detail,
-                           {"tool": "sale", "qty": qty, "buyer": buyer_name, "unit": unit})
-        if status == "unknown":
-            cap = detail[:1].upper() + detail[1:]
-            if buyer_name:
-                tail = _t("sale_tail_credit", buyer=buyer_name)
-            else:
-                tail = _t("sale_tail_cash")
-            return _t("sale_unknown", cap=cap, low=detail.lower(), tail=tail)
-        if _is_pack_unit(unit):
-            return _t("pack_price_ask", ask=_ask_price(detail),
-                      echo=_pack_echo(unit))
-        return _ask_price(detail)
+    if status != "ok":
+        return _sale_pause(conn, shop_id, status, detail, buyer_name, unit,
+                           {"tool": "sale", "qty": qty, "buyer": buyer_name,
+                            "unit": unit})
     payload = {"product_id": line["product_id"], "product": line["name"], "qty": line["qty"],
                "total_cents": line["line_total"], "buyer": buyer_name,
                "label": line["label"], "short": line["short"]}
@@ -1054,6 +1152,89 @@ def record_sale(conn: sqlite3.Connection, shop_id: str, product: str, qty: float
         preview += _t("warn_singles", echo=line['unit_word'],
                       name=line['name'])
     if stock < 0:
+        preview += _t("warn_short")
+    return _propose(conn, shop_id, "record_sale", payload, preview)
+
+
+def record_sale_multi(conn: sqlite3.Connection, shop_id: str, items: list[dict],
+                      buyer: str | None = None) -> str:
+    """Propose ONE sale holding every line, so one Yes saves them all.
+
+    Every line resolves before anything is proposed: a per-item propose
+    loop silently drops all but the last line (each _propose supersedes
+    the previous pending). A single item delegates to record_sale exactly.
+    """
+    ensure_shop(conn, shop_id)
+    buyer_name = buyer.strip() if buyer and buyer.strip() else None
+    raw = [{"product": it.get("product"), "qty": it.get("qty", 1),
+            "unit": it.get("unit")} for it in items or []
+           if isinstance(it, dict)]
+    if not raw:
+        return _t("how_many")
+    resolved = []
+    for it in raw:
+        try:
+            qty = float(it["qty"])
+        except (TypeError, ValueError):
+            return _t("how_many")
+        if qty <= 0:
+            return _t("how_many")
+        line, status, detail = _resolve_priced_line(
+            conn, shop_id, it["product"] or "", qty, it["unit"])
+        if status != "ok":
+            # Nothing proposed yet; the price answer revives the whole
+            # batch via the sale_multi await spec.
+            return _sale_pause(conn, shop_id, status, detail, buyer_name,
+                               it["unit"],
+                               {"tool": "sale_multi", "buyer": buyer_name,
+                                "items": raw})
+        resolved.append(line)
+    if len(resolved) == 1:
+        one = raw[0]
+        return record_sale(conn, shop_id, one["product"], one["qty"],
+                           buyer=buyer_name, unit=one["unit"])
+    total = sum(ln["line_total"] for ln in resolved)
+    buyer_new = bool(buyer_name) and _get_customer(conn, shop_id, buyer_name) is None
+    payload = {"lines": [{
+        "product_id": ln["product_id"], "product": ln["name"], "qty": ln["qty"],
+        "total_cents": ln["line_total"], "label": ln["label"],
+        "short": ln["short"], "pack_name": ln["pack_name"],
+        "pack_size": ln["pack_size"]} for ln in resolved],
+        "buyer": buyer_name, "total_cents": total}
+    with _dry_run(conn):
+        _apply_record_sale(conn, shop_id, payload, _action_id())
+        stocks = [conn.execute("SELECT stock_qty FROM products WHERE id = ?",
+                               (ln["product_id"],)).fetchone()["stock_qty"]
+                  for ln in resolved]
+        buyer_bal = None
+        if buyer_name:
+            cust = _get_customer(conn, shop_id, buyer_name)
+            buyer_bal = balance_cents(conn, shop_id, cust["id"])
+    rendered = []
+    for ln, stock in zip(resolved, stocks):
+        first = _t("sale_line", label=ln["label"],
+                   total=cents_to_rand(ln["line_total"]))
+        rendered.append(first + " " + _t(
+            "sale_left_inline",
+            hand=_fmt_on_hand(stock, ln["pack_name"], ln["pack_size"])))
+    preview = _t("sale_multi_head", n=len(resolved)) + "\n" + "\n".join(rendered)
+    if buyer_name:
+        preview += "\n" + _t("sale_multi_owes", buyer=buyer_name,
+                             amt=cents_to_rand(total))
+        preview += "\n" + _t("sale_multi_bal", bal=cents_to_rand(buyer_bal))
+        if buyer_new:
+            preview += _t("sale_new_cust")
+        else:
+            cust = _get_customer(conn, shop_id, buyer_name)
+            if cust is not None:
+                preview += _limit_warn(conn, shop_id, cust["id"], buyer_bal)
+    else:
+        preview += "\n" + _t("sale_multi_cash", amt=cents_to_rand(total))
+    for ln in resolved:
+        if ln["warn"]:
+            preview += _t("warn_singles", echo=ln["unit_word"],
+                          name=ln["name"])
+    if any(s < 0 for s in stocks):
         preview += _t("warn_short")
     return _propose(conn, shop_id, "record_sale", payload, preview)
 
@@ -7567,6 +7748,27 @@ def _restore_stock(conn: sqlite3.Connection, shop_id: str, product_id: int, qty:
 
 
 def _undo_sale(conn: sqlite3.Connection, shop_id: str, undo: dict, action_id: str) -> str:
+    mlines = undo.get("lines")
+    if isinstance(mlines, list) and mlines:
+        for ln in mlines:
+            conn.execute("UPDATE sales SET reversed = 1 WHERE id = ?",
+                         (ln["sale_id"],))
+            _restore_stock(conn, shop_id, ln["product_id"], ln["qty"],
+                           action_id)
+        _reverse_moves(conn, shop_id, action_id)
+        total = undo.get("total_cents", 0)
+        if undo.get("credit_ids"):
+            for cid in undo["credit_ids"]:
+                conn.execute("UPDATE credit_entries SET reversed = 1 WHERE id = ?",
+                             (cid,))
+            sale0 = conn.execute("SELECT * FROM sales WHERE id = ?",
+                                 (mlines[0]["sale_id"],)).fetchone()
+            cust = conn.execute("SELECT * FROM customers WHERE id = ?",
+                                (sale0["customer_id"],)).fetchone()
+            bal = balance_cents(conn, shop_id, cust["id"])
+            return _t("undo_sale_credit", name=cust["name"],
+                      amt=cents_to_rand(total), bal=cents_to_rand(bal))
+        return _t("undo_sale_cash_multi", amt=cents_to_rand(total))
     sale = conn.execute("SELECT * FROM sales WHERE id = ?", (undo["sale_id"],)).fetchone()
     conn.execute("UPDATE sales SET reversed = 1 WHERE id = ?", (undo["sale_id"],))
     _reverse_moves(conn, shop_id, action_id)

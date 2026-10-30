@@ -526,16 +526,14 @@ def _exec_order(conn, shop_id, args, bundle):
 
 
 def _exec_sale(conn, shop_id, args, bundle):
-    from app.tools import record_sale
+    from app.tools import record_sale_multi
     items = _items(args.get("items"))
     buyer = args.get("buyer")
     if isinstance(buyer, str) and buyer.strip():
         buyer = _customer(buyer)
     else:
         buyer = None
-    return "\n\n".join(record_sale(conn, shop_id, it["product"], it["qty"],
-                                  buyer=buyer, unit=it["unit"])
-                       for it in items), None
+    return record_sale_multi(conn, shop_id, items, buyer=buyer), None
 
 
 def _exec_credit(conn, shop_id, args, bundle):
@@ -1044,6 +1042,45 @@ write is deferred until the write is confirmed or cancelled, then runs
 from the settled ledger (see plan_followups in the pending payload)."""
 
 
+CHAIN_WRITE_KINDS = frozenset({"sale", "credit", "payment", "stock_add"})
+"""Write kinds that always propose: when one follows another proposal in
+the same plan it waits its turn (chained via plan_followups) instead of
+silently superseding it. Direct-save writes (reminders, settings) run
+inline as before; anything else that supersedes is rescued below."""
+
+
+def _sale_buyer(task: dict) -> str | None:
+    buyer = (task.get("args") or {}).get("buyer")
+    if isinstance(buyer, str) and buyer.strip():
+        return " ".join(buyer.strip().split()).lower()
+    return None
+
+
+def _merge_adjacent_sales(tasks: list) -> list:
+    """Fold runs of same-buyer sale tasks into one multi-item task.
+
+    One message, one buyer, one Yes: without this each sale task
+    proposes separately and all but the last are silently superseded.
+    """
+    merged: list = []
+    for task in tasks:
+        if (isinstance(task, dict) and task.get("kind") == "sale"
+                and merged and isinstance(merged[-1], dict)
+                and merged[-1].get("kind") == "sale"
+                and _sale_buyer(task) == _sale_buyer(merged[-1])):
+            prev = dict(merged[-1])
+            prev_args = dict(prev.get("args") or {})
+            combined = list(prev_args.get("items") or [])
+            for it in (task.get("args") or {}).get("items") or []:
+                combined.append(it)
+            prev_args["items"] = combined
+            prev["args"] = prev_args
+            merged[-1] = prev
+            continue
+        merged.append(task)
+    return merged
+
+
 def execute_plan(conn: sqlite3.Connection, shop_id: str, plan: dict,
                  bundle: dict) -> tuple[str, list[str] | None]:
     """Run validated tasks in order. Each failure stays local to its task."""
@@ -1052,6 +1089,7 @@ def execute_plan(conn: sqlite3.Connection, shop_id: str, plan: dict,
     if not tasks:
         return (plan.get("question") or _t("llm_say_again"),
                 plan.get("options") or None)
+    tasks = _merge_adjacent_sales([t for t in tasks if isinstance(t, dict)])
     parts: list[str] = []
     suggest: list[str] | None = None
     bundle["sibling_kinds"] = {t.get("kind") for t in tasks
@@ -1063,6 +1101,8 @@ def execute_plan(conn: sqlite3.Connection, shop_id: str, plan: dict,
     pre_id = pre["id"] if pre else None
     wrote = False
     deferred: list[dict] = []
+    rescued: list[dict] = []
+    produced: tuple[int, dict] | None = None
     for task in tasks:
         kind = task.get("kind")
         if ro and _task_is_write(task):
@@ -1071,14 +1111,24 @@ def execute_plan(conn: sqlite3.Connection, shop_id: str, plan: dict,
                 parts.append(_t("whapi_readonly"))
                 ro_told = True
             continue
-        if wrote and not _task_is_write(task) \
-                and kind not in IMMEDIATE_READ_KINDS \
-                and _EXECUTORS.get(kind) is not None:
-            # A later read would render pre-confirmation state (e.g. a
-            # statement before its credit is saved): hold it until the
-            # write resolves, then run it from the settled ledger.
-            deferred.append({"kind": kind, "args": task.get("args") or {}})
-            continue
+        if wrote and _EXECUTORS.get(kind) is not None:
+            held = False
+            if not _task_is_write(task) and kind not in IMMEDIATE_READ_KINDS:
+                # A later read would render pre-confirmation state (e.g.
+                # a statement before its credit is saved): hold it until
+                # the write resolves, then run it from the settled
+                # ledger.
+                held = True
+            elif kind in CHAIN_WRITE_KINDS:
+                live = get_pending(conn, shop_id)
+                if live is not None and live["id"] != pre_id:
+                    # Only one proposal can wait at a time: this one
+                    # proposes in turn after the live one resolves
+                    # instead of silently superseding it.
+                    held = True
+            if held:
+                deferred.append({"kind": kind, "args": task.get("args") or {}})
+                continue
         run = _EXECUTORS.get(kind)
         if run is None:
             continue
@@ -1095,19 +1145,30 @@ def execute_plan(conn: sqlite3.Connection, shop_id: str, plan: dict,
         suggest = suggest or sug
         if _task_is_write(task):
             wrote = True
-    if deferred:
+            cur = get_pending(conn, shop_id)
+            if cur is not None and cur["id"] != pre_id \
+                    and (produced is None or produced[0] != cur["id"]):
+                if produced is not None:
+                    # This write superseded an earlier plan proposal:
+                    # chain the victim so Yes/No still reaches it.
+                    # Nothing is silently lost.
+                    rescued.append(produced[1])
+                produced = (cur["id"], {"kind": kind,
+                                        "args": task.get("args") or {}})
+    held_tasks = rescued + deferred
+    if held_tasks:
         post = get_pending(conn, shop_id)
         if post is not None and post["id"] != pre_id:
             payload = json.loads(post["payload_json"])
-            payload["plan_followups"] = deferred
+            payload["plan_followups"] = held_tasks
             conn.execute("UPDATE pending_actions SET payload_json = ?"
                          " WHERE id = ?", (json.dumps(payload), post["id"]))
             conn.commit()
             parts.append(_t("plan_deferred"))
         else:
             # No new proposal (the write asked a question instead): no
-            # confirmation to wait for, so run the reads now as before.
-            for fol in deferred:
+            # confirmation to wait for, so run the held tasks now.
+            for fol in held_tasks:
                 run = _EXECUTORS.get(fol["kind"])
                 try:
                     text, sug = run(conn, shop_id, fol["args"], bundle)
