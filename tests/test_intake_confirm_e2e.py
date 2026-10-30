@@ -336,21 +336,50 @@ def test_existing_item2_previews_immediately(shop_db):
         conn.close()
 
 
-def test_resend_recovers_last_reply_without_resaving(shop_db):
+def test_resend_recovers_current_question_without_resaving(shop_db):
     conn = _db(shop_db)
     _start(conn)
     conn.close()
     _answer_item("R16", "sell R22")
     saved = _send("Yes", kind="button")[-1]
     assert "Saved Albany" in saved
+    # Session advanced: resend recovers the CURRENT question, never the
+    # stale ack and never obsolete Yes instructions.
     out = _send("resend")[-1]
-    assert out == saved  # the lost ack, verbatim
-    out = _send("resend")[-1]
-    assert out == saved  # repeatable, never accumulates
+    assert "Item 2 of 4" in out and "NPL Anabolic Whey 908g" in out
+    assert "cost" in out.lower()
+    assert "Reply Yes to save" not in out
+    assert "Saved Albany" not in out
+    again = _send("resend")[-1]
+    assert again == out  # repeatable, never accumulates
     conn = _db(shop_db)
     try:
         assert _stock(conn, "Albany Superior White Bread 700g")[0] == 1.0
         assert _moves(conn) == (0, 0)
+        pend = conn.execute("SELECT COUNT(*) c FROM pending_actions"
+                            " WHERE shop_id = ? AND status = 'pending'",
+                            (SHOP,)).fetchone()["c"]
+        assert pend == 0  # nothing auto-confirmed, nothing new pending
+    finally:
+        conn.close()
+
+
+def test_resend_live_preview_returns_buttons(shop_db):
+    conn = _db(shop_db)
+    _start(conn)
+    conn.close()
+    _answer_item("R16", "sell R22")  # item-1 preview now pending
+    process_message(IncomingMessage("e2e-rs-1", SHOP, "text", "resend", ""))
+    got = get_sender().pop_shop(SHOP)[-1]
+    assert got["type"] == "buttons"  # live preview keeps working buttons
+    assert got["buttons"] == ["Yes", "No"]
+    assert "Reply Yes to save" in got["body"]
+    assert "Albany Superior White Bread 700g" in got["body"]
+    out = _send("Yes")[-1]  # the resent preview confirms normally
+    assert "Saved Albany" in out
+    conn = _db(shop_db)
+    try:
+        assert _stock(conn, "Albany Superior White Bread 700g")[0] == 1.0
     finally:
         conn.close()
 
@@ -371,7 +400,27 @@ def test_resend_filler_variant_does_not_clobber(shop_db):
     conn.close()
     got = _send("resend please")  # media path taken (+queued media item)
     assert any("again" in m for m in got)
-    assert _send("resend")[-1] == saved  # text recovery intact, not the ack
+    out = _send("resend")[-1]  # session open: current question, not the ack
+    assert "Item 2 of 4" in out
+    conn = _db(shop_db)  # and the stored last reply is intact underneath
+    try:
+        val = conn.execute("SELECT value FROM flags WHERE shop_id = ?"
+                           " AND key = 'last-reply'", (SHOP,)).fetchone()["value"]
+        assert val == saved
+    finally:
+        conn.close()
+
+
+def test_resend_without_session_returns_last_reply(shop_db):
+    _send("menu")
+    conn = _db(shop_db)
+    try:
+        stored = conn.execute("SELECT value FROM flags WHERE shop_id = ?"
+                              " AND key = 'last-reply'", (SHOP,)).fetchone()["value"]
+    finally:
+        conn.close()
+    assert stored and "Main menu" in stored
+    assert _send("resend")[-1] == stored  # verbatim, nothing pending
 
 
 def test_resend_with_nothing_recorded(shop_db):

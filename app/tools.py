@@ -7235,6 +7235,41 @@ def resend_last_reply(conn: sqlite3.Connection, shop_id: str) -> str:
     return _t("resend_nothing")
 
 
+def resend_recovery(conn: sqlite3.Connection,
+                    shop_id: str) -> tuple[str, list[str] | None]:
+    """'resend' with intake awareness. Pure reads: never writes stock,
+    never confirms anything.
+
+    Priority: failed media (existing path) → the LIVE item preview with
+    Yes/No buttons when one is pending → the session's CURRENT question
+    re-rendered (never a stale preview whose Yes would misfire) → the
+    last text reply → nothing-to-resend.
+    """
+    ensure_shop(conn, shop_id)
+    row = conn.execute("SELECT value FROM flags WHERE shop_id = ?"
+                       " AND key = 'last-failed-media'", (shop_id,)).fetchone()
+    if row is not None:
+        try:
+            failed = json.loads(row["value"])
+        except ValueError:
+            failed = {}
+        if failed.get("kind") in ("image", "file") and failed.get("url"):
+            return resend_last_media(conn, shop_id), None
+    pend = get_pending(conn, shop_id)
+    if pend is not None and pend["action_type"] == "stock_intake_item":
+        return pend["preview_text"], ["Yes", "No"]
+    session = get_intake_session(conn, shop_id)
+    if session is not None and (session.get("status") or "active") == "active":
+        items = session.get("items_json") or []
+        idx = session.get("current") or 0
+        field = session.get("field")
+        if 0 <= idx < len(items) and field is not None:
+            head = _t("g_item", i=idx + 1, n=len(items),
+                      name=items[idx].get("name") or "?")
+            return (f"{head}\n{ask_intake_field(items[idx], field)}", None)
+    return resend_last_reply(conn, shop_id), None
+
+
 def get_order_draft(conn: sqlite3.Connection, shop_id: str) -> dict | None:
     row = conn.execute("SELECT payload_json FROM order_drafts WHERE shop_id = ?",
                        (shop_id,)).fetchone()
