@@ -27,7 +27,7 @@ import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from app.db import cents_to_rand, now_iso
+from app.db import DB_ERROR, cents_to_rand, now_iso
 from app.i18n import t as _t
 
 log = logging.getLogger("sisi.orders")
@@ -706,7 +706,7 @@ def _history_customer(conn: sqlite3.Connection, shop_id: str,
             "SELECT content FROM conversation_turns WHERE shop_id = ?"
             " AND role = 'user' ORDER BY id DESC LIMIT 6",
             (shop_id,)).fetchall()
-    except sqlite3.Error:
+    except DB_ERROR:
         return ""
     for row in rows:
         low = (row["content"] or "").lower()

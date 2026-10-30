@@ -1,4 +1,11 @@
-"""SQLite schema and helpers. One DB, every table keyed by shop_id (owner's WhatsApp number)."""
+"""SQLite schema and helpers. One DB, every table keyed by shop_id (owner's WhatsApp number).
+
+Two backends, one dialect. Local files and tests use sqlite3; production can
+point at Turso Cloud (SQLite-compatible, transactional, safe for concurrent
+containers) by setting TURSO_DATABASE_URL + TURSO_AUTH_TOKEN. An explicit
+path to connect() always selects sqlite3, so tests and tools never touch
+the network.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +13,30 @@ import os
 import sqlite3
 from datetime import date, datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING, Union
+
+if TYPE_CHECKING:  # pragma: no cover
+    from turso_serverless.connection import Connection as _TursoConnection
+
+DbConnection = Union["sqlite3.Connection", "_TursoConnection"]
+
+try:
+    from turso_serverless.dbapi import Error as _TursoError
+    from turso_serverless.dbapi import IntegrityError as _TursoIntegrityError
+    from turso_serverless.dbapi import OperationalError as _TursoOperationalError
+except ImportError:  # pragma: no cover - driver only installed where needed
+    _TursoError = _TursoIntegrityError = _TursoOperationalError = None
+
+#: Catch these instead of sqlite3's errors: they cover both backends.
+DB_ERROR: tuple[type[BaseException], ...] = (
+    (sqlite3.Error,) + ((_TursoError,) if _TursoError else ())
+)
+DB_INTEGRITY_ERROR: tuple[type[BaseException], ...] = (
+    (sqlite3.IntegrityError,) + ((_TursoIntegrityError,) if _TursoIntegrityError else ())
+)
+DB_OPERATIONAL_ERROR: tuple[type[BaseException], ...] = (
+    (sqlite3.OperationalError,) + ((_TursoOperationalError,) if _TursoOperationalError else ())
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS shops (
@@ -344,7 +375,34 @@ def get_db_path() -> Path:
     return Path(os.environ.get("SISI_DB", "data/sisi.db"))
 
 
-def connect(path: str | Path | None = None) -> sqlite3.Connection:
+def turso_creds() -> tuple[str | None, str | None]:
+    url = os.environ.get("TURSO_DATABASE_URL", "").strip()
+    token = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
+    if url and token:
+        return url, token
+    return None, None
+
+
+def using_turso(path: str | Path | None = None) -> bool:
+    """True when connect() would use Turso. Explicit paths always use sqlite."""
+    if path is not None:
+        return False
+    url, _token = turso_creds()
+    return bool(url)
+
+
+def connect(path: str | Path | None = None) -> DbConnection:
+    if path is None:
+        url, token = turso_creds()
+        if url and token:
+            from turso_serverless import connect as _turso_connect
+            conn = _turso_connect(url, auth_token=token)
+            # The driver's Row is already sqlite3.Row-like (index + name
+            # access); its factory protocol takes (cursor, row), so pass
+            # the prebuilt row straight through.
+            conn.row_factory = lambda _cur, row: row
+            conn.execute("PRAGMA foreign_keys = ON")
+            return conn
     db_path = Path(path) if path else get_db_path()
     if str(db_path) != ":memory:":
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -354,7 +412,7 @@ def connect(path: str | Path | None = None) -> sqlite3.Connection:
     return conn
 
 
-def init_db(conn: sqlite3.Connection) -> None:
+def init_db(conn: DbConnection) -> None:
     conn.executescript(SCHEMA)
     for sql in (
         "ALTER TABLE products ADD COLUMN cost_cents INTEGER",
@@ -380,7 +438,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     ):
         try:
             conn.execute(sql)
-        except sqlite3.OperationalError:
+        except DB_OPERATIONAL_ERROR:
             pass  # column already exists on fresh DBs
     conn.commit()
 

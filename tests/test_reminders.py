@@ -1,5 +1,6 @@
 """Reminders: NLU times, offers, context, exactly-once sending, recurrence."""
 
+import re
 from datetime import datetime
 
 import pytest
@@ -147,7 +148,14 @@ def test_offer_yes_and_time_flows(conn):
     assert msg.startswith("⏰ *Reminder set*")
     handle_text(conn, SHOP, "Thandi will pay on Friday")
     msg, _ = handle_text(conn, SHOP, "6am")
-    assert "Fri 30 Oct at 06:00" in msg
+    found = re.search(r"• (Fri \d{2} \w{3}) at 06:00", msg)
+    assert found, msg  # any coming Friday 06:00, not a hardcoded date
+    year = datetime.now().year
+    parsed = datetime.strptime(f"{found.group(1)} {year}", "Fri %d %b %Y")
+    if (datetime.now() - parsed).days > 7:  # Dec/Jan boundary: next year
+        parsed = datetime.strptime(f"{found.group(1)} {year + 1}",
+                                   "Fri %d %b %Y")
+    assert parsed.weekday() == 4
 
 
 def test_undo_cancels_reminder(conn):
