@@ -192,3 +192,14 @@ def test_schema_executescript_over_driver():
     dbmod.init_db(conn)  # full SCHEMA + ALTER sweep, recorded only
     assert any("CREATE TABLE IF NOT EXISTS shops" in s for s in sess.statements)
     assert any("ALTER TABLE" in s for s in sess.statements)
+
+
+def test_enforce_read_only_noop_on_turso_conn(caplog):
+    import logging
+
+    from app.db import enforce_read_only
+    conn = _conn(FakeSession())
+    assert not hasattr(conn, "set_authorizer")
+    with caplog.at_level(logging.WARNING, logger="sisi.db"):
+        enforce_read_only(conn)  # must not raise; proactive gates apply
+    assert "backstop unavailable" in caplog.text
