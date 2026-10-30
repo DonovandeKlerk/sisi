@@ -7429,6 +7429,9 @@ ERROR_REPORT_KEEP = 20
 def record_error(conn: sqlite3.Connection, shop_id: str, context: str,
                  detail: str) -> None:
     """Persist a crash traceback for later owner retrieval. Never raises."""
+    from app.db import read_only
+    if read_only():
+        return  # testing mode: the battery pins a completely unchanged DB
     try:
         conn.execute(
             "INSERT INTO error_reports (shop_id, context, detail)"
