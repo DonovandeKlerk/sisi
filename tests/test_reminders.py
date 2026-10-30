@@ -1,6 +1,5 @@
 """Reminders: NLU times, offers, context, exactly-once sending, recurrence."""
 
-import re
 from datetime import datetime
 
 import pytest
@@ -139,7 +138,15 @@ def test_list_cancel_move(conn):
     assert cancel_numbered(conn, SHOP, 9).startswith("No reminder with that number")
 
 
-def test_offer_yes_and_time_flows(conn):
+def test_offer_yes_and_time_flows(conn, monkeypatch):
+    import app.reminders as _rem
+    # Controlled clock: Monday 26 Oct 2026, so "Friday" is 30 Oct no
+    # matter when the suite runs (it broke once Friday actually came).
+    frozen = datetime(2026, 10, 26, 10, 0, tzinfo=SAST)
+    orig = _rem.now_sast
+    monkeypatch.setattr(_rem, "now_sast",
+                        lambda now=None: orig(frozen) if now is None
+                        else orig(now))
     msg, buttons = handle_text(conn, SHOP,
                                "Sipho will pay on Friday")
     assert buttons == ["Yes", "No"]
@@ -148,14 +155,7 @@ def test_offer_yes_and_time_flows(conn):
     assert msg.startswith("⏰ *Reminder set*")
     handle_text(conn, SHOP, "Thandi will pay on Friday")
     msg, _ = handle_text(conn, SHOP, "6am")
-    found = re.search(r"• (Fri \d{2} \w{3}) at 06:00", msg)
-    assert found, msg  # any coming Friday 06:00, not a hardcoded date
-    year = datetime.now().year
-    parsed = datetime.strptime(f"{found.group(1)} {year}", "Fri %d %b %Y")
-    if (datetime.now() - parsed).days > 7:  # Dec/Jan boundary: next year
-        parsed = datetime.strptime(f"{found.group(1)} {year + 1}",
-                                   "Fri %d %b %Y")
-    assert parsed.weekday() == 4
+    assert "Fri 30 Oct at 06:00" in msg
 
 
 def test_undo_cancels_reminder(conn):

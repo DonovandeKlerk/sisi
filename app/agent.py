@@ -12,7 +12,7 @@ from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 
 from app import reports
-from app.db import today_str
+from app.db import read_only, today_str
 from app.i18n import (CURRENT_LANG, NAMES, STRINGS, detect, normalize_lang,
                       owner_lang, t as _t)
 from app.setup import (
@@ -169,6 +169,8 @@ _OPTIONS_TTL = timedelta(minutes=10)
 def _store_options(conn: sqlite3.Connection, shop_id: str,
                    options: list[str]) -> None:
     """Remember offered buttons/list rows so '1' taps back to typed text."""
+    if read_only():
+        return  # testing mode: no operational memory writes either
     conn.execute(
         "INSERT INTO flags (shop_id, key, value) VALUES (?, 'last-options', ?)"
         " ON CONFLICT (shop_id, key) DO UPDATE SET value = excluded.value",
@@ -948,6 +950,13 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str,
                               or word.startswith(_STAFF_BLOCKED_PREFIX)):
         from app.tools import _staff_blocked
         return _staff_blocked(), None
+    if read_only() and (word in YES_WORDS or word in NO_WORDS
+                        or word in UNDO_WORDS or word == "undo book"
+                        or word in CANCEL_WORDS or word in RESET_WORDS
+                        or word in DELETE_WORDS):
+        # Testing mode: confirmations are the dangerous ones (a live
+        # pending action from another channel must never confirm here).
+        return _t("whapi_readonly"), None
     linked = try_link_choice_reply(conn, shop_id, text)
     if linked is not None:
         return linked
@@ -1354,6 +1363,10 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
     """
     shop_id, staff = _enter(conn, shop_id)
     ensure_shop(conn, shop_id)
+    if read_only():
+        # Testing mode: photos propose intakes/logos — block before the
+        # vision call (which costs money) and before any writes.
+        return None, _t("whapi_readonly"), None
     caption = (caption or "").strip()
     _set_message_lang(conn, shop_id, caption)
     LAST_PHOTO[shop_id] = (image or b"", datetime.now(timezone.utc))
@@ -1463,6 +1476,12 @@ def handle_text(conn: sqlite3.Connection, shop_id: str, text: str,
         _set_message_lang(conn, shop_id, text)
     if staff is None:
         word0 = _normalize(text or "")
+        if read_only() and (word0 == "setup" or word0 == "reset shop"
+                            or word0 == "yes erase everything"
+                            or word0 in RESET_WORDS
+                            or needs_setup(conn, shop_id)):
+            # Testing mode: setup and resets would (re)write the shop.
+            return _t("whapi_readonly"), None
         if word0 == "setup":
             message = start_setup(conn, shop_id)
             save_turn(conn, shop_id, "user", text)
@@ -1489,7 +1508,8 @@ def handle_text(conn: sqlite3.Connection, shop_id: str, text: str,
                 save_turn(conn, shop_id, "user", text)
                 save_turn(conn, shop_id, "assistant", message)
                 return message, None
-            mark_paused(conn, shop_id)
+            if not read_only():
+                mark_paused(conn, shop_id)
             save_turn(conn, shop_id, "user", text)
             save_turn(conn, shop_id, "assistant", _t("help_menu"))
             return _t("help_menu"), None
@@ -1533,6 +1553,8 @@ def _maybe_first_offer(conn: sqlite3.Connection, shop_id: str, message: str) -> 
         return message
     month = reports.prev_month(today[:7])
     key = f"offer-{month}"
+    if read_only():
+        return message  # testing mode: never mark the offer shown
     if conn.execute("SELECT value FROM flags WHERE shop_id = ? AND key = ?",
                     (shop_id, key)).fetchone():
         return message

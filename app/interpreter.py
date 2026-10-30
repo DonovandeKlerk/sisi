@@ -1011,9 +1011,35 @@ _EXECUTORS = {
 }
 
 
+WRITE_KINDS = frozenset({
+    "reminder", "reminder_offer", "reminder_cancel", "reminder_move",
+    "reminder_snooze", "order", "sale", "credit", "payment", "stock_add",
+    "order_add", "order_remove", "price_set", "expense", "drawing",
+    "count", "supplier_payment", "purchase", "restock", "set_language",
+    "set_profile", "float_set", "nudge", "staff_add", "limit_set",
+    "expiry_set", "book_page", "receipt_doc", "expiry_photo", "logo",
+})
+"""Planner task kinds that mutate business records (or stage proposals).
+
+Read-only testing skips these with the testing-mode reply; every other
+kind runs normally. `daily_plan` is mixed: blocked only when it carries
+a `setting` arg (show-plan stays available).
+"""
+
+
+def _task_is_write(task: dict) -> bool:
+    kind = task.get("kind")
+    if kind in WRITE_KINDS:
+        return True
+    if kind == "daily_plan":
+        return bool((task.get("args") or {}).get("setting"))
+    return False
+
+
 def execute_plan(conn: sqlite3.Connection, shop_id: str, plan: dict,
                  bundle: dict) -> tuple[str, list[str] | None]:
     """Run validated tasks in order. Each failure stays local to its task."""
+    from app.db import read_only
     tasks = plan.get("tasks") or []
     if not tasks:
         return (plan.get("question") or _t("llm_say_again"),
@@ -1022,7 +1048,15 @@ def execute_plan(conn: sqlite3.Connection, shop_id: str, plan: dict,
     suggest: list[str] | None = None
     bundle["sibling_kinds"] = {t.get("kind") for t in tasks
                                if isinstance(t, dict)}
+    ro = read_only()
+    ro_told = False
     for task in tasks:
+        if ro and _task_is_write(task):
+            # Testing mode: skip the write, say so once, keep the reads.
+            if not ro_told:
+                parts.append(_t("whapi_readonly"))
+                ro_told = True
+            continue
         run = _EXECUTORS.get(task.get("kind"))
         if run is None:
             continue

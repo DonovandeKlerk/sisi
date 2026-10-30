@@ -486,6 +486,9 @@ def _row_to_plan(row: sqlite3.Row) -> dict:
 
 def expire_plans(conn: sqlite3.Connection, shop_id: str) -> None:
     """Mark past-due plans expired (lazy expiry, no cron needed)."""
+    from app.db import read_only
+    if read_only():
+        return  # testing mode: expiry can wait for the next live message
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
     conn.execute("UPDATE task_plans SET status = 'expired'"
                  " WHERE shop_id = ? AND status = 'proposed'"

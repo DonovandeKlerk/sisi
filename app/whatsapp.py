@@ -71,7 +71,7 @@ class IncomingMessage:
     timestamp: str = ""
     media_id: str | None = None  # WhatsApp media id for audio/image/video
     media_url: str | None = None  # provider-hosted media URL (vonage/infobip)
-    channel: str = "meta"  # inbound channel: "meta", "vonage" or "infobip"
+    channel: str = "meta"  # inbound channel: "meta", "vonage", "infobip" or "whapi"
     caption: str = ""  # image caption, e.g. "logo"
 
 
