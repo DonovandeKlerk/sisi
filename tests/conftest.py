@@ -27,6 +27,14 @@ def _clean_global_state():
     _STAFF_NAME.set(None)
 
 
+@pytest.fixture(autouse=True)
+def _no_turso(monkeypatch):
+    """Keep the suite hermetic: default connect() must never reach Turso,
+    even on a dev machine with credentials exported."""
+    monkeypatch.delenv("TURSO_DATABASE_URL", raising=False)
+    monkeypatch.delenv("TURSO_AUTH_TOKEN", raising=False)
+
+
 @pytest.fixture()
 def conn(tmp_path, monkeypatch):
     monkeypatch.setenv("SISI_DB", str(tmp_path / "test.db"))

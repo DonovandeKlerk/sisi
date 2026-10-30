@@ -16,7 +16,7 @@ import sqlite3
 import uuid
 from datetime import date, datetime, timedelta, timezone
 
-from app.db import cents_to_rand, now_iso, today_str
+from app.db import DB_OPERATIONAL_ERROR, cents_to_rand, now_iso, today_str
 from app.i18n import acct_name as _acct_name
 from app.i18n import cat_name as _cat_name
 from app.i18n import doc_lang as _doc_lang
@@ -2230,7 +2230,7 @@ def _load_dup_stash(conn: sqlite3.Connection, shop_id: str) -> dict | None:
         row = conn.execute("SELECT value FROM flags WHERE shop_id = ?"
                            " AND key = ?", (shop_id, _DUP_STASH_KEY)
                            ).fetchone()
-    except sqlite3.OperationalError:
+    except DB_OPERATIONAL_ERROR:
         return None
     if row is None:
         return None
@@ -2257,7 +2257,7 @@ def _clear_dup_stash(conn: sqlite3.Connection, shop_id: str) -> None:
         conn.execute("DELETE FROM flags WHERE shop_id = ? AND key = ?",
                      (shop_id, _DUP_STASH_KEY))
         conn.commit()
-    except sqlite3.OperationalError:
+    except DB_OPERATIONAL_ERROR:
         pass
 
 
