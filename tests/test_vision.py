@@ -260,3 +260,61 @@ def test_webhook_image_message_end_to_end(photo_env, monkeypatch):
 def test_download_media_photo_label(photo_env):
     with pytest.raises(VoiceError, match="photo"):
         download_media("media-1", "photo")
+
+
+# --- adversarial vision JSON: normalization never crashes -------------------
+# Live bug (30 Oct 2026): a daily-sales photo died with "Something went
+# wrong" three times. Malformed model shapes (line_no as list/dict,
+# lines as int, wrong-typed sections) escaped read_shop_photo as raw
+# TypeError instead of degrading to VisionError.
+
+
+@pytest.mark.parametrize("payload", [
+    {"doc_type": "book_page",
+     "book": {"lines": [{"line_no": [3], "text": "x"}]}},
+    {"doc_type": "book_page",
+     "book": {"lines": [{"line_no": {"n": 3}, "text": "x"}]}},
+    {"doc_type": "book_page", "book": {"lines": 5}},
+    {"doc_type": "book_page", "book": [{"lines": []}]},
+    {"doc_type": "book_page", "book": "cash 2 bread"},
+    {"doc_type": "book_page",
+     "book": {"lines": [{"line_no": 1, "qty": {"n": 2}}]}},
+    {"doc_type": "book_page",
+     "book": {"crossed_out": {"n": 1}, "lines": []}},
+    {"doc_type": "receipt",
+     "receipt": {"lines": [{"line_no": 1, "packs": "two",
+                             "qty_units": "many"}]}},
+    {"doc_type": "other", "products": [{"visible_count": [2]}]},
+    {"doc_type": "other", "products": 7},
+])
+def test_shop_photo_malformed_shapes_survive(photo_env, monkeypatch, payload):
+    monkeypatch.setattr(vision, "_complete_vision",
+                        lambda m, r: _vresp(json.dumps(payload)))
+    doc = vision.read_shop_photo(_tiny_jpg(), SHOP)  # never raises
+    assert doc["doc_type"] in ("expiry", "book_page", "receipt", "other")
+    assert isinstance(doc["book"]["lines"], list)
+    assert isinstance(doc["receipt"]["lines"], list)
+    assert isinstance(doc["products"], list)
+
+
+@pytest.mark.parametrize("payload", [[{"doc_type": "book_page"}],
+                                     "just text", 42])
+def test_shop_photo_non_object_degrades(photo_env, monkeypatch, payload):
+    monkeypatch.setattr(vision, "_complete_vision",
+                        lambda m, r: _vresp(json.dumps(payload)))
+    with pytest.raises(VisionError):
+        vision.read_shop_photo(_tiny_jpg(), SHOP)
+
+
+def test_shop_photo_sanitizes_receipt_numbers(photo_env, monkeypatch):
+    payload = {"doc_type": "receipt",
+               "receipt": {"lines": [{"line_no": "1", "packs": "2",
+                                       "pack_size": 6, "qty_units": "12"}]}}
+    monkeypatch.setattr(vision, "_complete_vision",
+                        lambda m, r: _vresp(json.dumps(payload)))
+    doc = vision.read_shop_photo(_tiny_jpg(), SHOP)
+    (line,) = doc["receipt"]["lines"]
+    assert line["line_no"] == 1
+    assert line["packs"] == 2.0
+    assert line["pack_size"] == 6.0
+    assert line["qty_units"] == 12.0

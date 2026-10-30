@@ -299,6 +299,29 @@ def _sane_cents(val) -> int | None:
     return val if val >= 0 else None
 
 
+def _sane_int(val) -> int:
+    """A line number that survives model shape violations (default 0)."""
+    try:
+        return int(val or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _sane_number(val):
+    """A quantity-ish value: float when numeric, else None."""
+    if isinstance(val, bool):
+        return None
+    try:
+        out = float(val)
+    except (TypeError, ValueError):
+        return None
+    return out
+
+
+def _sane_list(val) -> list:
+    return val if isinstance(val, list) else []
+
+
 def _sane_date(val) -> str:
     exp = str(val or "").strip()
     try:
@@ -333,17 +356,15 @@ def read_shop_photo(image: bytes, shop_id: str = "") -> dict:
         raise VisionError(_t("vis_cant_read")) from None
     try:
         kinds = {"cash", "credit", "payment", "unreadable"}
-        book = doc.get("book") or {}
+        book = doc.get("book")
+        book = book if isinstance(book, dict) else {}
         book_lines = []
-        for ln in book.get("lines", []) or []:
+        for ln in _sane_list(book.get("lines")):
             if not isinstance(ln, dict):
                 continue
-            try:
-                qty = float(ln.get("qty", 0))
-            except (TypeError, ValueError):
-                qty = 0
+            qty = _sane_number(ln.get("qty", 0)) or 0
             book_lines.append({
-                "line_no": int(ln.get("line_no") or 0),
+                "line_no": _sane_int(ln.get("line_no")),
                 "text": str(ln.get("text") or "").strip(),
                 "item": str(ln.get("item") or "").strip(),
                 "qty": qty if qty > 0 else 1,
@@ -353,19 +374,21 @@ def read_shop_photo(image: bytes, shop_id: str = "") -> dict:
             })
         doc["book"] = {"date": _sane_date(book.get("date")),
                        "page_total_cents": _sane_cents(book.get("page_total_cents")),
-                       "crossed_out": int(book.get("crossed_out") or 0),
+                       "crossed_out": _sane_int(book.get("crossed_out")),
                        "lines": book_lines}
-        receipt = doc.get("receipt") or {}
+        receipt = doc.get("receipt")
+        receipt = receipt if isinstance(receipt, dict) else {}
         receipt_lines = []
-        for ln in receipt.get("lines", []) or []:
+        for ln in _sane_list(receipt.get("lines")):
             if not isinstance(ln, dict):
                 continue
             receipt_lines.append({
-                "line_no": int(ln.get("line_no") or 0),
+                "line_no": _sane_int(ln.get("line_no")),
                 "text": str(ln.get("text") or "").strip(),
                 "item": str(ln.get("item") or "").strip(),
-                "packs": ln.get("packs"), "pack_size": ln.get("pack_size"),
-                "qty_units": ln.get("qty_units"),
+                "packs": _sane_number(ln.get("packs")),
+                "pack_size": _sane_number(ln.get("pack_size")),
+                "qty_units": _sane_number(ln.get("qty_units")),
                 "unit_cost_cents": _sane_cents(ln.get("unit_cost_cents")),
                 "line_total_cents": _sane_cents(ln.get("line_total_cents")),
             })
@@ -379,7 +402,7 @@ def read_shop_photo(image: bytes, shop_id: str = "") -> dict:
             "payment": str(receipt.get("payment") or "").strip().lower(),
         }
         products = []
-        for p in doc.get("products", []) or []:
+        for p in _sane_list(doc.get("products")):
             if not isinstance(p, dict):
                 continue
             try:
@@ -398,5 +421,7 @@ def read_shop_photo(image: bytes, shop_id: str = "") -> dict:
         if doc.get("doc_type") not in ("expiry", "book_page", "receipt", "other"):
             doc["doc_type"] = "other"
         return doc
-    except (ValueError, AttributeError) as e:
+    except VisionError:
+        raise
+    except Exception as e:  # noqa: BLE001 - normalization never crashes
         raise VisionError(f"{_t('vis_cant_read')} (bad vision JSON: {e})") from e
