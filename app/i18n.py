@@ -3473,3 +3473,24 @@ STRINGS["xh"].update({
     "g_summary": "📦 *Inqanawe igqityiwe: {saved} okugciniweyo, {skipped} okutsityweyo, {pending} okuseleyo.*",
     "g_no_preview": "Laa nqanawe sele uvaliwe — le nto igcinwe yodwa.",
 })
+
+STRINGS["en"].update({
+    "whapi_readonly": ("🧪 *Testing mode: reads only.*\n"
+                       "I can show balances, stock and debts.\n"
+                       "I can't save anything yet — your records are unchanged."),
+})
+STRINGS["zu"].update({
+    "whapi_readonly": ("🧪 *Imodi yokuhlola: ukufunda kuphela.*\n"
+                       "Ngingakubonisa ibhalansi, isitoko nezikweletu.\n"
+                       "Angikwazi ukugcina lutho okwamanje."),
+})
+STRINGS["af"].update({
+    "whapi_readonly": ("🧪 *Toetsmodus: lees alleen.*\n"
+                       "Ek kan saldo's, voorraad en skuld wys.\n"
+                       "Ek kan nog niks stoor nie."),
+})
+STRINGS["xh"].update({
+    "whapi_readonly": ("🧪 *Imodi yokuvavanya: ukufunda kuphela.*\n"
+                       "Ndingakubonisa ibhalansi, isitokhwe namatyala.\n"
+                       "Andikwazi ukugcina nto okwangoku."),
+})

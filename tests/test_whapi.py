@@ -614,3 +614,285 @@ def test_whapi_channel_is_window_exempt(wh_env):
         assert send_due(conn, now) == [rid]  # fires, never window-blocked
     finally:
         conn.close()
+
+
+# --- scheduled-channel guard ---------------------------------------------------
+
+def _shop_channel():
+    import app.db as _db
+    conn = _db.connect()
+    try:
+        return conn.execute("SELECT channel FROM shops WHERE shop_id = ?",
+                            (SHOP,)).fetchone()["channel"]
+    finally:
+        conn.close()
+
+
+def _set_shop_channel(channel):
+    import app.db as _db
+    conn = _db.connect()
+    try:
+        conn.execute("UPDATE shops SET channel = ? WHERE shop_id = ?",
+                     (channel, SHOP))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _post_text(client, fake, mid, text):
+    body = _payload(_msg(mid=mid, node={"body": text}))
+    body["messages"][0]["timestamp"] = int(time.time())
+    r = client.post(f"/webhook/whapi/{TOKEN}", json=body)
+    assert r.status_code == 200
+    return [c for c in fake.calls if c["url"].endswith("/messages/text")]
+
+
+def test_whapi_inbound_leaves_scheduled_channel(wh_env, monkeypatch):
+    fake = _FakePost()
+    monkeypatch.setattr(whapi.httpx, "post", fake)
+    _set_shop_channel("infobip")
+    client = TestClient(app)
+    _post_text(client, fake, "w-ch-1", "menu")
+    assert _shop_channel() == "infobip"  # reminders still route via infobip
+
+
+def test_whapi_follow_channel_opt_in(wh_env, monkeypatch):
+    fake = _FakePost()
+    monkeypatch.setattr(whapi.httpx, "post", fake)
+    monkeypatch.setenv("WHAPI_ALLOW_WRITES", "1")
+    monkeypatch.setenv("WHAPI_FOLLOW_CHANNEL", "1")
+    _set_shop_channel("infobip")
+    client = TestClient(app)
+    _post_text(client, fake, "w-ch-2", "menu")
+    assert _shop_channel() == "whapi"
+
+
+def test_follow_without_writes_never_flips(wh_env, monkeypatch):
+    fake = _FakePost()
+    monkeypatch.setattr(whapi.httpx, "post", fake)
+    monkeypatch.setenv("WHAPI_FOLLOW_CHANNEL", "1")
+    _set_shop_channel("infobip")
+    client = TestClient(app)
+    texts = _post_text(client, fake, "w-ch-3", "menu")
+    assert _shop_channel() == "infobip"
+    assert texts  # the reply still went out (no authorizer crash)
+
+
+# --- read-only enforcement ----------------------------------------------------
+
+def _snapshot():
+    import app.db as _db
+    skip = {"messages_seen", "send_queue", "send_pacing", "sqlite_sequence"}
+    conn = _db.connect()
+    try:
+        tables = [r["name"] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")]
+        snap = {}
+        for t in sorted(tables):
+            if t in skip:
+                continue
+            snap[t] = [tuple(r) for r in
+                       conn.execute(f'SELECT * FROM "{t}"').fetchall()]
+        return snap
+    finally:
+        conn.close()
+
+
+def _seed_pending_sale():
+    import app.db as _db
+    import json as _json
+    conn = _db.connect()
+    try:
+        conn.execute(
+            "INSERT INTO pending_actions (shop_id, action_type, payload_json,"
+            " preview_text) VALUES (?, 'sale', ?, ?)",
+            (SHOP, _json.dumps({"product": "Bread", "qty": 2}),
+             "preview: 2 x Bread"))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_readonly_authorizer_blocks_business_writes(wh_env):
+    import sqlite3
+    import app.db as _db
+    conn = _db.connect()
+    try:
+        _db.init_db(conn)
+        _db.enforce_read_only(conn)
+        with pytest.raises(sqlite3.DatabaseError):
+            conn.execute("INSERT INTO products (shop_id, name) VALUES (?, 'x')",
+                         (SHOP,))
+        with pytest.raises(sqlite3.DatabaseError):
+            conn.execute("UPDATE shops SET name = 'hacked' WHERE shop_id = ?",
+                         (SHOP,))
+        with pytest.raises(sqlite3.DatabaseError):
+            conn.execute("DELETE FROM flags WHERE shop_id = ?", (SHOP,))
+        with pytest.raises(sqlite3.DatabaseError):
+            conn.execute("CREATE TABLE evil (id INTEGER)")
+        # Operational pipeline stays writable; reads work everywhere.
+        conn.execute("INSERT INTO send_queue (to_number, channel, kind,"
+                     " payload_json) VALUES (?, 'whapi', 'text', '{}')",
+                     (SHOP,))
+        conn.execute("INSERT OR IGNORE INTO shops (shop_id, name)"
+                     " VALUES (?, ?)", (SHOP, "x"))
+        assert conn.execute("SELECT COUNT(*) n FROM products").fetchone()["n"] \
+            >= 0
+    finally:
+        conn.close()
+
+
+def test_readonly_battery_leaves_db_unchanged(wh_env, monkeypatch):
+    from app.db import READ_ONLY
+    fake = _FakePost()
+    monkeypatch.setattr(whapi.httpx, "post", fake)
+    _set_shop_channel("infobip")
+    _seed_pending_sale()
+    before = _snapshot()
+    client = TestClient(app)
+    texts = ["yes", "undo", "cancel", "reset demo", "delete my data",
+             "remind me tomorrow 7am to test", "daily plan off",
+             "my reminders", "menu", "resend"]
+    for i, text in enumerate(texts):
+        n0 = len(fake.calls)
+        _post_text(client, fake, f"w-bat-{i}", text)
+        bodies = [c["json"].get("body", {}).get("text", "")
+                  if c["url"].endswith("/messages/interactive")
+                  else c["json"].get("body", "")
+                  for c in fake.calls[n0:]]
+        assert bodies, text  # every message got a reply
+        if text in ("my reminders", "menu", "resend"):
+            continue  # reads answer normally
+        assert any("Testing mode" in b or "Something went wrong" in b
+                   or "Couldn't save" in b for b in bodies), (text, bodies)
+    assert READ_ONLY.get() is False  # flag never leaks across messages
+    assert _snapshot() == before
+
+
+def test_readonly_yes_cannot_confirm_live_pending(wh_env, monkeypatch):
+    import app.db as _db
+    fake = _FakePost()
+    monkeypatch.setattr(whapi.httpx, "post", fake)
+    _seed_pending_sale()
+    client = TestClient(app)
+    texts = _post_text(client, fake, "w-trap-1", "yes")
+    assert "Testing mode" in texts[-1]["json"]["body"]
+    conn = _db.connect()
+    try:
+        pend = conn.execute("SELECT status FROM pending_actions"
+                            " WHERE shop_id = ?", (SHOP,)).fetchall()
+        sales = conn.execute("SELECT COUNT(*) n FROM sales WHERE shop_id = ?",
+                             (SHOP,)).fetchone()["n"]
+    finally:
+        conn.close()
+    assert [p["status"] for p in pend] == ["pending"]  # untouched
+    assert sales == 0  # nothing recorded
+
+
+def test_readonly_execute_plan_skips_writes_keeps_reads(wh_env):
+    import app.db as _db
+    from app.interpreter import execute_plan
+    conn = _db.connect()
+    try:
+        _db.init_db(conn)
+        _db.enforce_read_only(conn)
+        token = _db.READ_ONLY.set(True)
+        try:
+            msg, _ = execute_plan(
+                conn, SHOP,
+                {"tasks": [{"kind": "sale",
+                             "args": {"product": "Bread", "qty": 2}},
+                            {"kind": "balance", "args": {}}],
+                 "understood": "sell bread and show balance"},
+                {"text": "sell 2 bread, what's my balance?"})
+        finally:
+            _db.READ_ONLY.reset(token)
+        assert "Testing mode" in msg
+        assert "alance" in msg  # the read still ran
+        assert conn.execute("SELECT COUNT(*) n FROM pending_actions"
+                            " WHERE shop_id = ?", (SHOP,)).fetchone()["n"] == 0
+        assert conn.execute("SELECT COUNT(*) n FROM sales"
+                            " WHERE shop_id = ?", (SHOP,)).fetchone()["n"] == 0
+    finally:
+        conn.close()
+
+
+def test_readonly_daily_plan_show_allowed_set_blocked(wh_env):
+    import app.db as _db
+    from app.interpreter import execute_plan
+    conn = _db.connect()
+    try:
+        _db.init_db(conn)
+        _db.enforce_read_only(conn)
+        token = _db.READ_ONLY.set(True)
+        try:
+            show, _ = execute_plan(
+                conn, SHOP, {"tasks": [{"kind": "daily_plan", "args": {}}]},
+                {"text": "daily plan"})
+            blocked, _ = execute_plan(
+                conn, SHOP, {"tasks": [{"kind": "daily_plan",
+                                        "args": {"setting": "off"}}]},
+                {"text": "daily plan off"})
+        finally:
+            _db.READ_ONLY.reset(token)
+        assert "Testing mode" not in show
+        assert "Testing mode" in blocked
+    finally:
+        conn.close()
+
+
+def test_readonly_photo_blocked_before_vision(wh_env, monkeypatch):
+    import app.agent as _agent
+    import app.db as _db
+    conn = _db.connect()
+    try:
+        _db.init_db(conn)
+        _db.enforce_read_only(conn)
+        monkeypatch.setattr(
+            _agent, "read_shop_photo",
+            lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("vision must not run")))
+        token = _db.READ_ONLY.set(True)
+        try:
+            doc, reply, buttons = _agent.handle_photo(
+                conn, SHOP, b"fake-bytes", "shelf")
+        finally:
+            _db.READ_ONLY.reset(token)
+        assert doc is None and buttons is None
+        assert "Testing mode" in reply
+        assert conn.execute("SELECT COUNT(*) n FROM photo_hashes"
+                            " WHERE shop_id = ?", (SHOP,)).fetchone()["n"] == 0
+    finally:
+        conn.close()
+
+
+def test_writes_allowed_with_explicit_unlock(wh_env, monkeypatch):
+    import app.db as _db
+    fake = _FakePost()
+    monkeypatch.setattr(whapi.httpx, "post", fake)
+    monkeypatch.setenv("WHAPI_ALLOW_WRITES", "1")
+    client = TestClient(app)
+    texts = _post_text(client, fake, "w-unlock-1", "daily plan off")
+    assert "Testing mode" not in texts[-1]["json"]["body"]
+    conn = _db.connect()
+    try:
+        row = conn.execute("SELECT value FROM flags WHERE shop_id = ?"
+                           " AND key = 'plan_off'", (SHOP,)).fetchone()
+    finally:
+        conn.close()
+    assert row is not None  # the write landed
+
+
+def test_other_channels_unaffected_by_readonly(wh_env):
+    import app.db as _db
+    from app.agent import handle_text
+    conn = _db.connect()
+    try:
+        _db.init_db(conn)
+        msg, _ = handle_text(conn, SHOP, "daily plan off")
+        assert "Testing mode" not in msg
+        row = conn.execute("SELECT value FROM flags WHERE shop_id = ?"
+                           " AND key = 'plan_off'", (SHOP,)).fetchone()
+        assert row is not None  # normal path still writes
+    finally:
+        conn.close()

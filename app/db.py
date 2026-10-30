@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from contextvars import ContextVar
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -342,6 +343,70 @@ CREATE INDEX IF NOT EXISTS idx_rem_due ON reminders(status, due_at);
 
 def get_db_path() -> Path:
     return Path(os.environ.get("SISI_DB", "data/sisi.db"))
+
+
+READ_ONLY: ContextVar[bool] = ContextVar("sisi_read_only", default=False)
+"""True while handling a message on a read-only testing channel.
+
+Set by process_message for Whapi until database durability is proven
+(unlock is explicit: WHAPI_ALLOW_WRITES=1). Operational memory
+(conversation turns, last-reply, numbered options) no-ops while set;
+business writes are denied by `enforce_read_only` below.
+"""
+
+
+def read_only() -> bool:
+    """True when the current message must not mutate business records."""
+    return READ_ONLY.get()
+
+
+READ_ONLY_WRITE_TABLES = frozenset(
+    {"messages_seen", "send_queue", "send_pacing", "reports"})
+"""Tables writable in read-only mode: dedupe, the reply pipeline, and
+generated-report artifacts. Everything else is denied."""
+
+READ_ONLY_INSERT_TABLES = frozenset({"shops"})
+"""Tables allowing INSERT but not UPDATE/DELETE in read-only mode.
+
+`ensure_shop`'s INSERT OR IGNORE is a no-op for existing shops; the
+tester's shop already exists, and setup (which would populate a new
+row) is blocked separately.
+"""
+
+
+def enforce_read_only(conn: sqlite3.Connection) -> None:
+    """Deny business writes on this connection via a SQLite authorizer.
+
+    Reads are allowed everywhere. Writes are allowed only on
+    READ_ONLY_WRITE_TABLES (+ INSERT on READ_ONLY_INSERT_TABLES); all
+    DDL is denied. Call AFTER init_db. Denied statements raise
+    sqlite3.DatabaseError ("not authorized"), which the message pipeline
+    turns into the friendly fallback — never a silent write, never silence.
+    """
+
+    def _auth(action: int, p1: str | None, p2: str | None,
+              _db: str | None, _src: str | None) -> int:
+        if action == sqlite3.SQLITE_SELECT:
+            return sqlite3.SQLITE_OK
+        if action == sqlite3.SQLITE_INSERT:
+            if p1 in READ_ONLY_WRITE_TABLES \
+                    or p1 in READ_ONLY_INSERT_TABLES:
+                return sqlite3.SQLITE_OK
+            return sqlite3.SQLITE_DENY
+        if action in (sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE):
+            if p1 in READ_ONLY_WRITE_TABLES:
+                return sqlite3.SQLITE_OK
+            return sqlite3.SQLITE_DENY
+        if action in (sqlite3.SQLITE_CREATE_TABLE, sqlite3.SQLITE_DROP_TABLE,
+                      sqlite3.SQLITE_CREATE_INDEX, sqlite3.SQLITE_DROP_INDEX,
+                      sqlite3.SQLITE_CREATE_TRIGGER,
+                      sqlite3.SQLITE_DROP_TRIGGER,
+                      sqlite3.SQLITE_CREATE_VIEW, sqlite3.SQLITE_DROP_VIEW,
+                      sqlite3.SQLITE_ALTER_TABLE):
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    conn.set_authorizer(_auth)
 
 
 def connect(path: str | Path | None = None) -> sqlite3.Connection:

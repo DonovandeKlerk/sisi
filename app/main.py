@@ -19,7 +19,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, PlainTextResponse, Response
 
 from app.agent import handle_photo, handle_text, handle_voice, take_lists, take_media
-from app.db import connect, init_db, now_iso
+from app.db import READ_ONLY, connect, enforce_read_only, init_db, now_iso
 from app.i18n import CURRENT_LANG, STRINGS, detect, owner_lang
 from app.i18n import t as _t
 from app.vision import VisionError
@@ -348,6 +348,8 @@ def _already_seen(message_id: str, shop_id: str) -> bool:
     conn = connect()
     try:
         init_db(conn)
+        if READ_ONLY.get():
+            enforce_read_only(conn)
         cur = conn.execute(
             "INSERT OR IGNORE INTO messages_seen (message_id, shop_id) VALUES (?, ?)",
             (message_id, shop_id),
@@ -360,6 +362,9 @@ def _already_seen(message_id: str, shop_id: str) -> bool:
 
 def _with_consent(conn, shop_id: str, reply: str) -> str:
     """Append the POPIA consent line on a shop's first-ever reply."""
+    from app.db import read_only as _ro
+    if _ro():
+        return reply  # testing mode: consent stamp can wait for live
     row = conn.execute("SELECT consent_given_at FROM shops WHERE shop_id = ?",
                        (shop_id,)).fetchone()
     if row is not None and row["consent_given_at"] is not None:
@@ -416,9 +421,16 @@ def _slow_line(conn, msg: IncomingMessage) -> str | None:
 def process_message(msg: IncomingMessage) -> None:
     """Background worker: one message, own connection, never raises."""
     CURRENT_LANG.set("en")
+    # Read-only testing: the Whapi channel must not mutate business
+    # records until database durability is proven. Explicit unlock only:
+    # WHAPI_ALLOW_WRITES=1. Other channels are unaffected.
+    ro = (msg.channel or "meta") == "whapi" \
+        and os.environ.get("WHAPI_ALLOW_WRITES", "") != "1"
+    token = READ_ONLY.set(ro)
     try:
-        log.info("handling id=%s channel=%s kind=%s shop=%s", msg.message_id,
-                 msg.channel, msg.kind, msg.shop_id)
+        log.info("handling id=%s channel=%s kind=%s shop=%s%s",
+                 msg.message_id, msg.channel, msg.kind, msg.shop_id,
+                 " READ-ONLY" if ro else "")
         if _already_seen(msg.message_id, msg.shop_id):
             log.info("duplicate %s ignored", msg.message_id)
             return
@@ -435,6 +447,8 @@ def process_message(msg: IncomingMessage) -> None:
                 log.error("friendly fallback failed:\n%s", traceback.format_exc())
     except Exception:
         log.error("process_message failed:\n%s", traceback.format_exc())
+    finally:
+        READ_ONLY.reset(token)
 
 
 def _handle_message(sender, msg: IncomingMessage) -> None:
@@ -445,12 +459,23 @@ def _handle_message(sender, msg: IncomingMessage) -> None:
     conn = connect()
     try:
         init_db(conn)
+        if READ_ONLY.get():
+            enforce_read_only(conn)
         from app.tools import ensure_shop
         ensure_shop(conn, msg.shop_id)
         channel = msg.channel or "meta"
-        conn.execute("UPDATE shops SET channel = ? WHERE shop_id = ?",
-                     (channel, msg.shop_id))
-        conn.commit()
+        # Scheduled routing (reminders, daily plan) follows the last
+        # inbound channel — except Whapi testing, which must never
+        # silently flip it. Explicit switch only: WHAPI_FOLLOW_CHANNEL=1
+        # (and only when writes are allowed at all).
+        from app.db import read_only as _ro
+        if not _ro() and (channel != "whapi"
+                          or os.environ.get("WHAPI_FOLLOW_CHANNEL", "") == "1"):
+            conn.execute("UPDATE shops SET channel = ? WHERE shop_id = ?",
+                         (channel, msg.shop_id))
+            conn.commit()
+        else:
+            log.info("whapi inbound: shops.channel left unchanged")
         CURRENT_LANG.set(detect(msg.text, default=owner_lang(conn, msg.shop_id)))
         out = QueuedSender.wrap(sender, conn, channel)
         try:

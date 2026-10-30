@@ -55,6 +55,9 @@ def load_history(conn: sqlite3.Connection, shop_id: str, limit: int = HISTORY_TU
 
 
 def save_turn(conn: sqlite3.Connection, shop_id: str, role: str, content: str) -> None:
+    from app.db import read_only
+    if read_only():
+        return  # testing mode: test chatter must not pollute LLM history
     conn.execute(
         "INSERT INTO conversation_turns (shop_id, role, content) VALUES (?, ?, ?)",
         (shop_id, role, content),
