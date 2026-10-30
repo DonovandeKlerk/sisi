@@ -30,6 +30,7 @@ vol = modal.Volume.from_name("sisi-data", create_if_missing=True)
               volumes={"/data": vol})
 def apply_dump(dump_path: str, force: bool = False) -> dict:
     import os
+    import re
     import sqlite3
 
     import turso_serverless
@@ -42,10 +43,15 @@ def apply_dump(dump_path: str, force: bool = False) -> dict:
         tables = [r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table'"
             " AND name NOT LIKE 'sqlite_%'").fetchall()]
-        if "shops" in tables and not force:
-            n = conn.execute("SELECT COUNT(*) FROM shops").fetchone()[0]
-            if n:
-                return {"aborted": f"target holds {n} shop rows; refusing"}
+        if tables and not force:
+            total = 0
+            for (t,) in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    " AND name NOT LIKE 'sqlite_%'").fetchall():
+                total += conn.execute(
+                    f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            if total:
+                return {"aborted": f"target holds {total} rows; refusing"}
         with open("/data/" + dump_path.lstrip("/")) as f:
             text = f.read()
         conn.execute("PRAGMA foreign_keys = OFF")
@@ -61,6 +67,16 @@ def apply_dump(dump_path: str, force: bool = False) -> dict:
             head = stmt.split(None, 1)[0].upper().rstrip(";")
             if head in ("BEGIN", "COMMIT", "PRAGMA"):
                 continue
+            if head == "CREATE":
+                # Idempotent DDL: safe whether the target is empty or
+                # already holds our schema (observed once, unexplained).
+                stmt = re.sub(r"^CREATE\s+TABLE\s+",
+                              "CREATE TABLE IF NOT EXISTS ", stmt,
+                              count=1, flags=re.IGNORECASE)
+                stmt = re.sub(r"^CREATE\s+(UNIQUE\s+)?INDEX\s+",
+                              lambda m: f"CREATE {m.group(1) or ''}INDEX"
+                                        " IF NOT EXISTS ", stmt,
+                              count=1, flags=re.IGNORECASE)
             conn.execute(stmt)
             ran += 1
         conn.commit()
@@ -78,6 +94,43 @@ def apply_dump(dump_path: str, force: bool = False) -> dict:
         conn.close()
 
 
+@app.function(image=image, secrets=[modal.Secret.from_name("sisi-env")])
+def snapshot() -> dict:
+    """Per-table row counts + content hashes. Same hashing as
+    scripts/turso_verify.py (repr of value tuples), so reports compare
+    exactly. Only counts and hashes are printed, never contents."""
+    import hashlib
+    import os
+
+    import turso_serverless
+
+    conn = turso_serverless.connect(
+        os.environ["TURSO_DATABASE_URL"],
+        auth_token=os.environ["TURSO_AUTH_TOKEN"],
+    )
+    try:
+        tables = sorted(r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+            " AND name NOT LIKE 'sqlite_%'").fetchall())
+        out = {}
+        for table in tables:
+            cols = [r[1] for r in conn.execute(
+                f"PRAGMA table_info({table})").fetchall()]
+            order = ", ".join(cols) if cols else "rowid"
+            h = hashlib.sha256()
+            n = 0
+            for row in conn.execute(f"SELECT * FROM {table} ORDER BY {order}"):
+                h.update(repr(tuple(row)).encode())
+                n += 1
+            out[table] = {"rows": n, "sha": h.hexdigest()[:16]}
+        return {"tables": out}
+    finally:
+        conn.close()
+
+
 @app.local_entrypoint()
-def main(dump: str, force: bool = False):
-    print(apply_dump.remote(dump, force))
+def main(dump: str = "", force: bool = False, snapshot_only: bool = False):
+    if snapshot_only or not dump:
+        print(snapshot.remote())
+    else:
+        print(apply_dump.remote(dump, force))
