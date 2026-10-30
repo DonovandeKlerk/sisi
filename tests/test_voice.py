@@ -335,3 +335,31 @@ def test_webhook_audio_without_media_id(voice_env):
     out = client.get("/_sim/outbox", params={"shop": SHOP}).json()["messages"]
     assert len(out) == 2 and out[0]["body"].startswith("⏳")
     assert "empty" in out[1]["body"]
+
+
+def test_transcribe_keywords_truncated_to_30_chars(voice_env, monkeypatch):
+    # Live 400: "ASR keyword 28 exceeds the maximum length of 30
+    # characters" once long intake product names became keywords.
+    seen = {}
+
+    def fake_post(url, headers=None, data=None, files=None, timeout=None):
+        seen["data"] = data
+        return _FakeTResp({"turns": [{"transcript": "hi"}]})
+
+    monkeypatch.setattr(voice.httpx, "post", fake_post)
+    transcribe_wav(b"RIFF....", SHOP, ["Albany Superior White Bread 700g",
+                                       "NPL Anabolic Whey Chocolate Nougat 908g",
+                                       "  ", "Coke"])
+    req = json.loads(seen["data"]["request"])
+    assert all(len(k) <= 30 for k in req["keywords"])
+    assert "Albany Superior White Bread 70" in req["keywords"]
+    assert "NPL Anabolic Whey Chocolate No" in req["keywords"]
+    assert "Coke" in req["keywords"]
+    assert "" not in req["keywords"]
+    assert len(req["keywords"]) == len(set(req["keywords"]))
+
+
+def test_fit_keywords_dedupes_after_truncation():
+    from app.voice import _fit_keywords
+    out = _fit_keywords(["x" * 31, "x" * 40, "  padded  ", "", "ok"])
+    assert out == ["x" * 30, "padded", "ok"]

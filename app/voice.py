@@ -28,6 +28,9 @@ from app.net import call_with_retries
 TRANSCRIBE_URL = "https://api.meta.ai/v1/asr/transcribe"
 ASR_MODEL = "muse-voice-transcribe-1.0"
 MAX_AUDIO_BYTES = 10 * 1024 * 1024
+MAX_KEYWORD_CHARS = 30
+"""ASR rejects keywords longer than this (400: 'exceeds the maximum
+length of 30 characters'). Product/customer names are truncated to fit."""
 
 KEYWORDS = [
     "Sasko", "Albany", "Iwisa", "Ace", "Tastic", "Lucky Star", "Coke", "Stoney",
@@ -78,6 +81,22 @@ def _print_api_error(body: str) -> None:
     print(body[:4000], file=sys.stderr)
 
 
+def _fit_keywords(keywords: list[str]) -> list[str]:
+    """Truncate keywords to the ASR length limit, drop empties, dedupe.
+
+    Truncation (not removal) keeps the prefix bias for long product
+    names like 'NPL Anabolic Whey Chocolate Nougat 908g'.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for kw in keywords or []:
+        fit = (kw or "").strip()[:MAX_KEYWORD_CHARS].strip()
+        if fit and fit not in seen:
+            seen.add(fit)
+            out.append(fit)
+    return out
+
+
 def _log_stt(shop_id: str, wav_bytes: int) -> None:
     try:
         with open(_llm.TOKEN_LOG, "a") as f:
@@ -108,7 +127,7 @@ def transcribe_wav(wav: bytes, shop_id: str = "", extra_keywords: list[str] | No
         "model": ASR_MODEL,
         "audioEncoding": "WAV",
         "languageBias": _language_bias(),
-        "keywords": keywords[:50],
+        "keywords": _fit_keywords(keywords)[:50],
     })
     def send():
         resp = httpx.post(
