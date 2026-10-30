@@ -25,6 +25,7 @@ from app.i18n import t as _t
 from app.vision import VisionError
 from app.voice import VoiceError
 from app.vonage import VonageSender, download_vonage_media, parse_vonage_webhook
+from app.whapi import parse_whapi_status, parse_whapi_webhook
 from app.infobip import (InfobipSender, download_infobip_media,
                          parse_infobip_webhook)
 from app.providers import sender_for_channel
@@ -298,6 +299,51 @@ async def webhook_infobip_receive(request: Request,
     return {"status": "ok"}
 
 
+@app.post("/webhook/whapi/{token}")
+async def webhook_whapi_receive(request: Request,
+                                background_tasks: BackgroundTasks,
+                                token: str):
+    # Whapi documents no signature scheme, so auth is a shared secret
+    # embedded in the configured URL path (same pattern as Infobip):
+    #   https://<app>/webhook/whapi/<WHAPI_WEBHOOK_TOKEN>
+    # compared in constant time. Fails closed when unconfigured. One
+    # route serves messages + statuses (Whapi posts all events to the
+    # same channel webhook URL); channel, allowlist and loop guards
+    # live in the parser. Always 200 instantly so Whapi never retries
+    # a receipt; redelivery is still safe via the messages_seen key.
+    expected = os.environ.get("WHAPI_WEBHOOK_TOKEN", "").strip()
+    if not expected or not hmac.compare_digest(token.strip(), expected):
+        log.warning("whapi webhook 403: secret %s len=%d got len=%d",
+                    "set" if expected else "UNSET", len(expected), len(token))
+        raise HTTPException(status_code=403, detail="bad webhook token")
+    raw = await request.body()
+    if len(raw) > MAX_WEBHOOK_BYTES:
+        raise HTTPException(status_code=413, detail="payload too large")
+    try:
+        payload = json.loads(raw or b"{}")
+    except ValueError:
+        return {"status": "ignored"}
+    try:
+        reports = parse_whapi_status(payload)
+        if reports:
+            _apply_dlrs(reports)
+    except Exception:
+        log.warning("whapi status parse failed", exc_info=True)
+    msgs = parse_whapi_webhook(payload)
+    if not msgs and not isinstance(payload.get("event"), dict):
+        log.warning("whapi inbound dropped: no messages keys=%s",
+                    sorted(payload.keys()) if isinstance(payload, dict) else "?")
+    for msg in msgs:
+        log.info("whapi inbound id=%s from=%s type=%s", msg.message_id,
+                 msg.shop_id, msg.kind)
+        if _rate_limited(msg.shop_id):
+            log.warning("rate-limited %s", msg.shop_id)
+            continue
+        # No mark_read: Whapi documents no read-receipt endpoint.
+        _dispatch(background_tasks, msg)
+    return {"status": "ok"}
+
+
 def _already_seen(message_id: str, shop_id: str) -> bool:
     conn = connect()
     try:
@@ -328,6 +374,14 @@ def _with_consent(conn, shop_id: str, reply: str) -> str:
 
 def _download_msg_media(msg: IncomingMessage, label: str) -> bytes | None:
     """Fetch message media for any channel. None when the message has no media ref."""
+    if (msg.channel or "meta") == "whapi":
+        # Whapi media ids are NOT Meta graph ids: never fall through to
+        # download_media. The Auto-Download link (when present) is only
+        # a fallback inside the Whapi downloader.
+        if not msg.media_id and not msg.media_url:
+            return None
+        from app.whapi import download_whapi_media
+        return download_whapi_media(msg.media_id or "", msg.media_url)
     if msg.media_url:
         if (msg.channel or "meta") == "infobip":
             return download_infobip_media(msg.media_url)

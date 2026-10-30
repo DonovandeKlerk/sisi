@@ -7186,7 +7186,7 @@ def resend_last_media(conn: sqlite3.Connection, shop_id: str) -> str:
             "caption": failed.get("caption", ""),
             "filename": failed.get("filename", "")}
     channel = ensure_shop(conn, shop_id)["channel"] or "meta"
-    if channel in ("vonage", "infobip"):
+    if channel in ("vonage", "infobip", "whapi"):
         from app.mediasend import request_media_send
         request_media_send(conn, shop_id, channel, kind,
                            {k: item[k] for k in ("url", "caption",

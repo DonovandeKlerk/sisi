@@ -1,7 +1,7 @@
 """Explicit channel provider selection.
 
 Replies normally go out on the channel a message arrived on. Setting
-``SISI_PROVIDER`` to ``meta``, ``vonage`` or ``infobip`` locks ALL sending
+``SISI_PROVIDER`` to ``meta``, ``vonage``, ``infobip`` or ``whapi`` locks ALL sending
 to that one provider: any attempt to send via another channel raises
 ``WrongProviderError`` instead of silently crossing providers. Unset (the
 default) preserves the legacy per-channel routing.
@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import os
 
-CHANNELS = ("meta", "vonage", "infobip")
-QUEUED_CHANNELS = ("vonage", "infobip")
+CHANNELS = ("meta", "vonage", "infobip", "whapi")
+QUEUED_CHANNELS = ("vonage", "infobip", "whapi")
 """Channels whose sends pace through the SQLite queue (strict rate limits)."""
 
 
@@ -56,6 +56,10 @@ def sender_for_channel(channel: str | None):
         from app.infobip import InfobipSender
 
         return InfobipSender()
+    if code == "whapi":
+        from app.whapi import WhapiSender
+
+        return WhapiSender()
     from app.whatsapp import get_sender
 
     return get_sender()
