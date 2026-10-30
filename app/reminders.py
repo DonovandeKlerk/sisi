@@ -22,8 +22,13 @@ DELAYED_AFTER = timedelta(minutes=15)
 WINDOW_HOURS = 24
 """Freeform WhatsApp only inside this window after the last inbound message."""
 
-WINDOW_EXEMPT_CHANNELS = ("vonage",)
-"""Channels without an enforced 24h window (sandbox sender, no templates)."""
+WINDOW_EXEMPT_CHANNELS = ("vonage", "whapi")
+"""Channels without an enforced 24h window (sandbox sender, no templates).
+
+Whapi is a linked phone, not a Cloud API number: it sends as a normal
+WhatsApp client with no template mechanism, so window-gating would only
+block with no recovery path.
+"""
 
 WINDOW_GATED_CHANNELS = ("meta", "infobip")
 """Channels where outside-window sends need an approved template."""

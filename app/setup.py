@@ -61,6 +61,7 @@ def setup_step(conn: sqlite3.Connection, shop_id: str) -> int | None:
 
 def needs_setup(conn: sqlite3.Connection, shop_id: str) -> bool:
     """True for a fresh shop that never finished setup. Shops with books pass."""
+    from app.db import read_only
     if _flag(conn, shop_id, "setup-done"):
         return False
     if setup_step(conn, shop_id):
@@ -69,7 +70,8 @@ def needs_setup(conn: sqlite3.Connection, shop_id: str) -> bool:
         n = conn.execute(f"SELECT COUNT(*) n FROM {table} WHERE shop_id = ?",
                          (shop_id,)).fetchone()["n"]
         if n:
-            _set_flag(conn, shop_id, "setup-done", "1")
+            if not read_only():
+                _set_flag(conn, shop_id, "setup-done", "1")
             return False
     return True
 

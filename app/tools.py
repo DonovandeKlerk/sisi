@@ -1686,9 +1686,11 @@ def get_intake_session(conn: sqlite3.Connection, shop_id: str) -> dict | None:
     if (row["status"] or "") == "done":
         return None
     if row["expires_at"] and row["expires_at"] <= now_iso():
-        conn.execute("DELETE FROM intake_sessions WHERE shop_id = ?",
-                     (shop_id,))
-        conn.commit()
+        from app.db import read_only
+        if not read_only():
+            conn.execute("DELETE FROM intake_sessions WHERE shop_id = ?",
+                         (shop_id,))
+            conn.commit()
         return None
     stash = _load_intake_json(row["stash_json"], {})
     out = {
@@ -7186,7 +7188,7 @@ def resend_last_media(conn: sqlite3.Connection, shop_id: str) -> str:
             "caption": failed.get("caption", ""),
             "filename": failed.get("filename", "")}
     channel = ensure_shop(conn, shop_id)["channel"] or "meta"
-    if channel in ("vonage", "infobip"):
+    if channel in ("vonage", "infobip", "whapi"):
         from app.mediasend import request_media_send
         request_media_send(conn, shop_id, channel, kind,
                            {k: item[k] for k in ("url", "caption",
@@ -7208,6 +7210,9 @@ def remember_last_reply(conn: sqlite3.Connection, shop_id: str,
     are not kept, so a resent reply arrives as plain text. Empty replies
     and generic crash fallbacks are never stored.
     """
+    from app.db import read_only
+    if read_only():
+        return  # testing mode: no operational memory writes either
     if not (text or "").strip():
         return
     conn.execute("INSERT INTO flags (shop_id, key, value) VALUES (?, ?, ?)"

@@ -138,7 +138,15 @@ def test_list_cancel_move(conn):
     assert cancel_numbered(conn, SHOP, 9).startswith("No reminder with that number")
 
 
-def test_offer_yes_and_time_flows(conn):
+def test_offer_yes_and_time_flows(conn, monkeypatch):
+    import app.reminders as _rem
+    # Controlled clock: Monday 26 Oct 2026, so "Friday" is 30 Oct no
+    # matter when the suite runs (it broke once Friday actually came).
+    frozen = datetime(2026, 10, 26, 10, 0, tzinfo=SAST)
+    orig = _rem.now_sast
+    monkeypatch.setattr(_rem, "now_sast",
+                        lambda now=None: orig(frozen) if now is None
+                        else orig(now))
     msg, buttons = handle_text(conn, SHOP,
                                "Sipho will pay on Friday")
     assert buttons == ["Yes", "No"]

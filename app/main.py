@@ -19,12 +19,13 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, PlainTextResponse, Response
 
 from app.agent import handle_photo, handle_text, handle_voice, take_lists, take_media
-from app.db import connect, init_db, now_iso
+from app.db import READ_ONLY, connect, enforce_read_only, init_db, now_iso
 from app.i18n import CURRENT_LANG, STRINGS, detect, owner_lang
 from app.i18n import t as _t
 from app.vision import VisionError
 from app.voice import VoiceError
 from app.vonage import VonageSender, download_vonage_media, parse_vonage_webhook
+from app.whapi import parse_whapi_status, parse_whapi_webhook
 from app.infobip import (InfobipSender, download_infobip_media,
                          parse_infobip_webhook)
 from app.providers import sender_for_channel
@@ -298,10 +299,57 @@ async def webhook_infobip_receive(request: Request,
     return {"status": "ok"}
 
 
+@app.post("/webhook/whapi/{token}")
+async def webhook_whapi_receive(request: Request,
+                                background_tasks: BackgroundTasks,
+                                token: str):
+    # Whapi documents no signature scheme, so auth is a shared secret
+    # embedded in the configured URL path (same pattern as Infobip):
+    #   https://<app>/webhook/whapi/<WHAPI_WEBHOOK_TOKEN>
+    # compared in constant time. Fails closed when unconfigured. One
+    # route serves messages + statuses (Whapi posts all events to the
+    # same channel webhook URL); channel, allowlist and loop guards
+    # live in the parser. Always 200 instantly so Whapi never retries
+    # a receipt; redelivery is still safe via the messages_seen key.
+    expected = os.environ.get("WHAPI_WEBHOOK_TOKEN", "").strip()
+    if not expected or not hmac.compare_digest(token.strip(), expected):
+        log.warning("whapi webhook 403: secret %s len=%d got len=%d",
+                    "set" if expected else "UNSET", len(expected), len(token))
+        raise HTTPException(status_code=403, detail="bad webhook token")
+    raw = await request.body()
+    if len(raw) > MAX_WEBHOOK_BYTES:
+        raise HTTPException(status_code=413, detail="payload too large")
+    try:
+        payload = json.loads(raw or b"{}")
+    except ValueError:
+        return {"status": "ignored"}
+    try:
+        reports = parse_whapi_status(payload)
+        if reports:
+            _apply_dlrs(reports)
+    except Exception:
+        log.warning("whapi status parse failed", exc_info=True)
+    msgs = parse_whapi_webhook(payload)
+    if not msgs and not isinstance(payload.get("event"), dict):
+        log.warning("whapi inbound dropped: no messages keys=%s",
+                    sorted(payload.keys()) if isinstance(payload, dict) else "?")
+    for msg in msgs:
+        log.info("whapi inbound id=%s from=%s type=%s", msg.message_id,
+                 msg.shop_id, msg.kind)
+        if _rate_limited(msg.shop_id):
+            log.warning("rate-limited %s", msg.shop_id)
+            continue
+        # No mark_read: Whapi documents no read-receipt endpoint.
+        _dispatch(background_tasks, msg)
+    return {"status": "ok"}
+
+
 def _already_seen(message_id: str, shop_id: str) -> bool:
     conn = connect()
     try:
         init_db(conn)
+        if READ_ONLY.get():
+            enforce_read_only(conn)
         cur = conn.execute(
             "INSERT OR IGNORE INTO messages_seen (message_id, shop_id) VALUES (?, ?)",
             (message_id, shop_id),
@@ -314,6 +362,9 @@ def _already_seen(message_id: str, shop_id: str) -> bool:
 
 def _with_consent(conn, shop_id: str, reply: str) -> str:
     """Append the POPIA consent line on a shop's first-ever reply."""
+    from app.db import read_only as _ro
+    if _ro():
+        return reply  # testing mode: consent stamp can wait for live
     row = conn.execute("SELECT consent_given_at FROM shops WHERE shop_id = ?",
                        (shop_id,)).fetchone()
     if row is not None and row["consent_given_at"] is not None:
@@ -328,6 +379,14 @@ def _with_consent(conn, shop_id: str, reply: str) -> str:
 
 def _download_msg_media(msg: IncomingMessage, label: str) -> bytes | None:
     """Fetch message media for any channel. None when the message has no media ref."""
+    if (msg.channel or "meta") == "whapi":
+        # Whapi media ids are NOT Meta graph ids: never fall through to
+        # download_media. The Auto-Download link (when present) is only
+        # a fallback inside the Whapi downloader.
+        if not msg.media_id and not msg.media_url:
+            return None
+        from app.whapi import download_whapi_media
+        return download_whapi_media(msg.media_id or "", msg.media_url)
     if msg.media_url:
         if (msg.channel or "meta") == "infobip":
             return download_infobip_media(msg.media_url)
@@ -362,9 +421,16 @@ def _slow_line(conn, msg: IncomingMessage) -> str | None:
 def process_message(msg: IncomingMessage) -> None:
     """Background worker: one message, own connection, never raises."""
     CURRENT_LANG.set("en")
+    # Read-only testing: the Whapi channel must not mutate business
+    # records until database durability is proven. Explicit unlock only:
+    # WHAPI_ALLOW_WRITES=1. Other channels are unaffected.
+    ro = (msg.channel or "meta") == "whapi" \
+        and os.environ.get("WHAPI_ALLOW_WRITES", "") != "1"
+    token = READ_ONLY.set(ro)
     try:
-        log.info("handling id=%s channel=%s kind=%s shop=%s", msg.message_id,
-                 msg.channel, msg.kind, msg.shop_id)
+        log.info("handling id=%s channel=%s kind=%s shop=%s%s",
+                 msg.message_id, msg.channel, msg.kind, msg.shop_id,
+                 " READ-ONLY" if ro else "")
         if _already_seen(msg.message_id, msg.shop_id):
             log.info("duplicate %s ignored", msg.message_id)
             return
@@ -381,6 +447,8 @@ def process_message(msg: IncomingMessage) -> None:
                 log.error("friendly fallback failed:\n%s", traceback.format_exc())
     except Exception:
         log.error("process_message failed:\n%s", traceback.format_exc())
+    finally:
+        READ_ONLY.reset(token)
 
 
 def _handle_message(sender, msg: IncomingMessage) -> None:
@@ -391,12 +459,23 @@ def _handle_message(sender, msg: IncomingMessage) -> None:
     conn = connect()
     try:
         init_db(conn)
+        if READ_ONLY.get():
+            enforce_read_only(conn)
         from app.tools import ensure_shop
         ensure_shop(conn, msg.shop_id)
         channel = msg.channel or "meta"
-        conn.execute("UPDATE shops SET channel = ? WHERE shop_id = ?",
-                     (channel, msg.shop_id))
-        conn.commit()
+        # Scheduled routing (reminders, daily plan) follows the last
+        # inbound channel — except Whapi testing, which must never
+        # silently flip it. Explicit switch only: WHAPI_FOLLOW_CHANNEL=1
+        # (and only when writes are allowed at all).
+        from app.db import read_only as _ro
+        if not _ro() and (channel != "whapi"
+                          or os.environ.get("WHAPI_FOLLOW_CHANNEL", "") == "1"):
+            conn.execute("UPDATE shops SET channel = ? WHERE shop_id = ?",
+                         (channel, msg.shop_id))
+            conn.commit()
+        else:
+            log.info("whapi inbound: shops.channel left unchanged")
         CURRENT_LANG.set(detect(msg.text, default=owner_lang(conn, msg.shop_id)))
         out = QueuedSender.wrap(sender, conn, channel)
         try:
