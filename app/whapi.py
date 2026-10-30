@@ -6,18 +6,24 @@ agent, voice, and vision handlers. Replies go out via `WhapiSender`.
 The live Infobip integration is untouched; provider selection stays
 explicit via `sender_for_channel` / `SISI_PROVIDER`.
 
-Safety model (this channel is linked to the owner's own WhatsApp
-account, so it must never act on personal chats):
+Safety model (this channel must never act on unrelated chats):
 - `channel_id` must match WHAPI_CHANNEL_ID (verified channel DEADPL-S9KV8).
 - `from_me` echoes are dropped (loop prevention: API-sent messages
   reappear on the webhook with source "api").
 - Only 1:1 chats (`@s.whatsapp.net`) are accepted; groups (`@g.us`),
   broadcasts, channels and status updates are ignored.
-- Messages from the linked number itself (WHAPI_NUMBER) are dropped.
+- Messages from the linked sender number itself (WHAPI_NUMBER) are
+  dropped; the sender number is never treated as a shop owner.
 - WHAPI_ALLOWLIST (comma-separated digits) is REQUIRED: with no
   allowlist configured, all inbound is dropped (fail closed).
 - Messages older than WHAPI_MAX_AGE_S (default 600) are dropped so a
   history sync can never replay old chats into the shop.
+
+Identity mapping: the shop is keyed by the TESTER's number (the `from`
+digits, e.g. 27710000002), which resolves to that number's existing
+shop row — its records are preserved, never reseeded or merged. The
+linked sender (WHAPI_NUMBER, e.g. 27745492157) only sends; it owns no
+shop.
 
 Config (env, never logged): WHAPI_TOKEN, WHAPI_CHANNEL_ID,
 WHAPI_NUMBER, WHAPI_WEBHOOK_TOKEN (inbound webhook path token),
@@ -66,7 +72,7 @@ log = logging.getLogger("sisi.whapi")
 
 DEFAULT_BASE_URL = "https://gate.whapi.cloud"
 DEFAULT_CHANNEL_ID = "DEADPL-S9KV8"
-DEFAULT_NUMBER = "27710000002"
+DEFAULT_NUMBER = "27745492157"
 
 MAX_BTNS = 3
 MAX_BTN_TITLE = 25

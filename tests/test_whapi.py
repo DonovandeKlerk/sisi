@@ -32,7 +32,7 @@ SHOP = DEMO_SHOP_ID  # tester chat number (allowlisted below)
 STRANGER = "27719998888"
 TOKEN = "wh-hook-1"
 CHANNEL = "DEADPL-S9KV8"
-OWN = "27710000002"
+OWN = "27745492157"  # linked sender: sends only, owns no shop
 NOW = 1790000000.0
 
 
@@ -163,6 +163,16 @@ def test_parse_drops_linked_number_itself(wh_env, monkeypatch):
     monkeypatch.setenv("WHAPI_ALLOWLIST", f"{SHOP},{OWN}")
     self_msg = _msg(mid="w-self-1", frm=OWN, node={"body": "note to self"})
     assert parse_whapi_webhook(_payload(self_msg), now=NOW) == []
+
+
+def test_parse_tester_maps_to_tester_shop_not_sender(wh_env):
+    # The shop key is the TESTER's number (from); the linked sender
+    # number must never appear as a shop owner.
+    msgs = parse_whapi_webhook(
+        _payload(_msg(mid="w-id-1", node={"body": "hi"})), now=NOW)
+    assert len(msgs) == 1
+    assert msgs[0].shop_id == SHOP
+    assert msgs[0].shop_id != OWN
 
 
 def test_parse_allowlist_required_and_enforced(wh_env, monkeypatch):
@@ -469,6 +479,41 @@ def test_webhook_text_end_to_end_and_duplicate(wh_env, monkeypatch):
     assert r.status_code == 200
     texts = [c for c in fake.calls if c["url"].endswith("/messages/text")]
     assert len(texts) == 1  # duplicate message id ignored
+
+
+def test_webhook_preserves_existing_shop_records(wh_env, monkeypatch):
+    import app.db as _db
+    conn = _db.connect()
+    try:
+        conn.execute("UPDATE shops SET name = 'MaZulu Test Spaza'"
+                     " WHERE shop_id = ?", (SHOP,))
+        conn.commit()
+        before = conn.execute("SELECT name FROM shops WHERE shop_id = ?",
+                              (SHOP,)).fetchone()["name"]
+        n_cust = conn.execute("SELECT COUNT(*) n FROM customers"
+                              " WHERE shop_id = ?", (SHOP,)).fetchone()["n"]
+    finally:
+        conn.close()
+    fake = _FakePost()
+    monkeypatch.setattr(whapi.httpx, "post", fake)
+    client = TestClient(app)
+    body = _payload(_msg(mid="w-pres-1", node={"body": "resend"}))
+    body["messages"][0]["timestamp"] = int(time.time())
+    assert client.post(f"/webhook/whapi/{TOKEN}", json=body).status_code == 200
+    assert [c for c in fake.calls
+            if c["url"].endswith("/messages/text")]  # replied via whapi
+    conn = _db.connect()
+    try:
+        after = conn.execute("SELECT name FROM shops WHERE shop_id = ?",
+                             (SHOP,)).fetchone()["name"]
+        still = conn.execute("SELECT COUNT(*) n FROM customers"
+                             " WHERE shop_id = ?", (SHOP,)).fetchone()["n"]
+        sender_shop = conn.execute("SELECT shop_id FROM shops WHERE shop_id = ?",
+                                   (OWN,)).fetchone()
+    finally:
+        conn.close()
+    assert (before, after, n_cust, still) == (after, before, still, n_cust)
+    assert sender_shop is None  # sender number owns no shop
 
 
 def test_webhook_status_applies_dlrs(wh_env, monkeypatch):
