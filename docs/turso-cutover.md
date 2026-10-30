@@ -19,9 +19,13 @@ same SQL dialect. Backend switches on two env vars; no SQL changes.
    (`libsql://...`; the URL is not secret, the token is).
 
 ## Maintenance window (owner approves the time; ~15 min)
-Inbound WhatsApp traffic cannot be paused, so the cutover is
-backup → import → verify → flip → reconcile. Scheduled writers keep
-running; their window writes are covered by step 6.
+Stop the app first: fresh containers load the new secret immediately,
+so a running cron re-creates the schema (in fresh-init column order,
+which breaks positional dump INSERTs) the moment credentials land.
+`modal app stop sisi` freezes every writer; provider retries redeliver
+anything sent during the window, and message-id dedupe makes redelivery
+safe. With writers frozen the file backup is the exact migration source
+and reconcile is a zero-drift proof instead of a replay.
 
 1. **Consistent backup.** Pick a running container id from
    `modal container list`, then run the SQLite backup API inside it
@@ -32,12 +36,17 @@ running; their window writes are covered by step 6.
    then `modal volume get sisi-data /backup-<ts>.db /tmp/cutover.db`.
    Record per-table counts (`scripts/turso_verify.py --db /tmp/cutover.db`).
 2. **Import (server-side; token never leaves Modal).**
-   `sqlite3 /tmp/cutover.db .dump > /tmp/cutover.sql`, then
-   `modal volume put sisi-data /tmp/cutover.sql /cutover.sql`, then
+   `sqlite3 /tmp/cutover.db .dump > /tmp/cutover.sql`, then convert
+   the CLI's `unistr('...')` literals (SQLite ≥3.45 emits them; Turso
+   has no such function) to plain quoted text, verifying each value
+   against SQLite's own `unistr()`. Upload with
+   `modal volume put sisi-data /tmp/cutover.sql /cutover.sql`, wipe
+   any cron-created schema with the guarded wipe, then
    `modal run scripts/turso_import.py --dump /cutover.sql`.
-   It refuses non-empty targets, applies statement-by-statement,
-   checks foreign keys, and prints per-table counts. (Import logic is
-   rehearsed locally against the real backup before every cutover.)
+   It refuses non-empty targets, applies statement-by-statement with
+   idempotent DDL, checks foreign keys, and prints per-table counts.
+   (Import logic is rehearsed locally against the real backup, with
+   hash comparison, before every cutover.)
 3. **Verify.** `scripts/turso_verify.py --turso` (with the new creds
    exported locally) — every table count + hash must match step 1, and
    the SQL-compat probe must print `ok`. On mismatch: stop, keep serving
