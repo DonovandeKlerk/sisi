@@ -100,3 +100,75 @@ def test_fast_text_has_no_status_line(conn, monkeypatch, tmp_path):
     process_message(IncomingMessage("mid-5", SHOP, "text", "hi", ""))
     sent = get_sender().pop_shop(SHOP)
     assert len(sent) == 1 and sent[0]["body"].startswith("hi there")
+
+
+# --- crash diagnostics: record + owner-only retrieval ------------------------
+
+
+def test_crash_records_error_report(conn, monkeypatch, tmp_path):
+    import app.main as main
+    from app.db import connect
+    monkeypatch.setenv("SISI_DB", str(tmp_path / "t.db"))
+
+    def boom(conn, shop_id, text, sent_at=None):
+        raise RuntimeError("kaboom-book")
+
+    monkeypatch.setattr(main, "handle_text", boom)
+    process_message(IncomingMessage("mid-9", SHOP, "text", "hi", ""))
+    sent = get_sender().pop_shop(SHOP)
+    assert sent[0]["body"].startswith("😅 Something went wrong")
+    db = connect()
+    try:
+        row = db.execute(
+            "SELECT context, detail FROM error_reports WHERE shop_id = ?"
+            " ORDER BY id DESC LIMIT 1", (SHOP,)).fetchone()
+    finally:
+        db.close()
+    assert row is not None
+    assert "mid-9" in row["context"]
+    assert "RuntimeError: kaboom-book" in row["detail"]
+
+
+def test_debug_last_error_command(conn):
+    from app.agent import handle_text
+    from app.setup import skip_setup
+    from app.tools import ensure_shop, record_error
+    skip_setup(conn, SHOP)
+    ensure_shop(conn, SHOP)
+    record_error(conn, SHOP, "whapi/media:image/mid-9",
+                 'Traceback (most recent call last):\n  File "app/x.py",'
+                 ' line 1, in f\nRuntimeError: kaboom-book')
+    msg, buttons = handle_text(conn, SHOP, "debug last error")
+    assert buttons is None
+    assert "kaboom-book" in msg and "mid-9" in msg
+    assert all(len(line) <= 120 for line in msg.splitlines())
+
+
+def test_debug_no_errors_recorded(conn):
+    from app.agent import handle_text
+    from app.setup import skip_setup
+    from app.tools import ensure_shop
+    skip_setup(conn, SHOP)
+    ensure_shop(conn, SHOP)
+    msg, _ = handle_text(conn, SHOP, "debug last error")
+    assert "No errors recorded" in msg
+
+
+def test_debug_staff_blocked(conn):
+    from app.agent import handle_text
+    from app.setup import skip_setup
+    from app.tools import ensure_shop
+    skip_setup(conn, SHOP)
+    ensure_shop(conn, SHOP)
+    handle_text(conn, SHOP, "add staff 27821234567 Thandi")
+    msg, _ = handle_text(conn, "27821234567", "debug last error")
+    assert msg.startswith("⛔")
+
+
+def test_error_reports_capped(conn):
+    from app.tools import ERROR_REPORT_KEEP, ensure_shop, record_error
+    ensure_shop(conn, SHOP)
+    for i in range(ERROR_REPORT_KEEP + 5):
+        record_error(conn, SHOP, f"ctx-{i}", "boom")
+    assert conn.execute("SELECT COUNT(*) n FROM error_reports WHERE shop_id = ?",
+                        (SHOP,)).fetchone()["n"] == ERROR_REPORT_KEEP

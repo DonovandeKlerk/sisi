@@ -7422,6 +7422,44 @@ def resend_last_media(conn: sqlite3.Connection, shop_id: str) -> str:
     return _t("resend_again")
 
 
+ERROR_REPORT_KEEP = 20
+"""Crash reports kept per shop for the owner-only debug command."""
+
+
+def record_error(conn: sqlite3.Connection, shop_id: str, context: str,
+                 detail: str) -> None:
+    """Persist a crash traceback for later owner retrieval. Never raises."""
+    try:
+        conn.execute(
+            "INSERT INTO error_reports (shop_id, context, detail)"
+            " VALUES (?, ?, ?)",
+            (shop_id, (context or "")[:200], (detail or "")[:4000]))
+        conn.execute(
+            "DELETE FROM error_reports WHERE shop_id = ? AND id NOT IN"
+            " (SELECT id FROM error_reports WHERE shop_id = ?"
+            " ORDER BY id DESC LIMIT ?)",
+            (shop_id, shop_id, ERROR_REPORT_KEEP))
+        conn.commit()
+    except Exception:  # noqa: BLE001 - diagnostics must not break fallback
+        pass
+
+
+def last_error_report(conn: sqlite3.Connection, shop_id: str) -> str:
+    """Owner-only 'debug last error' reply. Plain developer English."""
+    row = conn.execute(
+        "SELECT context, detail, created_at FROM error_reports"
+        " WHERE shop_id = ? ORDER BY id DESC LIMIT 1",
+        (shop_id,)).fetchone()
+    if row is None:
+        return "No errors recorded. If something just failed, try it again."
+    lines = [ln[:120] for ln in (row["detail"] or "").splitlines()
+             if ln.strip()]
+    tail = "\n".join(lines[-12:])
+    when = (row["created_at"] or "")[:16].replace("T", " ")
+    head = f"Last error ({when} {(row['context'] or '')[:60]})".strip()
+    return f"{head}\n{tail}" if tail else head
+
+
 def remember_last_reply(conn: sqlite3.Connection, shop_id: str,
                         text: str) -> None:
     """Store the latest outbound reply so 'resend' can recover it.

@@ -365,7 +365,8 @@ _STAFF_BLOCKED_EXACT = {"undo", "demo reset", "reset demo", "delete my data",
                         "shop profile", "show shop profile",
                         "my shop profile", "show my shop profile",
                         "logo", "use original logo", "remove logo background",
-                        "setup", "reset shop", "yes erase everything"}
+                        "setup", "reset shop", "yes erase everything",
+                        "debug last error"}
 
 
 def slow_status(text: str) -> str | None:
@@ -1108,6 +1109,9 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str,
         if word != "demo help" and not needs_setup(conn, shop_id):
             return show_menu(conn, shop_id), None
         return DEMO_HELP, None
+    if word == "debug last error":
+        from app.tools import last_error_report
+        return last_error_report(conn, shop_id), None
     if word in ("month-end report", "month end report", "monthend report",
                 "month-end", "month end", "monthend"):
         text, media = reports.build_month_end(

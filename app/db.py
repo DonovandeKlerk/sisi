@@ -304,6 +304,15 @@ CREATE TABLE IF NOT EXISTS flags (
   PRIMARY KEY (shop_id, key)
 );
 
+CREATE TABLE IF NOT EXISTS error_reports (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  shop_id    TEXT NOT NULL,
+  context    TEXT NOT NULL DEFAULT '',
+  detail     TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_error_reports_shop ON error_reports (shop_id, id);
+
 CREATE TABLE IF NOT EXISTS send_queue (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   to_number    TEXT NOT NULL,

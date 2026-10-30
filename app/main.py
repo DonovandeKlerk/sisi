@@ -438,7 +438,21 @@ def process_message(msg: IncomingMessage) -> None:
         try:
             _handle_message(sender, msg)
         except Exception:
-            log.error("process_message failed:\n%s", traceback.format_exc())
+            detail = traceback.format_exc()
+            log.error("process_message failed:\n%s", detail)
+            try:
+                from app.tools import record_error
+                _dbg = connect()
+                try:
+                    init_db(_dbg)
+                    record_error(
+                        _dbg, msg.shop_id,
+                        f"{msg.channel or 'meta'}/{msg.kind}/"
+                        f"{msg.message_id}", detail)
+                finally:
+                    _dbg.close()
+            except Exception:
+                log.error("error report failed:\n%s", traceback.format_exc())
             try:
                 from app.sendqueue import send_immediate
                 send_immediate(msg.channel or "meta", msg.shop_id, "text",
