@@ -12,10 +12,11 @@ only row counts are printed.
 
 import modal
 
+image = modal.Image.debian_slim().pip_install("turso_serverless==0.1.0")
 app = modal.App("sisi-turso-smoke")
 
 
-@app.function(secrets=[modal.Secret.from_name("sisi-env")])
+@app.function(image=image, secrets=[modal.Secret.from_name("sisi-env")])
 def write_canary(worker: int, n: int) -> int:
     import os
 
@@ -43,7 +44,7 @@ def write_canary(worker: int, n: int) -> int:
         conn.close()
 
 
-@app.function(secrets=[modal.Secret.from_name("sisi-env")])
+@app.function(image=image, secrets=[modal.Secret.from_name("sisi-env")])
 def read_canaries() -> dict:
     import os
 
@@ -65,7 +66,7 @@ def read_canaries() -> dict:
         conn.close()
 
 
-@app.function(secrets=[modal.Secret.from_name("sisi-env")])
+@app.function(image=image, secrets=[modal.Secret.from_name("sisi-env")])
 def cleanup() -> dict:
     """Delete leftover canaries (e.g. from an interrupted run). Runs first,
     sequentially, so concurrent writers never wipe each other."""

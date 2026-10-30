@@ -9,13 +9,14 @@ other. On 2026-10-30 this silently dropped a confirmed intake. Turso
 same SQL dialect. Backend switches on two env vars; no SQL changes.
 
 ## Prereqs (owner, ~10 min)
-1. Install the Turso CLI and sign up: `brew install tursodatabase/tap/turso`
-   then `turso auth login` (confirm current pricing/limits on Turso's
-   pricing page; free tier historically covers this workload many times
-   over: our DB is < 1 MB).
-2. `turso db create sisi-prod --region iad` (same region as the Modal app).
-3. `turso db tokens create sisi-prod` — keep this private; it goes into
-   Modal secrets, never into chat or Git.
+1. Sign up at the Turso dashboard (or `brew install
+   tursodatabase/tap/turso` then `turso auth login`). Confirm current
+   pricing/limits on Turso's pricing page; free tier historically
+   covers this workload many times over: our DB is < 1 MB.
+2. Create database `sisi-prod` in region `iad` (same region as Modal).
+3. Create a token for it — keep this private; it goes into Modal
+   secrets, never into chat or Git. Copy the database URL too
+   (`libsql://...`; the URL is not secret, the token is).
 
 ## Maintenance window (owner approves the time; ~15 min)
 Inbound WhatsApp traffic cannot be paused, so the cutover is
@@ -30,7 +31,13 @@ running; their window writes are covered by step 6.
    d=sqlite3.connect('/data/backup-<ts>.db'); s.backup(d)"`
    then `modal volume get sisi-data /backup-<ts>.db /tmp/cutover.db`.
    Record per-table counts (`scripts/turso_verify.py --db /tmp/cutover.db`).
-2. **Import.** `sqlite3 /tmp/cutover.db .dump | turso db shell sisi-prod`.
+2. **Import (server-side; token never leaves Modal).**
+   `sqlite3 /tmp/cutover.db .dump > /tmp/cutover.sql`, then
+   `modal volume put sisi-data /tmp/cutover.sql /cutover.sql`, then
+   `modal run scripts/turso_import.py --dump /cutover.sql`.
+   It refuses non-empty targets, applies statement-by-statement,
+   checks foreign keys, and prints per-table counts. (Import logic is
+   rehearsed locally against the real backup before every cutover.)
 3. **Verify.** `scripts/turso_verify.py --turso` (with the new creds
    exported locally) — every table count + hash must match step 1, and
    the SQL-compat probe must print `ok`. On mismatch: stop, keep serving
