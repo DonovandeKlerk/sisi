@@ -1036,6 +1036,14 @@ def _task_is_write(task: dict) -> bool:
     return False
 
 
+IMMEDIATE_READ_KINDS = frozenset({"chat", "reminder_list", "compliance",
+                                  "draft"})
+"""Reads that never depend on unconfirmed writes: they run at once even
+after a write task in the same plan. Every other read that follows a
+write is deferred until the write is confirmed or cancelled, then runs
+from the settled ledger (see plan_followups in the pending payload)."""
+
+
 def execute_plan(conn: sqlite3.Connection, shop_id: str, plan: dict,
                  bundle: dict) -> tuple[str, list[str] | None]:
     """Run validated tasks in order. Each failure stays local to its task."""
@@ -1050,14 +1058,28 @@ def execute_plan(conn: sqlite3.Connection, shop_id: str, plan: dict,
                                if isinstance(t, dict)}
     ro = read_only()
     ro_told = False
+    from app.tools import get_pending
+    pre = get_pending(conn, shop_id)
+    pre_id = pre["id"] if pre else None
+    wrote = False
+    deferred: list[dict] = []
     for task in tasks:
+        kind = task.get("kind")
         if ro and _task_is_write(task):
             # Testing mode: skip the write, say so once, keep the reads.
             if not ro_told:
                 parts.append(_t("whapi_readonly"))
                 ro_told = True
             continue
-        run = _EXECUTORS.get(task.get("kind"))
+        if wrote and not _task_is_write(task) \
+                and kind not in IMMEDIATE_READ_KINDS \
+                and _EXECUTORS.get(kind) is not None:
+            # A later read would render pre-confirmation state (e.g. a
+            # statement before its credit is saved): hold it until the
+            # write resolves, then run it from the settled ledger.
+            deferred.append({"kind": kind, "args": task.get("args") or {}})
+            continue
+        run = _EXECUTORS.get(kind)
         if run is None:
             continue
         bundle["quote"] = task.get("quote") or ""
@@ -1071,6 +1093,32 @@ def execute_plan(conn: sqlite3.Connection, shop_id: str, plan: dict,
                            err=type(e).__name__), None
         parts.append(text)
         suggest = suggest or sug
+        if _task_is_write(task):
+            wrote = True
+    if deferred:
+        post = get_pending(conn, shop_id)
+        if post is not None and post["id"] != pre_id:
+            payload = json.loads(post["payload_json"])
+            payload["plan_followups"] = deferred
+            conn.execute("UPDATE pending_actions SET payload_json = ?"
+                         " WHERE id = ?", (json.dumps(payload), post["id"]))
+            conn.commit()
+            parts.append(_t("plan_deferred"))
+        else:
+            # No new proposal (the write asked a question instead): no
+            # confirmation to wait for, so run the reads now as before.
+            for fol in deferred:
+                run = _EXECUTORS.get(fol["kind"])
+                try:
+                    text, sug = run(conn, shop_id, fol["args"], bundle)
+                except _TaskFail as e:
+                    text, sug = str(e), None
+                except Exception as e:  # noqa: BLE001 - same task isolation
+                    log.warning("task %s failed", fol["kind"], exc_info=True)
+                    text, sug = _t("task_failed", kind=fol["kind"],
+                                   err=type(e).__name__), None
+                parts.append(text)
+                suggest = suggest or sug
     if not parts:
         return (plan.get("question") or _t("llm_say_again"),
                 plan.get("options") or None)

@@ -31,6 +31,7 @@ draft(customer)
 chat(reply)
 
 "Draft a reminder for Thandi" is a draft (a message the owner forwards), never a scheduled reminder.
+Goods changing hands on credit ("bought", "took", "gave ... on the book", "put ... on the book") is a sale with buyer: stock decreases AND the book increases. credit is ONLY a pure book entry with no goods (opening balance, fee, money owed without a sale).
 Periods: today/yesterday/week/month. Categories: transport/electricity/rent/airtime/wages/other. Accounts: cash/petty/bank. set_profile field: name/address/phone. Recurrence: none/daily/weekly/monthly (only when stated).
 Money for stock ("paid R60 for stock", "R120 on my Jumbo account for stock") is a purchase task — never expense. expense is running costs only; supplier_payment settles an old account with no new stock. purchase account is cash/petty/bank, or supplier with the supplier name for on-account stock.
 """

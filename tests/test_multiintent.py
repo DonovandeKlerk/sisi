@@ -260,3 +260,134 @@ def test_affordability_needs_amount_first(conn, monkeypatch, tmp_path):
     assert "R1200.00" in msg and "covers R200.00" in msg
     msg, _b = handle_text(conn, SHOP, "can we afford R2000")
     assert "Not quite" in msg and "R1200.00" in msg
+
+
+@pytest.fixture()
+def _follow_shop(conn, tmp_path, monkeypatch):
+    from app import reports
+    from app.agent import MEDIA_OUTBOX
+    monkeypatch.setattr(reports, "REPORTS_DIR", tmp_path / "reports")
+    monkeypatch.setattr(reports, "LOGOS_DIR", tmp_path / "logos")
+    monkeypatch.setenv("SISI_PUBLIC_URL", "https://x.example")
+    MEDIA_OUTBOX.clear()
+    ensure_shop(conn, SHOP, "Followup Spaza")
+    conn.execute("UPDATE shops SET language = 'en' WHERE shop_id = ?", (SHOP,))
+    conn.execute(
+        "INSERT INTO products (shop_id, name, price_cents, cost_cents, stock_qty)"
+        " VALUES (?, 'Bread', 2000, 1500, 50)", (SHOP,))
+    conn.execute("INSERT INTO customers (shop_id, name) VALUES (?, 'Sipho')",
+                 (SHOP,))
+    conn.commit()
+
+
+def _pending_payload(conn):
+    import json
+    from app.tools import get_pending
+    row = get_pending(conn, SHOP)
+    assert row is not None
+    return json.loads(row["payload_json"])
+
+
+def _exec_plan(conn, tasks):
+    from app.interpreter import execute_plan
+    return execute_plan(conn, SHOP, _plan(tasks), {"text": "", "sent_at": None})
+
+
+def test_statement_defers_until_credit_confirmed(conn, _follow_shop, monkeypatch,
+                                                 tmp_path):
+    from app.agent import MEDIA_OUTBOX, take_media
+    calls = _script(monkeypatch, tmp_path, [_plan(
+        [_t("credit", {"customer": "Sipho",
+                       "items": [{"product": "Bread", "qty": 2}]}),
+         _t("statement", {"customer": "Sipho"})],
+        understood="credit plus statement")])
+    msg, buttons = handle_text(conn, SHOP, "put bread on Sipho's book and state it")
+    assert calls["n"] == 1  # pins the planner path (no vacuous pass)
+    assert "Save to the book?" in msg
+    assert "I'll send that once you confirm" in msg
+    assert "Outstanding" not in msg  # statement held back, not rendered stale
+    assert take_media(SHOP) == []  # no card queued either
+    assert buttons == ["Yes", "No"]
+    assert _pending_payload(conn)["plan_followups"] == [
+        {"kind": "statement", "args": {"customer": "Sipho"}}]
+    assert MEDIA_OUTBOX == {}
+
+
+def test_confirm_runs_deferred_statement(conn, _follow_shop):
+    from app.agent import take_media
+    msg, buttons = _exec_plan(conn, [
+        _t("credit", {"customer": "Sipho",
+                      "items": [{"product": "Bread", "qty": 2}]}),
+        _t("statement", {"customer": "Sipho"})])
+    assert "Save to the book?" in msg
+    assert "Outstanding" not in msg
+    msg, _ = handle_text(conn, SHOP, "yes")
+    assert "Outstanding R40.00" in msg  # settled ledger, includes the credit
+    kinds = [m["kind"] for m in take_media(SHOP)]
+    assert kinds == ["image", "file"]
+    # Repeat Yes cannot rerun the followup.
+    msg2, _ = handle_text(conn, SHOP, "yes")
+    assert "Outstanding" not in msg2
+    assert take_media(SHOP) == []
+
+
+def test_cancel_runs_deferred_statement_unchanged(conn, _follow_shop):
+    from app.agent import take_media
+    _exec_plan(conn, [
+        _t("credit", {"customer": "Sipho",
+                      "items": [{"product": "Bread", "qty": 2}]}),
+        _t("statement", {"customer": "Sipho"})])
+    msg, _ = handle_text(conn, SHOP, "no")
+    # Followup ran on the settled (unchanged) ledger; zero balance
+    # short-circuits to text with no card.
+    assert "owes nothing" in msg
+    assert take_media(SHOP) == []
+
+
+def test_read_before_write_runs_immediately(conn, _follow_shop):
+    msg, _ = _exec_plan(conn, [
+        _t("balance", {"customer": "Sipho"}),
+        _t("credit", {"customer": "Sipho",
+                      "items": [{"product": "Bread", "qty": 2}]})])
+    assert "owes nothing" in msg  # fresh pre-write balance, correct then
+    assert "Save to the book?" in msg
+    assert "I'll send that once you confirm" not in msg
+
+
+def test_unrelated_read_after_write_runs_immediately(conn, _follow_shop):
+    msg, _ = _exec_plan(conn, [
+        _t("credit", {"customer": "Sipho",
+                      "items": [{"product": "Bread", "qty": 2}]}),
+        _t("compliance", {"topic": "overview"})])
+    assert "Save to the book?" in msg
+    assert "I'll send that once you confirm" not in msg
+    assert "Spaza Shop Support Fund" in msg or "spazashopfund" in msg
+
+
+def test_no_proposal_runs_reads_immediately(conn, _follow_shop):
+    msg, _ = _exec_plan(conn, [
+        _t("credit", {"customer": "Sipho",
+                      "items": [{"product": "Nope", "qty": 1}]}),
+        _t("balance", {"customer": "Sipho"})])
+    assert "I'll send that once you confirm" not in msg
+    assert "owes nothing" in msg  # nothing to wait for: answered at once
+
+
+def test_followups_never_attach_to_stale_pending(conn, _follow_shop):
+    from app.tools import _propose
+    _propose(conn, SHOP, "record_sale",
+             {"product": "Bread", "qty": 1, "product_id": 1,
+              "total_cents": 2000}, "stale preview")
+    msg, _ = _exec_plan(conn, [
+        _t("credit", {"customer": "Sipho",
+                      "items": [{"product": "Nope", "qty": 1}]}),
+        _t("balance", {"customer": "Sipho"})])
+    assert "owes nothing" in msg  # ran inline, not held on the stale proposal
+    assert "plan_followups" not in _pending_payload(conn)
+
+
+def test_prompt_disambiguates_sale_vs_credit():
+    from app.prompts import PLANNER_PROMPT
+    assert "sale with buyer" in PLANNER_PROMPT
+    assert "stock decreases AND the book increases" in PLANNER_PROMPT
+    assert "no goods" in PLANNER_PROMPT

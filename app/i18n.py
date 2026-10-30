@@ -3494,3 +3494,16 @@ STRINGS["xh"].update({
                        "Ndingakubonisa ibhalansi, isitokhwe namatyala.\n"
                        "Andikwazi ukugcina nto okwangoku."),
 })
+
+STRINGS["en"].update({
+    "plan_deferred": "I'll send that once you confirm ↑",
+})
+STRINGS["zu"].update({
+    "plan_deferred": "Ngizokuthumela lokho uma usuqinisekisile ↑",
+})
+STRINGS["af"].update({
+    "plan_deferred": "Ek sal dit stuur sodra jy bevestig ↑",
+})
+STRINGS["xh"].update({
+    "plan_deferred": "Ndiza kuyithumela wakuba uqinisekisile ↑",
+})

@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import math
 import re
 import sqlite3
 import uuid
 from datetime import date, datetime, timedelta, timezone
+
+log = logging.getLogger("sisi.tools")
 
 from app.db import DB_OPERATIONAL_ERROR, cents_to_rand, now_iso, today_str
 from app.i18n import acct_name as _acct_name
@@ -293,6 +296,40 @@ def _propose(conn: sqlite3.Connection, shop_id: str, action_type: str, payload: 
     return preview
 
 
+def _run_plan_followups(conn: sqlite3.Connection, shop_id: str,
+                        payload: dict) -> str:
+    """Run reads the plan held back until this proposal resolved.
+
+    Called on both confirm and cancel: the reads render the settled
+    ledger either way. Followup buttons are dropped (confirm/cancel
+    replies carry no buttons); queued media flushes with the reply as
+    usual. One followup never kills the rest.
+    """
+    followups = payload.get("plan_followups") or []
+    if not followups:
+        return ""
+    from app.interpreter import _EXECUTORS, _TaskFail
+    bundle = {"text": "", "sent_at": None, "sibling_kinds": set(),
+              "quote": ""}
+    parts = []
+    for fol in followups:
+        if not isinstance(fol, dict):
+            continue
+        run = _EXECUTORS.get(fol.get("kind"))
+        if run is None:
+            continue
+        try:
+            text, _sug = run(conn, shop_id, fol.get("args") or {}, bundle)
+        except _TaskFail as e:
+            text = str(e)
+        except Exception as e:  # noqa: BLE001 - one followup never kills the rest
+            log.warning("followup %s failed", fol.get("kind"), exc_info=True)
+            text = _t("task_failed", kind=fol.get("kind"),
+                      err=type(e).__name__)
+        parts.append(text)
+    return ("\n\n" + "\n\n".join(parts)) if parts else ""
+
+
 def confirm_pending(conn: sqlite3.Connection, shop_id: str) -> str:
     ensure_shop(conn, shop_id)
     row = get_pending(conn, shop_id)
@@ -346,6 +383,7 @@ def confirm_pending(conn: sqlite3.Connection, shop_id: str) -> str:
         message += _after_intake_pay(
             conn, shop_id, payload["pending_pay"],
             payload.get("supplier") or item.get("supplier") or "")
+    message += _run_plan_followups(conn, shop_id, payload)
     if get_deferred_link(conn, shop_id) is not None:
         message += _deferred_nudge()
     return message
@@ -392,6 +430,7 @@ def cancel_pending(conn: sqlite3.Connection, shop_id: str) -> str:
     )
     conn.commit()
     out = _t("not_saved")
+    out += _run_plan_followups(conn, shop_id, json.loads(row["payload_json"]))
     if get_deferred_link(conn, shop_id) is not None:
         out += _deferred_nudge()
     return out
@@ -7791,8 +7830,11 @@ def _tool(name: str, desc: str, props: dict, required: list[str]) -> dict:
 
 
 TOOL_DEFS = [
-    _tool("add_credit", "Put items someone TOOK on their credit book (asks for Yes first)."
-          " Use for 'took ... on the book'. No sale is recorded and stock is unchanged."
+    _tool("add_credit", "Pure credit-book entry with NO goods: opening balance, fee,"
+          " money owed without a sale (asks for Yes first). If the customer"
+          " BOUGHT or TOOK goods, use record_sale with buyer instead (stock"
+          " decreases AND the book increases). No sale is recorded here and"
+          " stock is unchanged."
           " qty is ALWAYS single units; pass unit only when the owner names a pack.",
           {"customer": {"type": "string"},
            "items": {"type": "array", "items": {"type": "object",
@@ -7892,7 +7934,8 @@ TOOL_DEFS = [
            "options": {"type": "array", "items": {"type": "string"}}},
           ["question"]),
     _tool("record_sale", "Record something SOLD: reduces stock and counts toward cash-up."
-          " Use whenever the owner says they sold something."
+          " Use whenever the owner says they sold something, including"
+          " 'bought/took ... on the book'."
           " Omit buyer for cash, or name the buyer for a credit sale."
           " qty is ALWAYS single units ('5 chappies' is 5 loose sweets); pass unit"
           " only when the owner names a pack ('box', 'tray', 'ibhokisi').",
