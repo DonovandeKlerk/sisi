@@ -2,7 +2,7 @@
 
 from test_format import assert_format
 
-from app.agent import handle_text
+from app.agent import handle_text, take_buttons, take_media
 from app.db import today_str
 from app.tools import (
     cash_balances,
@@ -244,3 +244,183 @@ def test_book_which_prefixes_match_translations():
         rendered = STRINGS[lang]["book_reason_which"].format(names="a, b")
         assert rendered.lower().startswith(prefix), lang
         assert prefix in _BOOK_WHICH_PREFIXES
+
+
+def _two_ambiguous():
+    book = _book()
+    book["lines"] = [ln for ln in book["lines"] if ln["line_no"] != 7] + [
+        {"line_no": 7, "text": "1 brd", "item": "brd", "qty": 1,
+         "price_cents": None, "kind": "cash", "customer": ""},
+    ]
+    return book
+
+
+def test_book_tap_full_label_binds_first(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    take_buttons(SHOP)
+    propose_book_page(conn, SHOP, _two_ambiguous())
+    msg, buttons = handle_text(conn, SHOP, "Albany Brown Bread 700g")
+    assert buttons is None
+    assert "• Sipho: 2x Albany Brown Bread 700g = R38.00" in msg
+    queued = take_buttons(SHOP)
+    assert len(queued) == 1
+    assert "Line 7" in queued[0]["body"]
+    assert queued[0]["buttons"] == ["Sasko White Bread 700g",
+                                   "Albany Brown Bread 700g"]
+
+
+def test_book_tap_short_word_binds(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    take_buttons(SHOP)
+    propose_book_page(conn, SHOP, _book())
+    msg, _ = handle_text(conn, SHOP, "brown")
+    assert "• Sipho: 2x Albany Brown Bread 700g = R38.00" in msg
+    assert take_buttons(SHOP) == []  # all answered, no next question
+
+
+def test_book_tap_ambiguous_reasks(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    take_buttons(SHOP)
+    propose_book_page(conn, SHOP, _book())
+    msg, _ = handle_text(conn, SHOP, "bread")
+    assert "line 6 — which one?" in msg
+    assert "Answer the open lines first" in confirm_pending(conn, SHOP)
+    take_buttons(SHOP)
+
+
+def test_book_tap_no_match_falls_through(conn):
+    from app.agent import try_book_tap
+
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    propose_book_page(conn, SHOP, _book())
+    assert try_book_tap(conn, SHOP, "hello there") is None
+    assert try_book_tap(conn, "27noshop", "brown") is None
+
+
+def test_book_numbered_tap_binds(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    take_buttons(SHOP)
+    propose_book_page(conn, SHOP, _two_ambiguous())
+    handle_text(conn, SHOP, "line 6 sasko")
+    take_buttons(SHOP)
+    msg, _ = handle_text(conn, SHOP, "2")
+    assert "• 1x Albany Brown Bread 700g = R19.00" in msg
+    assert assert_format(confirm_pending(conn, SHOP)).startswith(
+        "✅ *Book saved*")
+
+
+def test_book_yes_gate_queues_buttons(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    take_buttons(SHOP)
+    propose_book_page(conn, SHOP, _book())
+    msg, buttons = handle_text(conn, SHOP, "yes")
+    assert "Answer the open lines first" in msg
+    assert buttons is None
+    queued = take_buttons(SHOP)
+    assert len(queued) == 1
+    assert "Line 6" in queued[0]["body"]
+    assert "Sasko White Bread 700g" in queued[0]["buttons"]
+
+
+def test_book_photo_proposal_queues_option_buttons(conn, monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    import app.agent as agent_mod
+    import app.interpreter as interp
+    from app.agent import handle_photo
+
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    take_buttons(SHOP)
+
+    def fake_read(image, shop=""):
+        return {"doc_type": "book_page",
+                "expiry": {"stamp_count": 0, "items": []},
+                "book": _book(),
+                "receipt": {"supplier": "", "date": "", "receipt_no": "",
+                            "lines": [], "vat_cents": None,
+                            "total_cents": None, "payment": ""}}
+
+    def fake(messages):
+        return SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content=json.dumps(
+                    {"understood": "day book photo",
+                     "tasks": [{"kind": "book_page", "args": {},
+                                "quote": ""}],
+                     "question": None, "options": []})))],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1,
+                                  total_tokens=2))
+
+    monkeypatch.setattr(agent_mod, "read_shop_photo", fake_read)
+    monkeypatch.setattr(interp, "propose_plan", fake)
+    _, reply, buttons = handle_photo(conn, SHOP, b"book-photo-tap")
+    assert "Today's book" in reply
+    assert buttons is None  # options go as tap buttons, not Yes/No
+    queued = take_buttons(SHOP)
+    assert len(queued) == 1
+    assert "Line 6" in queued[0]["body"]
+    assert queued[0]["buttons"] == ["Sasko White Bread 700g",
+                                   "Albany Brown Bread 700g"]
+
+
+def test_book_save_queues_daily_pdf(conn, monkeypatch, tmp_path):
+    from app import reports
+
+    monkeypatch.setattr(reports, "REPORTS_DIR", tmp_path / "reports")
+    monkeypatch.setenv("SISI_PUBLIC_URL", "https://x.example")
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    take_buttons(SHOP)
+    take_media(SHOP)
+    propose_book_page(conn, SHOP, _book())
+    handle_text(conn, SHOP, "line 6 sasko")
+    take_buttons(SHOP)
+    saved = assert_format(confirm_pending(conn, SHOP))
+    assert saved.startswith("✅ *Book saved*")
+    items = take_media(SHOP)
+    assert len(items) == 1
+    assert items[0]["kind"] == "file"
+    assert items[0]["url"].startswith("https://x.example/media/")
+    assert items[0]["filename"] == "sisi-daily-sales-2026-10-21.pdf"
+    assert "Daily sales" in items[0]["caption"]
+    safe = "".join(c for c in SHOP if c.isdigit()) or "shop"
+    pdf = (tmp_path / "reports" /
+           f"{safe}-daily-sales-2026-10-21.pdf").read_bytes()
+    assert pdf.startswith(b"%PDF")
+    assert b"R106.00" in pdf  # cash sales
+    assert b"R64.00" in pdf  # credit incl. the answered line
+    assert b"R156.00" in pdf  # expected cash in hand
+    assert b"R170.00" in pdf  # lines vs page total mismatch
+
+
+def test_book_save_without_base_url_no_media(conn, monkeypatch):
+    monkeypatch.delenv("SISI_PUBLIC_URL", raising=False)
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    take_media(SHOP)
+    propose_book_page(conn, SHOP, _book())
+    handle_text(conn, SHOP, "line 6 sasko")
+    assert confirm_pending(conn, SHOP).startswith("✅ *Book saved*")
+    assert take_media(SHOP) == []
+
+
+def test_daily_pdf_failure_keeps_save(conn, monkeypatch):
+    def boom(data, brand, path):
+        raise RuntimeError("pdf exploded")
+
+    monkeypatch.setattr("app.reports.render_daily_sales_pdf", boom)
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    take_media(SHOP)
+    propose_book_page(conn, SHOP, _book())
+    handle_text(conn, SHOP, "line 6 sasko")
+    assert confirm_pending(conn, SHOP).startswith("✅ *Book saved*")
+    assert take_media(SHOP) == []

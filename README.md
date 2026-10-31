@@ -100,6 +100,9 @@ Every WhatsApp reply must be visually polished:
   anything over about 1,500 characters is split at a section boundary
   (`split_message` in `app/whatsapp.py`, applied by both live senders).
 - The privacy PS appears only on the first message or in "demo help".
+- Buttons before typing: any question with 2–3 short answers is offered as
+  tap buttons (with a numbered-text fallback); the owner types or talks only
+  when buttons don't make sense.
 - The model relays tool results exactly as written (see `REPLY STYLE` in
   `app/prompts.py`). `tests/test_format.py` fails the suite if any
   deterministic reply breaks these rules.

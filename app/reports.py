@@ -797,6 +797,92 @@ def render_statement_pngs(data: dict, brand: dict, prefix: str,
             for n, chunk in enumerate(chunks)]
 
 
+def daily_sales_data(payload: dict) -> dict:
+    """Flatten a confirmed book-page payload for the daily sales PDF."""
+    cash = sorted(payload.get("cash") or [], key=lambda e: e["line_no"])
+    credit = sorted(payload.get("credit") or [], key=lambda e: e["line_no"])
+    payments = sorted(payload.get("payments") or [],
+                      key=lambda e: e["line_no"])
+    cash_total = sum(e["total"] for e in cash)
+    credit_total = sum(e["total"] for e in credit)
+    pay_total = sum(e["amount"] for e in payments)
+    return {
+        "date": payload.get("display_date") or payload.get("date") or "",
+        "cash": [{"item": e["short"], "cents": e["total"]} for e in cash],
+        "credit": [{"customer": e["customer"], "item": e["short"],
+                    "cents": e["total"]} for e in credit],
+        "payments": [{"customer": e["customer"], "cents": e["amount"]}
+                     for e in payments],
+        "cash_total": cash_total, "credit_total": credit_total,
+        "pay_total": pay_total,
+        "expected_cash": cash_total + pay_total,
+        "page_total": payload.get("page_total"),
+        "match": payload.get("page_total") is not None
+        and payload["page_total"] == cash_total + credit_total,
+    }
+
+
+def render_daily_sales_pdf(data: dict, brand: dict, path: str) -> str:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (Paragraph, SimpleDocTemplate, Spacer)
+    st = _pdf_styles()
+    doc = SimpleDocTemplate(path, pagesize=A4, topMargin=18 * mm,
+                            bottomMargin=18 * mm,
+                            title=f"Daily sales {data['date']}",
+                            author="Sisi", pageCompression=0)
+    W = A4[0] - doc.leftMargin - doc.rightMargin
+    story: list = []
+    _pdf_brand_header(story, st, brand,
+                      f"{_t('doc_title_daily')} · {data['date']}",
+                      data["date"], W)
+    if data["cash"]:
+        story.append(Paragraph(_t("doc_cash_sales"), st["h2"]))
+        rows = [[Paragraph(f"<b>{_t('doc_th_item')}</b>", st["cell"]),
+                 Paragraph(f"<b>{_t('doc_th_amount')}</b>", st["cell_r"])]]
+        for it in data["cash"]:
+            rows.append([Paragraph(_esc(it["item"]), st["cell"]),
+                         Paragraph(cents_to_rand(it["cents"]), st["cell_r"])])
+        story.append(_pdf_table(rows, [W * 0.78, W * 0.22]))
+        story.append(Spacer(1, 6))
+    if data["credit"]:
+        story.append(Paragraph(_t("doc_credit_sales"), st["h2"]))
+        rows = [[Paragraph(f"<b>{_t('doc_th_customer')}</b>", st["cell"]),
+                 Paragraph(f"<b>{_t('doc_th_item')}</b>", st["cell"]),
+                 Paragraph(f"<b>{_t('doc_th_amount')}</b>", st["cell_r"])]]
+        for it in data["credit"]:
+            rows.append([Paragraph(_esc(it["customer"]), st["cell"]),
+                         Paragraph(_esc(it["item"]), st["cell"]),
+                         Paragraph(cents_to_rand(it["cents"]), st["cell_r"])])
+        story.append(_pdf_table(rows, [W * 0.26, W * 0.52, W * 0.22]))
+        story.append(Spacer(1, 6))
+    if data["payments"]:
+        story.append(Paragraph(_t("doc_payments"), st["h2"]))
+        story.append(_pdf_table(_kv_rows(st, [
+            (_esc(p["customer"]), cents_to_rand(p["cents"]))
+            for p in data["payments"]], bold_last=False), [W - 130, 130]))
+        story.append(Spacer(1, 6))
+    story.append(_pdf_table(_kv_rows(st, [
+        (_t("doc_cash_sales"), cents_to_rand(data["cash_total"])),
+        (_t("doc_credit_sales"), cents_to_rand(data["credit_total"])),
+        (_t("doc_payments"), cents_to_rand(data["pay_total"])),
+        (_t("doc_expected_cash"),
+         cents_to_rand(data["expected_cash"]))]), [W - 130, 130]))
+    story.append(Spacer(1, 6))
+    if data["page_total"] is not None:
+        if data["match"]:
+            story.append(Paragraph(
+                _t("doc_match",
+                   total=cents_to_rand(data["page_total"])), st["body"]))
+        else:
+            story.append(Paragraph(
+                _t("doc_mismatch", page=cents_to_rand(data["page_total"]),
+                   lines=cents_to_rand(data["cash_total"]
+                                       + data["credit_total"])), st["body"]))
+    doc.build(story, onFirstPage=_pdf_footer, onLaterPages=_pdf_footer)
+    return path
+
+
 def render_statement_pdf(data: dict, brand: dict, path: str) -> str:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import mm

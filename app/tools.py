@@ -5530,6 +5530,35 @@ def match_book_option(payload: dict, line_no: int, rest: str):
     return hits[0] if len(hits) == 1 else None
 
 
+def first_book_question(payload: dict):
+    """First still-open which-one entry, or None when all answered."""
+    awaiting = sorted(payload.get("awaiting") or [],
+                      key=lambda e: e["line_no"])
+    return awaiting[0] if awaiting else None
+
+
+def book_option_labels(payload: dict) -> list[str]:
+    """Button labels answering the current which-one question."""
+    entry = first_book_question(payload)
+    if entry is None:
+        return []
+    return [o["name"] for o in entry["options"]]
+
+
+def match_first_options(entry: dict, text: str) -> list[dict]:
+    """Options of one question matching a full tap/typed reply."""
+    ans = _clean_answer(text)
+    if not ans:
+        return []
+    hits = []
+    for o in entry["options"]:
+        name = o["name"].lower()
+        if ans == name or name.startswith(ans) \
+                or (len(ans) >= 3 and ans in name):
+            hits.append(o)
+    return hits
+
+
 def _replace_book_line(payload: dict, line_no: int, section: str, entry: dict) -> None:
     entry["kind"] = section
     for key in ("cash", "credit", "payments", "flagged"):
@@ -5670,6 +5699,7 @@ def _apply_book_page(conn: sqlite3.Connection, shop_id: str, payload: dict, acti
                         amt=cents_to_rand(pay_total)))
     msg = (_t("book_saved", parts=" · ".join(parts)) + "\n\n"
            + low_stock(conn, shop_id) + "\n\n" + cash_up(conn, shop_id, payload["date"]))
+    _queue_daily_sales_pdf(conn, shop_id, payload)
     return (msg, "book", f"book page {payload['date']}",
             {"sale_ids": sale_ids, "credit_ids": credit_ids, "payment_ids": payment_ids,
              "new_customers": new_customers, "stock": stock_deltas,
@@ -7428,6 +7458,35 @@ def confirm_logo(conn: sqlite3.Connection, shop_id: str) -> str | None:
                  (shop_id,))
     conn.commit()
     return _t("logo_confirmed")
+
+
+def _queue_daily_sales_pdf(conn: sqlite3.Connection, shop_id: str,
+                           payload: dict) -> None:
+    """Render the daily sales PDF after a book save; never break the save."""
+    try:
+        import os as _os
+
+        from app import reports as _reports
+        from app.agent import queue_media as _queue
+        safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
+        day = "".join(c for c in str(payload.get("date") or "undated")
+                      if c.isdigit() or c == "-") or "undated"
+        _reports.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        pdf = str(_reports.REPORTS_DIR / f"{safe}-daily-sales-{day}.pdf")
+        with _doc_lang(_owner_lang(conn, shop_id)):
+            data = _reports.daily_sales_data(payload)
+            _reports.render_daily_sales_pdf(
+                data, _reports.shop_brand(conn, shop_id), pdf)
+        base = _os.environ.get("SISI_PUBLIC_URL", "").rstrip("/")
+        if not base:
+            return
+        token = _reports.store_card(conn, shop_id, f"daily-{day}", pdf)
+        _queue(shop_id, [{"kind": "file",
+                          "url": f"{base}/media/{token}?f=pdf",
+                          "caption": _t("daily_pdf_cap", date=data["date"]),
+                          "filename": f"sisi-daily-sales-{day}.pdf"}])
+    except Exception:
+        log.warning("daily sales pdf failed", exc_info=True)
 
 
 def _queue_statement(conn: sqlite3.Connection, shop_id: str, data: dict,

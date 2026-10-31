@@ -43,9 +43,12 @@ log = logging.getLogger("sisi.agent")
 from app.vision import VisionError, read_expiry_photo, read_shop_photo
 from app.voice import VoiceError, transcribe_audio
 from app.tools import (
+    _book_question,
+    _example_word,
     _is_pack_unit,
     _pack_echo,
     add_credit,
+    answer_book_line,
     answer_intake_session,
     answer_link_choice,
     ask_intake_field,
@@ -71,7 +74,10 @@ from app.tools import (
     correct_receipt_line,
     delete_my_data,
     demo_reset,
+    book_option_labels,
     ensure_pack_price,
+    first_book_question,
+    match_first_options,
     ensure_product_price,
     ensure_shop,
     find_product,
@@ -149,6 +155,20 @@ def queue_list(shop_id: str, body: str, button_text: str,
 
 def take_lists(shop_id: str) -> list[dict]:
     return LIST_OUTBOX.pop(shop_id, [])
+
+
+BUTTON_OUTBOX: dict[str, list[dict]] = {}
+"""Queued tap-button prompts per shop; main.py drains after the text reply."""
+
+
+def queue_buttons(shop_id: str, body: str, buttons: list[str]) -> None:
+    if body and buttons:
+        BUTTON_OUTBOX.setdefault(shop_id, []).append(
+            {"body": body, "buttons": list(buttons)})
+
+
+def take_buttons(shop_id: str) -> list[dict]:
+    return BUTTON_OUTBOX.pop(shop_id, [])
 
 
 MENU_WORDS = {"menu", "hi", "hello", "hey", "imenyu"}
@@ -1176,6 +1196,9 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str,
     priced = try_price_reply(conn, shop_id, text)
     if priced is not None:
         return priced, None
+    tapped = try_book_tap(conn, shop_id, text)
+    if tapped is not None:
+        return tapped, None
     corrected = try_line_correction(conn, shop_id, text)
     if corrected is None:
         corrected = try_account_correction(conn, shop_id, text)
@@ -1509,6 +1532,9 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
             reply = (_t("logo_req_dropped") + "\n\n") + reply
         if after is not None and after["action_type"] == "link_choice":
             buttons = ["link", "new"]
+        elif after is not None and after["action_type"] == "book_page" \
+                and _book_awaits(conn, shop_id):
+            buttons = None  # which-one options go as tap buttons
         else:
             buttons = ["Yes", "No"]
     elif not plan["tasks"] and plan.get("question"):
@@ -1516,6 +1542,7 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
     save_turn(conn, shop_id, "assistant", reply)
     if buttons:
         _store_options(conn, shop_id, buttons)
+    _offer_book_question(conn, shop_id)
     return doc, reply, buttons
 
 
@@ -1590,6 +1617,9 @@ def handle_text(conn: sqlite3.Connection, shop_id: str, text: str,
     if after is not None and after["id"] != before_id:
         if after["action_type"] == "link_choice":
             buttons = ["link", "new"]
+        elif after["action_type"] == "book_page" \
+                and _book_awaits(conn, shop_id):
+            buttons = None  # which-one options go as tap buttons
         else:
             buttons = ["Yes", "No"]
     elif after_plan is not None and after_plan["plan_id"] != before_plan_id:
@@ -1598,6 +1628,7 @@ def handle_text(conn: sqlite3.Connection, shop_id: str, text: str,
         buttons = det_buttons
     if buttons:
         _store_options(conn, shop_id, buttons)
+    _offer_book_question(conn, shop_id)
     return message, buttons
 
 
@@ -1625,6 +1656,54 @@ def _maybe_first_offer(conn: sqlite3.Connection, shop_id: str, message: str) -> 
         return message
     return message + _t("ag_first_offer",
                                month=reports.month_label(month))
+
+
+def _book_awaits(conn: sqlite3.Connection, shop_id: str) -> bool:
+    """A book preview is waiting on which-one answers."""
+    pend = get_pending(conn, shop_id)
+    if pend is None or pend["action_type"] != "book_page":
+        return False
+    return first_book_question(json.loads(pend["payload_json"])) is not None
+
+
+def _offer_book_question(conn: sqlite3.Connection, shop_id: str) -> None:
+    """Queue tap buttons for the open which-one line, if any."""
+    pend = get_pending(conn, shop_id)
+    if pend is None or pend["action_type"] != "book_page":
+        return
+    payload = json.loads(pend["payload_json"])
+    entry = first_book_question(payload)
+    if entry is None:
+        return
+    labels = book_option_labels(payload)
+    queue_buttons(shop_id,
+                  _t("book_tap_answer", n=entry["line_no"],
+                     ex=_example_word(entry["options"])),
+                  labels)
+    _store_options(conn, shop_id, labels)
+
+
+def try_book_tap(conn: sqlite3.Connection, shop_id: str,
+                 text: str) -> str | None:
+    """A tap/typed pick answering the open which-one line.
+
+    A unique match binds it; a match on several options re-asks;
+    anything else returns None so normal routing continues.
+    """
+    if get_plan(conn, shop_id) is not None:
+        return None
+    pend = get_pending(conn, shop_id)
+    if pend is None or pend["action_type"] != "book_page":
+        return None
+    entry = first_book_question(json.loads(pend["payload_json"]))
+    if entry is None:
+        return None
+    hits = match_first_options(entry, text)
+    if len(hits) == 1:
+        return answer_book_line(conn, shop_id, entry["line_no"], hits[0])
+    if hits:
+        return _book_question(entry)
+    return None
 
 
 def try_line_correction(conn: sqlite3.Connection, shop_id: str, text: str) -> str | None:
