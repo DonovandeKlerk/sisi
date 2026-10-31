@@ -64,6 +64,7 @@ from app.tools import (
     clear_await_reminder,
     confirm_pending,
     correct_book_line,
+    correct_or_answer_book_line,
     correct_intake_line,
     correct_link_line,
     correct_receipt_account,
@@ -1628,16 +1629,23 @@ def _maybe_first_offer(conn: sqlite3.Connection, shop_id: str, message: str) -> 
 
 def try_line_correction(conn: sqlite3.Connection, shop_id: str, text: str) -> str | None:
     """Rewrite one pending order/book/receipt line ("line 3 is 4 bread")."""
-    m = re.match(r"\s*line\s+(\d+)\s+is\s+(.+)$", text or "", re.IGNORECASE)
+    m = re.match(r"\s*line\s+(\d+)\s+(?:is\s+)?(.+)$", text or "",
+                 re.IGNORECASE)
     if not m:
         return None
+    bare = re.match(r"\s*line\s+\d+\s+is\s+", text or "",
+                    re.IGNORECASE) is None
     if get_plan(conn, shop_id) is not None:
+        if bare:
+            return None
         return correct_plan_line(conn, shop_id, int(m.group(1)),
                                  m.group(2).strip())
     pend = get_pending(conn, shop_id)
     if pend is None or pend["action_type"] not in ("book_page", "receipt",
                                                   "stock_intake",
                                                   "receipt_link"):
+        return None
+    if bare and pend["action_type"] != "book_page":
         return None
     if pend["action_type"] == "receipt":
         return correct_receipt_line(conn, shop_id, int(m.group(1)), m.group(2).strip())
@@ -1647,7 +1655,8 @@ def try_line_correction(conn: sqlite3.Connection, shop_id: str, text: str) -> st
     if pend["action_type"] == "receipt_link":
         return correct_link_line(conn, shop_id, int(m.group(1)),
                                  m.group(2).strip())
-    return correct_book_line(conn, shop_id, int(m.group(1)), m.group(2).strip())
+    return correct_or_answer_book_line(conn, shop_id, int(m.group(1)),
+                                       m.group(2).strip())
 
 
 def try_link_choice_reply(conn: sqlite3.Connection, shop_id: str,

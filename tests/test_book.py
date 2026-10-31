@@ -58,7 +58,8 @@ def test_book_preview_sections(conn):
     assert "Expected cash in hand R156.00" in out
     assert "✅ Matches your page total R133.00" in out
     assert "Skipped 1 crossed-out line." in out
-    assert out.rstrip().endswith("Reply Yes to save, or correct a line, e.g. 'line 3 is 4 bread'")
+    assert "⏳ Answer the open lines first" in out
+    assert out.rstrip().endswith("Reply 'line 6 sasko'")
 
 
 def test_book_page_total_mismatch(conn):
@@ -69,7 +70,11 @@ def test_book_page_total_mismatch(conn):
 
 def test_book_confirm_applies_everything(conn):
     seed_demo(SHOP, conn)
+    conn.execute("UPDATE shops SET language = 'en' WHERE shop_id = ?", (SHOP,))
+    conn.commit()
     propose_book_page(conn, SHOP, _book())
+    msg, _ = handle_text(conn, SHOP, "line 6 sasko")
+    assert "• Sipho: 2x Sasko White Bread 700g = R37.00" in msg
     saved = assert_format(confirm_pending(conn, SHOP))
     assert saved.startswith("✅ *Book saved*")
     assert "⚠️ *Low stock*" in saved or "Stock looks fine" in saved
@@ -79,7 +84,7 @@ def test_book_confirm_applies_everything(conn):
     assert coke == 3
     assert "• Till R156.00" in cash_balances(conn, SHOP)
     assert get_balance(conn, SHOP, "Thandi") == "💳 *Thandi* owes R72.50."
-    assert get_balance(conn, SHOP, "Sipho") == "💳 *Sipho* owes R23.00."
+    assert get_balance(conn, SHOP, "Sipho") == "💳 *Sipho* owes R60.00."
 
 
 def test_undo_book_reverses_page(conn):
@@ -87,6 +92,7 @@ def test_undo_book_reverses_page(conn):
     conn.execute("UPDATE shops SET language = 'en' WHERE shop_id = ?", (SHOP,))
     conn.commit()
     propose_book_page(conn, SHOP, _book())
+    handle_text(conn, SHOP, "line 6 sasko")
     confirm_pending(conn, SHOP)
     msg, _ = handle_text(conn, SHOP, "undo book")
     assert msg == "Undone: removed the book page from 21 Oct."
@@ -105,6 +111,7 @@ def test_undo_book_skips_newer_actions(conn):
     conn.execute("UPDATE shops SET language = 'en' WHERE shop_id = ?", (SHOP,))
     conn.commit()
     propose_book_page(conn, SHOP, _book())
+    handle_text(conn, SHOP, "line 6 sasko")
     confirm_pending(conn, SHOP)
     record_sale(conn, SHOP, "Simba Chips 120g", 1)
     confirm_pending(conn, SHOP)
@@ -139,3 +146,101 @@ def test_book_nothing_usable(conn):
          "price_cents": None, "kind": "unreadable", "customer": ""}]})
     assert "Nothing to save" in out
     assert get_pending(conn, SHOP) is None
+
+
+def _set_en(conn):
+    conn.execute("UPDATE shops SET language = 'en' WHERE shop_id = ?", (SHOP,))
+    conn.commit()
+
+
+def _coke_stock(conn):
+    return conn.execute("SELECT stock_qty FROM products WHERE shop_id = ? "
+                        "AND name = 'Coke 2L'", (SHOP,)).fetchone()["stock_qty"]
+
+
+def test_book_yes_waits_for_answers(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    propose_book_page(conn, SHOP, _book())
+    gate = assert_format(confirm_pending(conn, SHOP))
+    assert "⏳ Answer the open lines first" in gate
+    assert "line 6" in gate and "sasko" in gate.lower()
+    assert get_pending(conn, SHOP) is not None  # nothing saved
+    assert _coke_stock(conn) == 5
+    msg, _ = handle_text(conn, SHOP, "line 6 sasko")
+    assert "• Sipho: 2x Sasko White Bread 700g = R37.00" in msg
+    saved = assert_format(confirm_pending(conn, SHOP))
+    assert saved.startswith("✅ *Book saved*")
+    assert get_balance(conn, SHOP, "Sipho") == "💳 *Sipho* owes R60.00."
+
+
+def test_book_two_ambiguous_lines_asked_in_order(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    book = _book()
+    book["lines"] = [ln for ln in book["lines"] if ln["line_no"] != 7] + [
+        {"line_no": 7, "text": "1 brd", "item": "brd", "qty": 1,
+         "price_cents": None, "kind": "cash", "customer": ""},
+    ]
+    out = propose_book_page(conn, SHOP, book)
+    assert out.rstrip().endswith("Reply 'line 6 sasko'")
+    assert "line 6 — which one?" in confirm_pending(conn, SHOP)
+    msg, _ = handle_text(conn, SHOP, "line 6 is 2 sasko Sipho")
+    assert "Reply 'line 7 sasko'" in msg  # next question surfaces
+    assert "line 7 — which one?" in confirm_pending(conn, SHOP)
+    msg, _ = handle_text(conn, SHOP, "line 7 brown")
+    assert "• 1x Albany Brown Bread 700g = R19.00" in msg
+    assert assert_format(confirm_pending(conn, SHOP)).startswith(
+        "✅ *Book saved*")
+
+
+def test_book_answer_keeps_written_price(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    out = propose_book_page(conn, SHOP, {
+        "date": "2026-10-21", "page_total_cents": None, "crossed_out": 0,
+        "lines": [{"line_no": 3, "text": "2 brd 40", "item": "brd", "qty": 2,
+                   "price_cents": 4000, "kind": "cash", "customer": ""}]})
+    assert "line 3 — which one?" in out
+    msg, _ = handle_text(conn, SHOP, "line 3 brown")
+    assert "• 2x Albany Brown Bread 700g = R40.00" in msg
+    assert assert_format(confirm_pending(conn, SHOP)).startswith(
+        "✅ *Book saved*")
+    alb = conn.execute("SELECT stock_qty FROM products WHERE shop_id = ? "
+                       "AND name = 'Albany Brown Bread 700g'",
+                       (SHOP,)).fetchone()["stock_qty"]
+    assert alb == 6
+    assert "• Till R40.00" in cash_balances(conn, SHOP)
+
+
+def test_book_legacy_pending_blocks_yes(conn):
+    import json
+
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    propose_book_page(conn, SHOP, _book())
+    row = get_pending(conn, SHOP)
+    payload = json.loads(row["payload_json"])
+    del payload["awaiting"]  # pre-migration row
+    conn.execute("UPDATE pending_actions SET payload_json = ? WHERE id = ?",
+                 (json.dumps(payload), row["id"]))
+    conn.commit()
+    gate = assert_format(confirm_pending(conn, SHOP))
+    assert "Lines 6 still need answers" in gate
+    assert "line 6 is 2 brown bread" in gate
+    assert get_pending(conn, SHOP) is not None
+    msg, _ = handle_text(conn, SHOP, "line 6 is 2 sasko Sipho")
+    assert "2x Sasko White Bread 700g" in msg
+    assert confirm_pending(conn, SHOP).startswith("✅ *Book saved*")
+
+
+def test_book_which_prefixes_match_translations():
+    from app.i18n import STRINGS
+    from app.tools import _BOOK_WHICH_PREFIXES
+
+    assert len(_BOOK_WHICH_PREFIXES) == 4
+    for lang, prefix in (("en", "which one:"), ("zu", "ikuphi:"),
+                         ("af", "watter een:"), ("xh", "yeyiphi:")):
+        rendered = STRINGS[lang]["book_reason_which"].format(names="a, b")
+        assert rendered.lower().startswith(prefix), lang
+        assert prefix in _BOOK_WHICH_PREFIXES

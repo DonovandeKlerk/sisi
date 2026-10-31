@@ -361,6 +361,10 @@ def confirm_pending(conn: sqlite3.Connection, shop_id: str) -> str:
         blockers = _intake_blockers(payload)
         if blockers:
             return _t("intake_still", items="; ".join(blockers))
+    if row["action_type"] == "book_page":
+        gate = _book_confirm_gate(payload)
+        if gate is not None:
+            return gate
     message, kind, summary, undo = apply(conn, shop_id, payload, action_id)
     if payload.get("photo_hash"):
         photo_kind = {"expiry_note": "expiry", "book_page": "book_page",
@@ -5338,8 +5342,12 @@ def _book_short(units: float, name: str) -> str:
 
 def _resolve_book_line(conn: sqlite3.Connection, shop_id: str, line_no: int, text: str,
                        item: str, qty: float, price_cents: int | None, kind: str,
-                       customer: str):
-    """Returns (section, entry) with section in cash|credit|payment|flagged."""
+                       customer: str, force_id=None):
+    """Returns (section, entry) with section in cash|credit|payment|flagged.
+
+    force_id binds a which-one answer to its chosen product, keeping the
+    original line's qty/price/customer instead of re-parsing the answer.
+    """
     cust = (customer or "").strip()
     if kind == "unreadable":
         return "flagged", {"line_no": line_no, "text": text,
@@ -5360,6 +5368,11 @@ def _resolve_book_line(conn: sqlite3.Connection, shop_id: str, line_no: int, tex
         return "flagged", {"line_no": line_no, "text": text,
                            "reason": _t("book_reason_unreadable")}
     prod, ambiguous = _resolve_book_item(conn, shop_id, item)
+    if force_id is not None:
+        forced = conn.execute("SELECT * FROM products WHERE shop_id = ?"
+                              " AND id = ?", (shop_id, force_id)).fetchone()
+        if forced is not None:
+            prod, ambiguous = forced, []
     if prod is None:
         if ambiguous:
             names = ", ".join(p["name"] for p in ambiguous[:2])
@@ -5449,8 +5462,105 @@ def _render_book_preview(conn: sqlite3.Connection, shop_id: str, payload: dict) 
     elif payload.get("crossed_out"):
         blocks.append(_t("book_crossed_many",
                          n=payload["crossed_out"]))
-    blocks.append(_t("book_correct_hint"))
+    awaiting = sorted(payload.get("awaiting") or [], key=lambda e: e["line_no"])
+    if awaiting:
+        blocks.append(_t("book_answer_first"))
+        blocks.append(_book_question(awaiting[0]))
+    else:
+        blocks.append(_t("book_correct_hint"))
     return "\n\n".join(blocks)
+
+
+def _track_book_ambiguous(conn, shop_id, payload, line_no, ln, item):
+    """Remember a which-one line so Yes waits for its answer."""
+    if not (item or "").strip():
+        return
+    _prod, ambiguous = _resolve_book_item(conn, shop_id, item)
+    if not ambiguous:
+        return
+    payload.setdefault("awaiting", [])
+    payload["awaiting"] = [e for e in payload["awaiting"]
+                           if e["line_no"] != line_no]
+    payload["awaiting"].append({
+        "line_no": line_no, "text": str(ln.get("text") or ""),
+        "item": item, "qty": ln.get("qty") or 1,
+        "price_cents": ln.get("price_cents"),
+        "kind": str(ln.get("kind") or "unreadable"),
+        "customer": str(ln.get("customer") or ""),
+        "options": [{"id": p["id"], "name": p["name"]}
+                    for p in ambiguous[:2]]})
+
+
+def _example_word(options) -> str:
+    """Shortest distinguishing word of the first option ('brown')."""
+    first = options[0]["name"]
+    others = " ".join(o["name"] for o in options[1:]).lower()
+    best = ""
+    for word in re.findall(r"[a-z0-9]+", first.lower()):
+        if len(word) < 3 or any(ch.isdigit() for ch in word):
+            continue
+        if word in others:
+            continue
+        if not best or len(word) < len(best):
+            best = word
+    return best or first
+
+
+def _book_question(entry) -> str:
+    opts = "\n".join("• " + o["name"] for o in entry["options"])
+    return _t("book_ask_which", n=entry["line_no"], text=entry["text"][:60],
+              opts=opts, ex=_example_word(entry["options"]))
+
+
+def _clean_answer(text: str) -> str:
+    return re.sub(r"[^a-z0-9 ]", "", (text or "").lower()).strip()
+
+
+def match_book_option(payload: dict, line_no: int, rest: str):
+    """The uniquely named option, else None (caller falls back to re-parse)."""
+    entry = next((e for e in payload.get("awaiting") or []
+                  if e["line_no"] == line_no), None)
+    if entry is None:
+        return None
+    ans = _clean_answer(rest)
+    if not ans:
+        return None
+    hits = [o for o in entry["options"]
+            if ans in o["name"].lower() or o["name"].lower() in ans]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _replace_book_line(payload: dict, line_no: int, section: str, entry: dict) -> None:
+    entry["kind"] = section
+    for key in ("cash", "credit", "payments", "flagged"):
+        payload[key] = [e for e in payload[key] if e["line_no"] != line_no]
+    payload[{"cash": "cash", "credit": "credit", "payment": "payments"}.get(
+        section, "flagged")].append(entry)
+
+
+def answer_book_line(conn: sqlite3.Connection, shop_id: str, line_no: int,
+                     option: dict) -> str:
+    """Bind a which-one answer, keeping the original line's qty/price."""
+    pend = get_pending(conn, shop_id)
+    if pend is None or pend["action_type"] != "book_page":
+        return _t("book_no_preview")
+    payload = json.loads(pend["payload_json"])
+    entry = next((e for e in payload.get("awaiting") or []
+                  if e["line_no"] == line_no), None)
+    if entry is None:
+        return _t("book_no_preview")
+    section, resolved = _resolve_book_line(
+        conn, shop_id, line_no, entry["text"], entry["item"], entry["qty"],
+        entry.get("price_cents"), entry["kind"], entry["customer"],
+        force_id=option["id"])
+    _replace_book_line(payload, line_no, section, resolved)
+    payload["awaiting"] = [e for e in payload["awaiting"]
+                           if e["line_no"] != line_no]
+    preview = _render_book_preview(conn, shop_id, payload)
+    conn.execute("UPDATE pending_actions SET payload_json = ?, preview_text = ? WHERE id = ?",
+                 (json.dumps(payload), preview, pend["id"]))
+    conn.commit()
+    return preview
 
 
 def propose_book_page(conn: sqlite3.Connection, shop_id: str, book: dict,
@@ -5462,17 +5572,23 @@ def propose_book_page(conn: sqlite3.Connection, shop_id: str, book: dict,
                      "page_total": book.get("page_total_cents"),
                      "crossed_out": book.get("crossed_out") or 0,
                      "cash": [], "credit": [], "payments": [], "flagged": [],
+                     "awaiting": [],
                      "line_count": 0, "photo_hash": photo_hash}
     for ln in book.get("lines", []) or []:
         payload["line_count"] = max(payload["line_count"], int(ln.get("line_no") or 0))
+        no = int(ln.get("line_no") or 0)
+        item = str(ln.get("item") or "")
         section, entry = _resolve_book_line(
-            conn, shop_id, int(ln.get("line_no") or 0), str(ln.get("text") or ""),
-            str(ln.get("item") or ""), ln.get("qty") or 1, ln.get("price_cents"),
+            conn, shop_id, no, str(ln.get("text") or ""),
+            item, ln.get("qty") or 1, ln.get("price_cents"),
             str(ln.get("kind") or "unreadable"), str(ln.get("customer") or ""))
         entry["kind"] = section
         payload[{"cash": "cash", "credit": "credit", "payment": "payments"}.get(
             section, "flagged")].append(entry)
-    if not payload["cash"] and not payload["credit"] and not payload["payments"]:
+        if section == "flagged":
+            _track_book_ambiguous(conn, shop_id, payload, no, ln, item)
+    if not payload["cash"] and not payload["credit"] \
+            and not payload["payments"] and not payload["awaiting"]:
         out = _t("book_nothing")
         if payload["flagged"]:
             out += "\n" + "\n".join(_t("book_flag_line", n=e['line_no'],
@@ -5610,6 +5726,7 @@ def correct_book_line(conn: sqlite3.Connection, shop_id: str, line_no: int, rest
     if parsed is None:
         return _t("book_bad_correction")
     shop = ensure_shop(conn, shop_id)
+    await_entry = None
     if parsed["kind"] == "payment":
         section, entry = _resolve_book_line(conn, shop_id, line_no, rest, "",
                                             1, parsed["amount"], "payment",
@@ -5629,6 +5746,12 @@ def correct_book_line(conn: sqlite3.Connection, shop_id: str, line_no: int, rest
             names = ", ".join(p["name"] for p in ambiguous[:2])
             section, entry = "flagged", {"line_no": line_no, "text": rest,
                                          "reason": _t("book_reason_which", names=names)}
+            await_entry = {
+                "line_no": line_no, "text": rest, "item": " ".join(words),
+                "qty": parsed["qty"], "price_cents": None, "kind": kind,
+                "customer": customer,
+                "options": [{"id": p["id"], "name": p["name"]}
+                            for p in ambiguous[:2]]}
         elif prod["price_cents"] is None:
             section, entry = "flagged", {"line_no": line_no, "text": rest,
                                          "reason": _t("book_reason_noprice",
@@ -5647,16 +5770,62 @@ def correct_book_line(conn: sqlite3.Connection, shop_id: str, line_no: int, rest
                 section = "credit"
             else:
                 section = "cash"
-    entry["kind"] = section
-    for key in ("cash", "credit", "payments", "flagged"):
-        payload[key] = [e for e in payload[key] if e["line_no"] != line_no]
-    payload[{"cash": "cash", "credit": "credit", "payment": "payments"}.get(
-        section, "flagged")].append(entry)
+    _replace_book_line(payload, line_no, section, entry)
+    payload.setdefault("awaiting", [])
+    if await_entry is not None:
+        payload["awaiting"] = [e for e in payload["awaiting"]
+                               if e["line_no"] != line_no] + [await_entry]
+    else:
+        payload["awaiting"] = [e for e in payload["awaiting"]
+                               if e["line_no"] != line_no]
     preview = _render_book_preview(conn, shop_id, payload)
     conn.execute("UPDATE pending_actions SET payload_json = ?, preview_text = ? WHERE id = ?",
                  (json.dumps(payload), preview, pend["id"]))
     conn.commit()
     return preview
+
+
+def correct_or_answer_book_line(conn: sqlite3.Connection, shop_id: str,
+                                line_no: int, rest: str) -> str:
+    """A which-one answer binds its option; anything else re-parses."""
+    pend = get_pending(conn, shop_id)
+    if pend is not None and pend["action_type"] == "book_page":
+        opt = match_book_option(json.loads(pend["payload_json"]),
+                                line_no, rest)
+        if opt is not None:
+            return answer_book_line(conn, shop_id, line_no, opt)
+    return correct_book_line(conn, shop_id, line_no, rest)
+
+
+_BOOK_WHICH_PREFIXES = ("which one:", "ikuphi:", "watter een:", "yeyiphi:")
+"""book_reason_which prefixes per language (see test for the sync pin)."""
+
+
+def _book_blocked_lines(payload: dict) -> list[int]:
+    """Line_nos whose which-one question is still open (legacy included)."""
+    awaited = {e["line_no"] for e in payload.get("awaiting") or []}
+    blocked = set(awaited)
+    for e in payload.get("flagged") or []:
+        reason = str(e.get("reason") or "")
+        if e.get("line_no") not in awaited and reason[:24].lower().startswith(
+                tuple(p.lower() for p in _BOOK_WHICH_PREFIXES)):
+            blocked.add(e["line_no"])
+    return sorted(blocked)
+
+
+def _book_confirm_gate(payload: dict) -> str | None:
+    """Block Yes while which-one questions are open; None when complete."""
+    blocked = _book_blocked_lines(payload)
+    if not blocked:
+        return None
+    awaited = {e["line_no"] for e in payload.get("awaiting") or []}
+    if all(n in awaited for n in blocked):
+        first = next(e for e in payload["awaiting"]
+                     if e["line_no"] == blocked[0])
+        return _t("book_answer_first") + "\n\n" + _book_question(first)
+    lines = ", ".join(str(n) for n in blocked)
+    return _t("book_legacy_lines", lines=lines,
+              ex=f"line {blocked[0]} is 2 brown bread")
 
 
 RECEIPT_EXPENSE_WORDS = {
