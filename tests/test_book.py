@@ -75,6 +75,7 @@ def test_book_confirm_applies_everything(conn):
     propose_book_page(conn, SHOP, _book())
     msg, _ = handle_text(conn, SHOP, "line 6 sasko")
     assert "• Sipho: 2x Sasko White Bread 700g = R37.00" in msg
+    handle_text(conn, SHOP, "skip line 7")  # unicorn: no match, skip it
     saved = assert_format(confirm_pending(conn, SHOP))
     assert saved.startswith("✅ *Book saved*")
     assert "⚠️ *Low stock*" in saved or "Stock looks fine" in saved
@@ -93,6 +94,7 @@ def test_undo_book_reverses_page(conn):
     conn.commit()
     propose_book_page(conn, SHOP, _book())
     handle_text(conn, SHOP, "line 6 sasko")
+    handle_text(conn, SHOP, "skip line 7")
     confirm_pending(conn, SHOP)
     msg, _ = handle_text(conn, SHOP, "undo book")
     assert msg == "Undone: removed the book page from 21 Oct."
@@ -112,6 +114,7 @@ def test_undo_book_skips_newer_actions(conn):
     conn.commit()
     propose_book_page(conn, SHOP, _book())
     handle_text(conn, SHOP, "line 6 sasko")
+    handle_text(conn, SHOP, "skip line 7")
     confirm_pending(conn, SHOP)
     record_sale(conn, SHOP, "Simba Chips 120g", 1)
     confirm_pending(conn, SHOP)
@@ -169,6 +172,7 @@ def test_book_yes_waits_for_answers(conn):
     assert _coke_stock(conn) == 5
     msg, _ = handle_text(conn, SHOP, "line 6 sasko")
     assert "• Sipho: 2x Sasko White Bread 700g = R37.00" in msg
+    handle_text(conn, SHOP, "skip line 7")  # unicorn: no match, skip it
     saved = assert_format(confirm_pending(conn, SHOP))
     assert saved.startswith("✅ *Book saved*")
     assert get_balance(conn, SHOP, "Sipho") == "💳 *Sipho* owes R60.00."
@@ -226,17 +230,18 @@ def test_book_legacy_pending_blocks_yes(conn):
                  (json.dumps(payload), row["id"]))
     conn.commit()
     gate = assert_format(confirm_pending(conn, SHOP))
-    assert "Lines 6 still need answers" in gate
+    assert "Lines 6, 7 still need answers" in gate
     assert "line 6 is 2 brown bread" in gate
     assert get_pending(conn, SHOP) is not None
     msg, _ = handle_text(conn, SHOP, "line 6 is 2 sasko Sipho")
     assert "2x Sasko White Bread 700g" in msg
+    handle_text(conn, SHOP, "skip line 7")
     assert confirm_pending(conn, SHOP).startswith("✅ *Book saved*")
 
 
 def test_book_which_prefixes_match_translations():
     from app.i18n import STRINGS
-    from app.tools import _BOOK_WHICH_PREFIXES
+    from app.tools import _BOOK_NOSHELF, _BOOK_WHICH_PREFIXES
 
     assert len(_BOOK_WHICH_PREFIXES) == 4
     for lang, prefix in (("en", "which one:"), ("zu", "ikuphi:"),
@@ -244,6 +249,9 @@ def test_book_which_prefixes_match_translations():
         rendered = STRINGS[lang]["book_reason_which"].format(names="a, b")
         assert rendered.lower().startswith(prefix), lang
         assert prefix in _BOOK_WHICH_PREFIXES
+    assert len(_BOOK_NOSHELF) == 4
+    for lang in ("en", "zu", "af", "xh"):
+        assert STRINGS[lang]["book_reason_noshelf"] in _BOOK_NOSHELF, lang
 
 
 def _two_ambiguous():
@@ -289,6 +297,294 @@ def test_book_tap_ambiguous_reasks(conn):
     assert "line 6 — which one?" in msg
     assert "Answer the open lines first" in confirm_pending(conn, SHOP)
     take_buttons(SHOP)
+
+
+def test_book_nomatch_suggests_and_binds(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    take_buttons(SHOP)
+    out = propose_book_page(conn, SHOP, {
+        "date": "2026-10-21", "page_total_cents": None, "crossed_out": 0,
+        "lines": [{"line_no": 6, "text": "2 cooldrinks 36", "item": "cooldrinks",
+                   "qty": 2, "price_cents": 3600, "kind": "cash",
+                   "customer": ""}]})
+    assert "line 6 — which one?" in out
+    assert "Answer the open lines first" in confirm_pending(conn, SHOP)
+    msg, _ = handle_text(conn, SHOP, "Stoney 2L")
+    assert "• 2x Stoney 2L = R36.00" in msg
+    assert assert_format(confirm_pending(conn, SHOP)).startswith(
+        "✅ *Book saved*")
+    stoney = conn.execute("SELECT stock_qty FROM products WHERE shop_id = ? "
+                          "AND name = 'Stoney 2L'",
+                          (SHOP,)).fetchone()["stock_qty"]
+    assert stoney == 6
+    assert "• Till R36.00" in cash_balances(conn, SHOP)
+
+
+def test_book_nomatch_without_suggestions_then_skip(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    take_buttons(SHOP)
+    out = propose_book_page(conn, SHOP, _book())
+    assert "what is this?" not in out  # first question is still line 6
+    handle_text(conn, SHOP, "line 6 sasko")
+    take_buttons(SHOP)
+    assert "what is this?" in confirm_pending(conn, SHOP)  # unicorn, no taps
+    assert take_buttons(SHOP) == []
+    msg, _ = handle_text(conn, SHOP, "skip line 7")
+    assert "unicorn" not in msg
+    assert assert_format(confirm_pending(conn, SHOP)).startswith(
+        "✅ *Book saved*")
+
+
+def test_book_skip_last_line_cancels(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    propose_book_page(conn, SHOP, {
+        "date": "2026-10-21", "page_total_cents": None, "crossed_out": 0,
+        "lines": [{"line_no": 1, "text": "1 unicorn", "item": "unicorn",
+                   "qty": 1, "price_cents": None, "kind": "cash",
+                   "customer": ""}]})
+    assert get_pending(conn, SHOP) is not None
+    msg, _ = handle_text(conn, SHOP, "skip line 1")
+    assert "Nothing to save" in msg
+    assert get_pending(conn, SHOP) is None
+
+
+def test_book_correction_to_nomatch_stays_asked(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    take_buttons(SHOP)
+    propose_book_page(conn, SHOP, _book())
+    handle_text(conn, SHOP, "line 6 sasko")
+    msg, _ = handle_text(conn, SHOP, "line 7 is 1 dragon")
+    assert "what is this?" in msg or "which one?" in msg
+    assert "Answer the open lines first" in confirm_pending(conn, SHOP)
+    take_buttons(SHOP)
+
+
+def test_book_skip_resolved_is_noop(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    propose_book_page(conn, SHOP, _book())
+    msg, _ = handle_text(conn, SHOP, "skip line 2")
+    assert "• 2x Coke 2L = R72.00" in msg  # resolved line kept
+    assert "Answer the open lines first" in confirm_pending(conn, SHOP)
+
+
+def _card_book():
+    return {
+        "date": "2026-10-21",
+        "page_total_cents": None,
+        "crossed_out": 0,
+        "lines": [
+            {"line_no": 1, "text": "2 coke 72", "item": "coke", "qty": 2,
+             "price_cents": 7200, "kind": "cash", "customer": ""},
+            {"line_no": 2, "text": "2 milk 56", "item": "milk", "qty": 2,
+             "price_cents": 5600, "kind": "card", "customer": ""},
+            {"line_no": 3, "text": "1 milk Thandi", "item": "milk", "qty": 1,
+             "price_cents": None, "kind": "credit", "customer": "Thandi"},
+        ],
+    }
+
+
+def test_book_card_posts_to_bank(conn):
+    from app.tools import account_balance, cash_up
+
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    out = assert_format(propose_book_page(conn, SHOP, _card_book()))
+    assert "💳 *Card sales*" in out
+    assert "• 2x Fresh Milk 1L = R56.00" in out
+    assert "💳 *Card sales R56.00 → bank R56.00*" in out
+    assert "Expected cash in hand R72.00" in out  # drawer excludes card
+    saved = assert_format(confirm_pending(conn, SHOP))
+    assert "card R56.00" in saved
+    assert "• Card sales R56.00 (1 sales)" in saved
+    assert "• Till R72.00" in cash_balances(conn, SHOP)
+    assert account_balance(conn, SHOP, "bank") == 5600
+    assert "• Cash sales R72.00 (1 sales)" in cash_up(conn, SHOP,
+                                                     "2026-10-21")
+    milk = conn.execute("SELECT stock_qty FROM products WHERE shop_id = ? "
+                        "AND name = 'Fresh Milk 1L'", (SHOP,)).fetchone()
+    assert milk["stock_qty"] == 3  # card + credit lines both moved stock
+
+
+def test_book_card_correction(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    propose_book_page(conn, SHOP, _card_book())
+    msg, _ = handle_text(conn, SHOP, "line 1 is 2 coke card")
+    assert "💳 *Card sales*" in msg
+    assert "• 2x Coke 2L = R72.00" in msg
+    assert "💵 *Cash sales*" not in msg
+
+
+def test_book_card_ambiguous_asked_then_banked(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    take_buttons(SHOP)
+    out = propose_book_page(conn, SHOP, {
+        "date": "2026-10-21", "page_total_cents": None, "crossed_out": 0,
+        "lines": [{"line_no": 4, "text": "2 brd 44", "item": "brd", "qty": 2,
+                   "price_cents": 4400, "kind": "card", "customer": ""}]})
+    assert "line 4 — which one?" in out
+    msg, _ = handle_text(conn, SHOP, "line 4 brown")
+    assert "• 2x Albany Brown Bread 700g = R44.00" in msg
+    assert confirm_pending(conn, SHOP).startswith("✅ *Book saved*")
+    from app.tools import account_balance
+    assert account_balance(conn, SHOP, "bank") == 4400
+    assert "• Till R0.00" in cash_balances(conn, SHOP)
+    take_buttons(SHOP)
+
+
+def _supply_book():
+    return {
+        "date": "2026-10-21",
+        "page_total_cents": None,
+        "crossed_out": 0,
+        "lines": [
+            {"line_no": 1, "text": "2 coke 72", "item": "coke", "qty": 2,
+             "price_cents": 7200, "kind": "cash", "customer": ""},
+            {"line_no": 15, "text": "Supplier: 5 bread R80 cash",
+             "item": "bread", "qty": 5, "price_cents": 8000,
+             "kind": "supplier", "customer": ""},
+            {"line_no": 16, "text": "1 milk damaged - threw away",
+             "item": "milk", "qty": 1, "price_cents": None,
+             "kind": "wastage", "customer": ""},
+        ],
+    }
+
+
+def _prod(conn, name):
+    return conn.execute("SELECT * FROM products WHERE shop_id = ? AND name = ?",
+                        (SHOP, name)).fetchone()
+
+
+def test_book_supply_and_waste_flow(conn):
+    from app.tools import undo_last
+
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    take_buttons(SHOP)
+    out = assert_format(propose_book_page(conn, SHOP, _supply_book()))
+    assert "line 15 — which one?" in out  # bread still ambiguous
+    msg, _ = handle_text(conn, SHOP, "line 15 brown")
+    assert "• 5x Albany Brown Bread 700g = R80.00 (Till)" in msg
+    assert "🚚 *Supplier R80.00 paid from Till*" in msg
+    assert "• 1x Fresh Milk 1L" in msg  # waste section
+    assert "Expected cash in hand -R8.00" in msg  # 72 - 80
+    assert assert_format(confirm_pending(conn, SHOP)).startswith(
+        "✅ *Book saved*")
+    assert _prod(conn, "Albany Brown Bread 700g")["stock_qty"] == 13
+    assert _prod(conn, "Albany Brown Bread 700g")["cost_cents"] == 1600
+    assert _prod(conn, "Fresh Milk 1L")["stock_qty"] == 5
+    assert "• Till -R8.00" in cash_balances(conn, SHOP)
+    undo_last(conn, SHOP)
+    assert _prod(conn, "Albany Brown Bread 700g")["stock_qty"] == 8
+    assert _prod(conn, "Albany Brown Bread 700g")["cost_cents"] is None
+    assert _prod(conn, "Fresh Milk 1L")["stock_qty"] == 6
+    assert "• Till R0.00" in cash_balances(conn, SHOP)
+
+
+def test_book_supply_asks_qty_then_saves(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    take_buttons(SHOP)
+    out = propose_book_page(conn, SHOP, {
+        "date": "2026-10-21", "page_total_cents": None, "crossed_out": 0,
+        "lines": [{"line_no": 15, "text": "Supplier: bread R80 cash",
+                   "item": "bread", "qty": None, "price_cents": 8000,
+                   "kind": "supplier", "customer": ""}]})
+    assert "line 15 — which one?" in out
+    msg, _ = handle_text(conn, SHOP, "brown")
+    assert "how many?" in msg
+    assert "R80.00" in msg
+    msg, _ = handle_text(conn, SHOP, "5")
+    assert "• 5x Albany Brown Bread 700g = R80.00 (Till)" in msg
+    assert assert_format(confirm_pending(conn, SHOP)).startswith(
+        "✅ *Book saved*")
+    assert _prod(conn, "Albany Brown Bread 700g")["stock_qty"] == 13
+    assert "• Till -R80.00" in cash_balances(conn, SHOP)
+
+
+def test_book_supply_asks_cost(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    take_buttons(SHOP)
+    out = propose_book_page(conn, SHOP, {
+        "date": "2026-10-21", "page_total_cents": None, "crossed_out": 0,
+        "lines": [{"line_no": 15, "text": "Supplier: 5 coke",
+                   "item": "coke", "qty": 5, "price_cents": None,
+                   "kind": "supplier", "customer": ""}]})
+    assert "how much?" in out
+    msg, _ = handle_text(conn, SHOP, "line 15 is R80")
+    assert "• 5x Coke 2L = R80.00 (Till)" in msg
+    assert confirm_pending(conn, SHOP).startswith("✅ *Book saved*")
+    assert _prod(conn, "Coke 2L")["stock_qty"] == 10
+
+
+def test_book_supply_correction_keeps_supplier(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    take_buttons(SHOP)
+    propose_book_page(conn, SHOP, {
+        "date": "2026-10-21", "page_total_cents": None, "crossed_out": 0,
+        "lines": [{"line_no": 15, "text": "Supplier: bread R80 cash",
+                   "item": "bread", "qty": None, "price_cents": 8000,
+                   "kind": "supplier", "customer": ""}]})
+    handle_text(conn, SHOP, "brown")  # binds Albany, asks qty
+    take_buttons(SHOP)
+    msg, _ = handle_text(conn, SHOP, "line 15 is stoney")
+    assert "how many?" in msg  # product fixed, qty still open
+    assert "Stoney 2L" in msg
+    msg, _ = handle_text(conn, SHOP, "line 15 is 4")
+    assert "• 4x Stoney 2L = R80.00 (Till)" in msg
+    assert confirm_pending(conn, SHOP).startswith("✅ *Book saved*")
+
+
+def test_book_supply_skip(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    propose_book_page(conn, SHOP, _supply_book())
+    msg, _ = handle_text(conn, SHOP, "skip line 15")
+    assert "Supplier" not in msg
+    assert confirm_pending(conn, SHOP).startswith("✅ *Book saved*")
+    assert _prod(conn, "Albany Brown Bread 700g")["stock_qty"] == 8
+    assert _prod(conn, "Fresh Milk 1L")["stock_qty"] == 5  # waste kept
+
+
+def test_book_waste_correction(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    propose_book_page(conn, SHOP, _card_book())
+    msg, _ = handle_text(conn, SHOP, "line 1 is 2 coke waste")
+    assert "🗑️ *Damaged / thrown away*" in msg
+    assert "• 2x Coke 2L" in msg
+    assert confirm_pending(conn, SHOP).startswith("✅ *Book saved*")
+    assert _prod(conn, "Coke 2L")["stock_qty"] == 3
+    assert "• Till R0.00" in cash_balances(conn, SHOP)  # no money moved
+
+
+def test_book_credit_shows_list_flag(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    out = assert_format(propose_book_page(conn, SHOP, {
+        "date": "2026-10-21", "page_total_cents": None, "crossed_out": 0,
+        "lines": [{"line_no": 3, "text": "2 coke Thandi 80", "item": "coke",
+                   "qty": 2, "price_cents": 8000, "kind": "credit",
+                   "customer": "Thandi"}]}))
+    assert "• Thandi: 2x Coke 2L = R80.00" in out
+    assert "⚠️ (list R72.00)" in out
+    assert confirm_pending(conn, SHOP).startswith("✅ *Book saved*")
+
+
+def test_book_skip_off_page(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    propose_book_page(conn, SHOP, _book())
+    msg, _ = handle_text(conn, SHOP, "skip line 9")
+    assert "isn't on this page" in msg
 
 
 def test_book_tap_no_match_falls_through(conn):
@@ -383,6 +679,8 @@ def test_book_save_queues_daily_pdf(conn, monkeypatch, tmp_path):
     propose_book_page(conn, SHOP, _book())
     handle_text(conn, SHOP, "line 6 sasko")
     take_buttons(SHOP)
+    handle_text(conn, SHOP, "skip line 7")
+    take_buttons(SHOP)
     saved = assert_format(confirm_pending(conn, SHOP))
     assert saved.startswith("✅ *Book saved*")
     items = take_media(SHOP)
@@ -397,8 +695,10 @@ def test_book_save_queues_daily_pdf(conn, monkeypatch, tmp_path):
     assert pdf.startswith(b"%PDF")
     assert b"R106.00" in pdf  # cash sales
     assert b"R64.00" in pdf  # credit incl. the answered line
-    assert b"R156.00" in pdf  # expected cash in hand
+    assert b"R156.00" in pdf  # cash from today
     assert b"R170.00" in pdf  # lines vs page total mismatch
+    assert b"Cash from today" in pdf
+    assert b"Expected cash in hand" not in pdf  # chat-only balance label
 
 
 def test_book_save_without_base_url_no_media(conn, monkeypatch):
@@ -408,8 +708,29 @@ def test_book_save_without_base_url_no_media(conn, monkeypatch):
     take_media(SHOP)
     propose_book_page(conn, SHOP, _book())
     handle_text(conn, SHOP, "line 6 sasko")
+    handle_text(conn, SHOP, "skip line 7")
     assert confirm_pending(conn, SHOP).startswith("✅ *Book saved*")
     assert take_media(SHOP) == []
+
+
+def test_book_unreadable_line_asks_no_question(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    take_buttons(SHOP)
+    out = propose_book_page(conn, SHOP, {
+        "date": "2026-10-21", "page_total_cents": None, "crossed_out": 0,
+        "lines": [
+            {"line_no": 1, "text": "2 coke 72", "item": "coke", "qty": 2,
+             "price_cents": 7200, "kind": "cash", "customer": ""},
+            {"line_no": 15, "text": "Supplier: bread R80 cash",
+             "item": "bread", "qty": 1, "price_cents": 8000,
+             "kind": "unreadable", "customer": ""}]})
+    assert "which one?" not in out  # no pointless question
+    assert out.rstrip().endswith(
+        "Reply Yes to save, or correct a line, e.g. 'line 3 is 4 bread'")
+    msg, _ = handle_text(conn, SHOP, "yes")
+    assert assert_format(msg).startswith("✅ *Book saved*")
+    assert take_buttons(SHOP) == []  # nothing to answer, no buttons
 
 
 def test_daily_pdf_failure_keeps_save(conn, monkeypatch):
@@ -422,5 +743,6 @@ def test_daily_pdf_failure_keeps_save(conn, monkeypatch):
     take_media(SHOP)
     propose_book_page(conn, SHOP, _book())
     handle_text(conn, SHOP, "line 6 sasko")
+    handle_text(conn, SHOP, "skip line 7")
     assert confirm_pending(conn, SHOP).startswith("✅ *Book saved*")
     assert take_media(SHOP) == []

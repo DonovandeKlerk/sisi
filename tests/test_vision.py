@@ -269,6 +269,39 @@ def test_download_media_photo_label(photo_env):
 # TypeError instead of degrading to VisionError.
 
 
+def test_shop_photo_keeps_card_kind_and_page_date(photo_env, monkeypatch):
+    seen = {}
+
+    def fake(messages, response_format):
+        seen["prompt"] = messages[0]["content"][0]["text"]
+        return _vresp(json.dumps({
+            "doc_type": "book_page",
+            "book": {"date": "2026-10-30", "page_total_cents": None,
+                     "crossed_out": 0,
+                     "lines": [
+                         {"line_no": 8, "text": "2 milk 56", "item": "milk",
+                          "qty": 2, "price_cents": 5600, "kind": "card",
+                          "customer": ""},
+                         {"line_no": 15, "text": "Supplier: bread R80",
+                          "item": "bread", "qty": None, "price_cents": 8000,
+                          "kind": "supplier", "customer": ""},
+                         {"line_no": 16, "text": "1 milk damaged",
+                          "item": "milk", "qty": 1, "price_cents": None,
+                          "kind": "wastage", "customer": ""},
+                         {"line_no": 9, "text": "???", "item": "",
+                          "qty": 1, "price_cents": None,
+                          "kind": "teleport", "customer": ""}]}}))
+
+    monkeypatch.setattr(vision, "_complete_vision", fake)
+    doc = vision.read_shop_photo(_tiny_jpg(), SHOP)
+    assert seen["prompt"].startswith("Today is ")
+    assert doc["book"]["date"] == "2026-10-30"
+    kinds = [ln["kind"] for ln in doc["book"]["lines"]]
+    assert kinds == ["card", "supplier", "wastage", "unreadable"]
+    qtys = [ln["qty"] for ln in doc["book"]["lines"]]
+    assert qtys == [2, None, 1, 1]  # supplier keeps its unknown qty
+
+
 @pytest.mark.parametrize("payload", [
     {"doc_type": "book_page",
      "book": {"lines": [{"line_no": [3], "text": "x"}]}},

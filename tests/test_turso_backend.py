@@ -184,14 +184,49 @@ def test_error_tuples_cover_both_backends():
         raise sqlite3.OperationalError("boom")
 
 
+def _tables_script():
+    import app.db as dbmod
+
+    return {"SELECT name FROM sqlite_master":
+            (["name"], [(t,) for t in dbmod._SCHEMA_TABLES])}
+
+
 def test_schema_executescript_over_driver():
     import app.db as dbmod
 
-    sess = FakeSession()
+    sess = FakeSession(script=_tables_script())
     conn = _conn(sess)
     dbmod.init_db(conn)  # full SCHEMA + ALTER sweep, recorded only
     assert any("CREATE TABLE IF NOT EXISTS shops" in s for s in sess.statements)
     assert any("ALTER TABLE" in s for s in sess.statements)
+
+
+def test_init_db_fails_when_tables_missing():
+    """Live cron bug: init passed silently, send_due died on no-such-table."""
+    import app.db as dbmod
+
+    sess = FakeSession(script={"SELECT name FROM sqlite_master": ([], [])})
+    with pytest.raises(RuntimeError, match="schema verification failed"):
+        dbmod.init_db(_conn(sess))
+
+
+def test_init_db_reraises_nonduplicate_alter():
+    import app.db as dbmod
+
+    sess = FakeSession(script=_tables_script())
+    sess.failures["ALTER TABLE"] = TursoOperationalError(
+        "no such table: shops")
+    with pytest.raises(TursoOperationalError, match="no such table"):
+        dbmod.init_db(_conn(sess))
+
+
+def test_init_db_swallows_duplicate_column():
+    import app.db as dbmod
+
+    sess = FakeSession(script=_tables_script())
+    sess.failures["ALTER TABLE"] = TursoOperationalError(
+        "duplicate column name: cost_cents")
+    dbmod.init_db(_conn(sess))  # fresh-DB ALTER noise stays silent
 
 
 def test_enforce_read_only_noop_on_turso_conn(caplog):

@@ -20,6 +20,7 @@ from datetime import date
 from pathlib import Path
 
 from app import config
+from app.db import today_str
 from app.i18n import STRINGS
 from app.i18n import t as _t
 from app.llm import get_client, log_usage, print_api_error
@@ -113,7 +114,9 @@ SHOP_PHOTO_SCHEMA = {
                                 "qty": {"type": "number"},
                                 "price_cents": {"type": ["integer", "null"]},
                                 "kind": {"type": "string", "enum": ["cash", "credit",
-                                                                    "payment", "unreadable"]},
+                                                                    "card", "payment",
+                                                                    "supplier", "wastage",
+                                                                    "unreadable"]},
                                 "customer": {"type": "string"},
                             },
                             "required": ["line_no", "text", "item", "qty",
@@ -196,8 +199,12 @@ SHOP_PHOTO_PROMPT = (
     "own total line (put it in page_total_cents). For each kept line: the item as "
     "written (keep abbreviations like chap, brd, stny and isiZulu spellings as-is), "
     "qty as written (default 1; quantities are loose singles), the written price in "
-    "cents or null, kind (cash sale, credit sale with the customer's name, a credit "
-    "payment with the customer, or unreadable), and the customer first name or ''. "
+    "cents or null, kind (cash sale, card sale for lines under a Card heading, "
+    "credit sale with the customer's name, a credit payment with the customer, "
+    "a supplier purchase with what was paid, a damaged or thrown-away line, "
+    "or unreadable), and the customer first name or ''. Also read the page's "
+    "written date into date as YYYY-MM-DD (use the current year when only day "
+    "and month are written; '' when no date is shown). "
     "RECEIPT: supplier name, receipt date as YYYY-MM-DD, receipt/invoice number, "
     "every line (item as printed, packs and pack size when shown, total single "
     "units when you can tell, unit cost and line total in cents, null when not "
@@ -340,7 +347,8 @@ def read_shop_photo(image: bytes, shop_id: str = "") -> dict:
     prepared, mime = _prepare_image(image)
     data_url = f"data:{mime};base64," + base64.b64encode(prepared).decode("ascii")
     messages = [{"role": "user", "content": [
-        {"type": "text", "text": SHOP_PHOTO_PROMPT},
+        {"type": "text",
+         "text": f"Today is {today_str()}. " + SHOP_PHOTO_PROMPT},
         {"type": "image_url", "image_url": {"url": data_url}},
     ]}]
     try:
@@ -355,7 +363,8 @@ def read_shop_photo(image: bytes, shop_id: str = "") -> dict:
     except (ValueError, AttributeError, IndexError):
         raise VisionError(_t("vis_cant_read")) from None
     try:
-        kinds = {"cash", "credit", "payment", "unreadable"}
+        kinds = {"cash", "credit", "card", "payment", "supplier",
+                 "wastage", "unreadable"}
         book = doc.get("book")
         book = book if isinstance(book, dict) else {}
         book_lines = []
@@ -363,13 +372,16 @@ def read_shop_photo(image: bytes, shop_id: str = "") -> dict:
             if not isinstance(ln, dict):
                 continue
             qty = _sane_number(ln.get("qty", 0)) or 0
+            kind = ln.get("kind") if ln.get("kind") in kinds else "unreadable"
+            if qty <= 0:
+                qty = None if kind == "supplier" else 1
             book_lines.append({
                 "line_no": _sane_int(ln.get("line_no")),
                 "text": str(ln.get("text") or "").strip(),
                 "item": str(ln.get("item") or "").strip(),
-                "qty": qty if qty > 0 else 1,
+                "qty": qty,
                 "price_cents": _sane_cents(ln.get("price_cents")),
-                "kind": ln.get("kind") if ln.get("kind") in kinds else "unreadable",
+                "kind": kind,
                 "customer": str(ln.get("customer") or "").strip(),
             })
         doc["book"] = {"date": _sane_date(book.get("date")),

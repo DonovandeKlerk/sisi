@@ -384,6 +384,14 @@ CREATE INDEX IF NOT EXISTS idx_sendq_to ON send_queue(to_number, status, next_at
 CREATE INDEX IF NOT EXISTS idx_rem_due ON reminders(status, due_at);
 """
 
+_SCHEMA_TABLES: tuple[str, ...] = tuple(
+    dict.fromkeys(
+        m.group(1).lower()
+        for m in re.finditer(r"CREATE TABLE IF NOT EXISTS (\w+)", SCHEMA)
+    )
+)
+"""Every table init_db must create; _verify_schema fails loud without them."""
+
 
 def get_db_path() -> Path:
     return Path(os.environ.get("SISI_DB", "data/sisi.db"))
@@ -606,12 +614,31 @@ def init_db(conn: DbConnection) -> None:
         "ALTER TABLE reminders ADD COLUMN dlr_detail TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE reminders ADD COLUMN blocked_reason TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE send_queue ADD COLUMN claimed_at REAL",
+        "ALTER TABLE sales ADD COLUMN pay_method TEXT NOT NULL DEFAULT 'cash'",
     ):
         try:
             conn.execute(sql)
-        except DB_OPERATIONAL_ERROR:
-            pass  # column already exists on fresh DBs
+        except DB_OPERATIONAL_ERROR as e:
+            if _BENIGN_ALTER.search(str(e)) is None:
+                raise  # e.g. "no such table": a real schema failure
+            # column already exists on fresh DBs
     conn.commit()
+    _verify_schema(conn)
+
+
+_BENIGN_ALTER = re.compile(r"duplicate column|already exists", re.IGNORECASE)
+"""ALTER errors safe to swallow; anything else fails loud."""
+
+
+def _verify_schema(conn: DbConnection) -> None:
+    """Fail loud when tables are missing after init (never mask it)."""
+    have = {r[0].lower()
+            for r in conn.execute("SELECT name FROM sqlite_master"
+                                  " WHERE type = 'table'").fetchall()}
+    missing = [t for t in _SCHEMA_TABLES if t not in have]
+    if missing:
+        raise RuntimeError("schema verification failed, missing tables: "
+                           + ", ".join(missing))
 
 
 def now_iso() -> str:

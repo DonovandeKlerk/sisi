@@ -801,24 +801,36 @@ def daily_sales_data(payload: dict) -> dict:
     """Flatten a confirmed book-page payload for the daily sales PDF."""
     cash = sorted(payload.get("cash") or [], key=lambda e: e["line_no"])
     credit = sorted(payload.get("credit") or [], key=lambda e: e["line_no"])
+    card = sorted(payload.get("card") or [], key=lambda e: e["line_no"])
+    supply = sorted(payload.get("supply") or [], key=lambda e: e["line_no"])
+    waste = sorted(payload.get("waste") or [], key=lambda e: e["line_no"])
     payments = sorted(payload.get("payments") or [],
                       key=lambda e: e["line_no"])
     cash_total = sum(e["total"] for e in cash)
     credit_total = sum(e["total"] for e in credit)
+    card_total = sum(e["total"] for e in card)
+    supply_total = sum(e["total"] for e in supply)
+    supply_cash = sum(e["total"] for e in supply
+                      if (e.get("account") or "cash") == "cash")
     pay_total = sum(e["amount"] for e in payments)
     return {
         "date": payload.get("display_date") or payload.get("date") or "",
         "cash": [{"item": e["short"], "cents": e["total"]} for e in cash],
         "credit": [{"customer": e["customer"], "item": e["short"],
                     "cents": e["total"]} for e in credit],
+        "card": [{"item": e["short"], "cents": e["total"]} for e in card],
+        "supply": [{"item": e["short"], "cents": e["total"]}
+                   for e in supply],
+        "waste": [{"item": e["short"]} for e in waste],
         "payments": [{"customer": e["customer"], "cents": e["amount"]}
                      for e in payments],
         "cash_total": cash_total, "credit_total": credit_total,
+        "card_total": card_total, "supply_total": supply_total,
         "pay_total": pay_total,
-        "expected_cash": cash_total + pay_total,
+        "expected_cash": cash_total + pay_total - supply_cash,
         "page_total": payload.get("page_total"),
         "match": payload.get("page_total") is not None
-        and payload["page_total"] == cash_total + credit_total,
+        and payload["page_total"] == cash_total + card_total + credit_total,
     }
 
 
@@ -845,6 +857,15 @@ def render_daily_sales_pdf(data: dict, brand: dict, path: str) -> str:
                          Paragraph(cents_to_rand(it["cents"]), st["cell_r"])])
         story.append(_pdf_table(rows, [W * 0.78, W * 0.22]))
         story.append(Spacer(1, 6))
+    if data["card"]:
+        story.append(Paragraph(_t("doc_card_sales"), st["h2"]))
+        rows = [[Paragraph(f"<b>{_t('doc_th_item')}</b>", st["cell"]),
+                 Paragraph(f"<b>{_t('doc_th_amount')}</b>", st["cell_r"])]]
+        for it in data["card"]:
+            rows.append([Paragraph(_esc(it["item"]), st["cell"]),
+                         Paragraph(cents_to_rand(it["cents"]), st["cell_r"])])
+        story.append(_pdf_table(rows, [W * 0.78, W * 0.22]))
+        story.append(Spacer(1, 6))
     if data["credit"]:
         story.append(Paragraph(_t("doc_credit_sales"), st["h2"]))
         rows = [[Paragraph(f"<b>{_t('doc_th_customer')}</b>", st["cell"]),
@@ -856,18 +877,41 @@ def render_daily_sales_pdf(data: dict, brand: dict, path: str) -> str:
                          Paragraph(cents_to_rand(it["cents"]), st["cell_r"])])
         story.append(_pdf_table(rows, [W * 0.26, W * 0.52, W * 0.22]))
         story.append(Spacer(1, 6))
+    if data["supply"]:
+        story.append(Paragraph(_t("doc_purchases"), st["h2"]))
+        rows = [[Paragraph(f"<b>{_t('doc_th_item')}</b>", st["cell"]),
+                 Paragraph(f"<b>{_t('doc_th_amount')}</b>", st["cell_r"])]]
+        for it in data["supply"]:
+            rows.append([Paragraph(_esc(it["item"]), st["cell"]),
+                         Paragraph(cents_to_rand(it["cents"]), st["cell_r"])])
+        story.append(_pdf_table(rows, [W * 0.78, W * 0.22]))
+        story.append(Spacer(1, 6))
+    if data["waste"]:
+        story.append(Paragraph(_t("doc_waste_head"), st["h2"]))
+        rows = [[Paragraph(f"<b>{_t('doc_th_item')}</b>", st["cell"])]]
+        for it in data["waste"]:
+            rows.append([Paragraph(_esc(it["item"]), st["cell"])])
+        story.append(_pdf_table(rows, [W]))
+        story.append(Spacer(1, 6))
     if data["payments"]:
         story.append(Paragraph(_t("doc_payments"), st["h2"]))
         story.append(_pdf_table(_kv_rows(st, [
             (_esc(p["customer"]), cents_to_rand(p["cents"]))
             for p in data["payments"]], bold_last=False), [W - 130, 130]))
         story.append(Spacer(1, 6))
-    story.append(_pdf_table(_kv_rows(st, [
-        (_t("doc_cash_sales"), cents_to_rand(data["cash_total"])),
-        (_t("doc_credit_sales"), cents_to_rand(data["credit_total"])),
-        (_t("doc_payments"), cents_to_rand(data["pay_total"])),
-        (_t("doc_expected_cash"),
-         cents_to_rand(data["expected_cash"]))]), [W - 130, 130]))
+    totals = [(_t("doc_cash_sales"), cents_to_rand(data["cash_total"]))]
+    if data["card_total"]:
+        totals.append((_t("doc_card_sales"),
+                       cents_to_rand(data["card_total"])))
+    totals.append((_t("doc_credit_sales"),
+                   cents_to_rand(data["credit_total"])))
+    if data["supply_total"]:
+        totals.append((f"− {_t('doc_purchases')}",
+                       "−" + cents_to_rand(data["supply_total"])))
+    totals += [(_t("doc_payments"), cents_to_rand(data["pay_total"])),
+               (_t("doc_cash_today"),
+                cents_to_rand(data["expected_cash"]))]
+    story.append(_pdf_table(_kv_rows(st, totals), [W - 130, 130]))
     story.append(Spacer(1, 6))
     if data["page_total"] is not None:
         if data["match"]:

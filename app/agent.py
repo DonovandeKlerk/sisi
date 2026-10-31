@@ -46,10 +46,12 @@ from app.tools import (
     _book_question,
     _example_word,
     _is_pack_unit,
+    _leading_number,
     _pack_echo,
     add_credit,
     answer_book_line,
     answer_intake_session,
+    answer_supply_number,
     answer_link_choice,
     ask_intake_field,
     build_order,
@@ -78,6 +80,7 @@ from app.tools import (
     ensure_pack_price,
     first_book_question,
     match_first_options,
+    skip_book_line,
     ensure_product_price,
     ensure_shop,
     find_product,
@@ -1199,6 +1202,9 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str,
     tapped = try_book_tap(conn, shop_id, text)
     if tapped is not None:
         return tapped, None
+    skipped = try_book_skip(conn, shop_id, text)
+    if skipped is not None:
+        return skipped, None
     corrected = try_line_correction(conn, shop_id, text)
     if corrected is None:
         corrected = try_account_correction(conn, shop_id, text)
@@ -1676,11 +1682,28 @@ def _offer_book_question(conn: sqlite3.Connection, shop_id: str) -> None:
     if entry is None:
         return
     labels = book_option_labels(payload)
+    if not labels:
+        # Open question lives in the preview; clear stale taps so bare
+        # numbers answer it instead of a dead button row.
+        _store_options(conn, shop_id, [])
+        return
     queue_buttons(shop_id,
                   _t("book_tap_answer", n=entry["line_no"],
                      ex=_example_word(entry["options"])),
                   labels)
     _store_options(conn, shop_id, labels)
+
+
+def try_book_skip(conn: sqlite3.Connection, shop_id: str,
+                  text: str) -> str | None:
+    """Drop one flagged book line ("skip line 6"). None when not applicable."""
+    m = re.match(r"\s*skip\s+line\s+(\d+)\s*$", text or "", re.IGNORECASE)
+    if not m:
+        return None
+    pend = get_pending(conn, shop_id)
+    if pend is None or pend["action_type"] != "book_page":
+        return None
+    return skip_book_line(conn, shop_id, int(m.group(1)))
 
 
 def try_book_tap(conn: sqlite3.Connection, shop_id: str,
@@ -1698,6 +1721,12 @@ def try_book_tap(conn: sqlite3.Connection, shop_id: str,
     entry = first_book_question(json.loads(pend["payload_json"]))
     if entry is None:
         return None
+    if entry.get("need") in ("qty", "cost"):
+        num = _leading_number(text)
+        if num is None:
+            return None
+        return answer_supply_number(conn, shop_id, entry["line_no"],
+                                    entry["need"], num)
     hits = match_first_options(entry, text)
     if len(hits) == 1:
         return answer_book_line(conn, shop_id, entry["line_no"], hits[0])
