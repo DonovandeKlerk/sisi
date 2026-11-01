@@ -1727,6 +1727,13 @@ def try_book_tap(conn: sqlite3.Connection, shop_id: str,
             return None
         return answer_supply_number(conn, shop_id, entry["line_no"],
                                     entry["need"], num)
+    if entry.get("price_warn") and _leading_number(text) is not None:
+        # A bare number repeats the warned pick: that confirms it.
+        want = entry["price_warn"].get("prod")
+        opt = next((o for o in entry.get("options") or []
+                    if o["id"] == want), None)
+        if opt is not None:
+            return answer_book_line(conn, shop_id, entry["line_no"], opt)
     hits = match_first_options(entry, text)
     if len(hits) == 1:
         return answer_book_line(conn, shop_id, entry["line_no"], hits[0])

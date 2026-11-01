@@ -799,6 +799,7 @@ def render_statement_pngs(data: dict, brand: dict, prefix: str,
 
 def daily_sales_data(payload: dict) -> dict:
     """Flatten a confirmed book-page payload for the daily sales PDF."""
+    from app import tools as _tools
     cash = sorted(payload.get("cash") or [], key=lambda e: e["line_no"])
     credit = sorted(payload.get("credit") or [], key=lambda e: e["line_no"])
     card = sorted(payload.get("card") or [], key=lambda e: e["line_no"])
@@ -831,7 +832,23 @@ def daily_sales_data(payload: dict) -> dict:
         "page_total": payload.get("page_total"),
         "match": payload.get("page_total") is not None
         and payload["page_total"] == cash_total + card_total + credit_total,
+        "is_till": _tools._is_till_count(
+            payload.get("page_total_label") or ""),
     }
+
+
+def _till_line(data: dict) -> str:
+    """Drawer-count line: page total vs till balance after save."""
+    counted = data["page_total"]
+    drawer = data.get("drawer")
+    if drawer is not None and counted == drawer:
+        return _t("doc_till_match", total=cents_to_rand(counted))
+    if drawer is None:
+        return _t("doc_match", total=cents_to_rand(counted))
+    word = _t("over_word") if counted > drawer else _t("short_word")
+    return _t("doc_till_diff", counted=cents_to_rand(counted),
+              diff=cents_to_rand(abs(counted - drawer)), word=word,
+              exp=cents_to_rand(drawer))
 
 
 def render_daily_sales_pdf(data: dict, brand: dict, path: str) -> str:
@@ -914,7 +931,9 @@ def render_daily_sales_pdf(data: dict, brand: dict, path: str) -> str:
     story.append(_pdf_table(_kv_rows(st, totals), [W - 130, 130]))
     story.append(Spacer(1, 6))
     if data["page_total"] is not None:
-        if data["match"]:
+        if data.get("is_till"):
+            story.append(Paragraph(_till_line(data), st["body"]))
+        elif data["match"]:
             story.append(Paragraph(
                 _t("doc_match",
                    total=cents_to_rand(data["page_total"])), st["body"]))
@@ -922,6 +941,7 @@ def render_daily_sales_pdf(data: dict, brand: dict, path: str) -> str:
             story.append(Paragraph(
                 _t("doc_mismatch", page=cents_to_rand(data["page_total"]),
                    lines=cents_to_rand(data["cash_total"]
+                                       + data["card_total"]
                                        + data["credit_total"])), st["body"]))
     doc.build(story, onFirstPage=_pdf_footer, onLaterPages=_pdf_footer)
     return path

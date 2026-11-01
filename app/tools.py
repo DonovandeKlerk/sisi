@@ -5466,6 +5466,75 @@ def _supply_account(text: str) -> str:
     return "cash"
 
 
+def _is_till_count(label: str) -> bool:
+    """The page total is a drawer count, not a sales total."""
+    return re.search(r"\b(till|counted|count|drawer|cash\s?-?up)\b",
+                     (label or "").lower()) is not None
+
+
+def _price_deviant(total, list_total) -> bool:
+    """True when written money is half-or-less / double-or-more of list."""
+    if not total or total <= 0 or not list_total or list_total <= 0:
+        return False
+    ratio = total / list_total
+    return ratio <= 0.5 or ratio >= 2.0
+
+
+def _challenge_price(conn: sqlite3.Connection, shop_id: str, payload: dict,
+                     line_no: int, text: str, kind: str, customer: str,
+                     account: str, prod: dict, units: float, total: int,
+                     list_total: int, orig) -> str | None:
+    """Demand same-pick-twice confirmation for an absurd price.
+
+    Returns the warning when this bind must be confirmed (flagging the
+    line and tracking a single-option question); None when it may bind.
+    """
+    if not _price_deviant(total, list_total):
+        return None
+    if (orig or {}).get("price_warn", {}).get("prod") == prod["id"]:
+        return None  # same pick twice: the owner confirmed it
+    short = _book_short(units, prod["name"])
+    warn = _t("book_price_warn", short=short, total=cents_to_rand(total),
+              list=cents_to_rand(list_total))
+    _replace_book_line(payload, line_no, "flagged",
+                       {"line_no": line_no, "text": text,
+                        "reason": _t("book_reason_priceoff")})
+    payload.setdefault("awaiting", [])
+    payload["awaiting"] = [e for e in payload["awaiting"]
+                           if e["line_no"] != line_no]
+    payload["awaiting"].append({
+        "line_no": line_no, "text": text, "item": prod["name"],
+        "qty": units, "price_cents": total, "kind": kind,
+        "customer": customer, "account": account,
+        "options": [{"id": prod["id"], "name": prod["name"]}],
+        "price_warn": {"prod": prod["id"]}})
+    return warn
+
+
+def _maybe_challenge_bind(conn: sqlite3.Connection, shop_id: str,
+                          payload: dict, line_no: int, section: str,
+                          resolved: dict, orig, text: str = "") -> str | None:
+    """Challenge a resolved bind when its price is absurd, else None."""
+    if section not in ("cash", "credit", "card", "supply"):
+        return None
+    prod = {"id": resolved["product_id"], "name": resolved["name"]}
+    if section == "supply":
+        cost = conn.execute(
+            "SELECT cost_cents FROM products WHERE id = ?",
+            (resolved["product_id"],)).fetchone()["cost_cents"]
+        if not cost:
+            return None  # no cost on file: nothing to judge against
+        list_total = cost * resolved["units"]
+    else:
+        list_total = resolved["list_total"]
+    return _challenge_price(
+        conn, shop_id, payload, line_no,
+        resolved.get("text") or text or "",
+        "supplier" if section == "supply" else section,
+        resolved.get("customer") or "", resolved.get("account") or "cash",
+        prod, resolved["units"], resolved["total"], list_total, orig)
+
+
 def _resolve_supply_line(conn: sqlite3.Connection, shop_id: str, line_no: int,
                          text: str, item: str, qty, price_cents,
                          force_id=None):
@@ -5645,7 +5714,21 @@ def _render_book_preview(conn: sqlite3.Connection, shop_id: str, payload: dict) 
                              acct=_acct_name(acct)))
     if payload.get("page_total") is not None:
         written = cash_total + card_total + credit_total
-        if written == payload["page_total"]:
+        if _is_till_count(payload.get("page_total_label") or ""):
+            counted = payload["page_total"]
+            if counted == expected:
+                blocks.append(_t("book_till_match",
+                                 total=cents_to_rand(counted)))
+            else:
+                diff = counted - expected
+                word = _t("over_word") if diff > 0 else _t("short_word")
+                blocks.append(_t("book_till_diff",
+                                 counted=cents_to_rand(counted),
+                                 diff=cents_to_rand(abs(diff)), word=word,
+                                 exp=cents_to_rand(expected)))
+                blocks.append(_t("book_till_hint",
+                                 n=cents_to_rand(counted)))
+        elif written == payload["page_total"]:
             blocks.append(_t("book_match", total=cents_to_rand(written)))
         else:
             blocks.append(_t("book_mismatch",
@@ -5709,10 +5792,13 @@ def _example_word(options) -> str:
 
 def _book_question(entry) -> str:
     if entry.get("need") == "qty":
-        return _t("book_supply_qty", n=entry["line_no"],
-                  text=entry["text"][:60],
-                  name=(entry.get("product") or {}).get("name", ""),
-                  total=cents_to_rand(entry.get("price_cents") or 0))
+        name = (entry.get("product") or {}).get("name", "")
+        if entry.get("price_cents"):
+            return _t("book_supply_qty", n=entry["line_no"],
+                      text=entry["text"][:60], name=name,
+                      total=cents_to_rand(entry["price_cents"]))
+        return _t("book_supply_qty_plain", n=entry["line_no"],
+                  text=entry["text"][:60], name=name)
     if entry.get("need") == "cost":
         return _t("book_supply_cost", n=entry["line_no"],
                   text=entry["text"][:60],
@@ -5803,21 +5889,24 @@ def answer_book_line(conn: sqlite3.Connection, shop_id: str, line_no: int,
         conn, shop_id, line_no, entry["text"], entry["item"], entry["qty"],
         entry.get("price_cents"), entry["kind"], entry["customer"],
         force_id=option["id"])
-    _replace_book_line(payload, line_no, section, resolved)
-    rest = [e for e in payload.get("awaiting") or []
-            if e["line_no"] != line_no]
-    if section in _SUPPLY_NEEDS:
-        # Product bound, qty/cost still open: chain the next question.
-        rest.append(_supply_need_entry(
-            line_no, resolved["text"], entry.get("qty"),
-            entry.get("price_cents"), option,
-            resolved.get("account") or "cash", section))
-    payload["awaiting"] = rest
+    warn = _maybe_challenge_bind(conn, shop_id, payload, line_no, section,
+                                 resolved, entry, entry["text"])
+    if warn is None:
+        _replace_book_line(payload, line_no, section, resolved)
+        rest = [e for e in payload.get("awaiting") or []
+                if e["line_no"] != line_no]
+        if section in _SUPPLY_NEEDS:
+            # Product bound, qty/cost still open: chain the next question.
+            rest.append(_supply_need_entry(
+                line_no, resolved["text"], entry.get("qty"),
+                entry.get("price_cents"), option,
+                resolved.get("account") or "cash", section))
+        payload["awaiting"] = rest
     preview = _render_book_preview(conn, shop_id, payload)
     conn.execute("UPDATE pending_actions SET payload_json = ?, preview_text = ? WHERE id = ?",
                  (json.dumps(payload), preview, pend["id"]))
     conn.commit()
-    return preview
+    return (warn + "\n\n" + preview) if warn else preview
 
 
 def _leading_number(rest: str):
@@ -5850,19 +5939,22 @@ def answer_supply_number(conn: sqlite3.Connection, shop_id: str, line_no: int,
     section, resolved = _resolve_supply_line(
         conn, shop_id, line_no, entry["text"], "", qty, price,
         force_id=entry["product"]["id"])
-    _replace_book_line(payload, line_no, section, resolved)
-    rest = [e for e in payload.get("awaiting") or []
-            if e["line_no"] != line_no]
-    if section in _SUPPLY_NEEDS:
-        rest.append(_supply_need_entry(
-            line_no, resolved["text"], qty, price, entry["product"],
-            entry.get("account") or "cash", section))
-    payload["awaiting"] = rest
+    warn = _maybe_challenge_bind(conn, shop_id, payload, line_no, section,
+                                 resolved, entry, entry["text"])
+    if warn is None:
+        _replace_book_line(payload, line_no, section, resolved)
+        rest = [e for e in payload.get("awaiting") or []
+                if e["line_no"] != line_no]
+        if section in _SUPPLY_NEEDS:
+            rest.append(_supply_need_entry(
+                line_no, resolved["text"], qty, price, entry["product"],
+                entry.get("account") or "cash", section))
+        payload["awaiting"] = rest
     preview = _render_book_preview(conn, shop_id, payload)
     conn.execute("UPDATE pending_actions SET payload_json = ?, preview_text = ? WHERE id = ?",
                  (json.dumps(payload), preview, pend["id"]))
     conn.commit()
-    return preview
+    return (warn + "\n\n" + preview) if warn else preview
 
 
 def propose_book_page(conn: sqlite3.Connection, shop_id: str, book: dict,
@@ -5872,11 +5964,13 @@ def propose_book_page(conn: sqlite3.Connection, shop_id: str, book: dict,
     day = book.get("date") or today_str()
     payload: dict = {"date": day, "display_date": _fmt_date(day),
                      "page_total": book.get("page_total_cents"),
+                     "page_total_label": str(book.get("page_total_label") or ""),
                      "crossed_out": book.get("crossed_out") or 0,
                      "cash": [], "credit": [], "card": [], "payments": [],
                      "supply": [], "waste": [], "flagged": [],
                      "awaiting": [],
                      "line_count": 0, "photo_hash": photo_hash}
+    warns: list[str] = []
     for ln in book.get("lines", []) or []:
         payload["line_count"] = max(payload["line_count"], int(ln.get("line_no") or 0))
         no = int(ln.get("line_no") or 0)
@@ -5887,6 +5981,12 @@ def propose_book_page(conn: sqlite3.Connection, shop_id: str, book: dict,
             conn, shop_id, no, str(ln.get("text") or ""),
             item, ln_qty, ln.get("price_cents"),
             ln_kind, str(ln.get("customer") or ""))
+        warn = _maybe_challenge_bind(conn, shop_id, payload, no, section,
+                                         entry, None,
+                                         str(ln.get("text") or ""))
+        if warn is not None:
+            warns.append(warn)
+            continue
         entry["kind"] = section
         if section in _SUPPLY_NEEDS:
             payload.setdefault("awaiting", []).append(_supply_need_entry(
@@ -5909,8 +6009,10 @@ def propose_book_page(conn: sqlite3.Connection, shop_id: str, book: dict,
                                         reason=e['reason'])
                                      for e in payload["flagged"])
         return out
-    return _propose(conn, shop_id, "book_page", payload,
-                    _render_book_preview(conn, shop_id, payload))
+    preview = _render_book_preview(conn, shop_id, payload)
+    if warns:
+        preview = warns[0] + "\n\n" + preview
+    return _propose(conn, shop_id, "book_page", payload, preview)
 
 
 def _apply_book_page(conn: sqlite3.Connection, shop_id: str, payload: dict, action_id: str):
@@ -6176,7 +6278,8 @@ def correct_book_line(conn: sqlite3.Connection, shop_id: str, line_no: int, rest
                                                      name=prod['name'])}
         else:
             total = int(round(prod["price_cents"] * parsed["qty"]))
-            entry = {"line_no": line_no, "product_id": prod["id"], "name": prod["name"],
+            entry = {"line_no": line_no, "text": rest, "product_id": prod["id"],
+                     "name": prod["name"],
                      "units": parsed["qty"], "total": total, "list_total": total,
                      "short": _book_short(parsed["qty"], prod["name"])}
             if kind == "credit":
@@ -6195,6 +6298,16 @@ def correct_book_line(conn: sqlite3.Connection, shop_id: str, line_no: int, rest
                 section = "waste"
             else:
                 section = "cash"
+    orig = next((e for e in payload.get("awaiting") or []
+                 if e["line_no"] == line_no), None)
+    warn = _maybe_challenge_bind(conn, shop_id, payload, line_no, section,
+                                 entry, orig, rest)
+    if warn is not None:
+        preview = _render_book_preview(conn, shop_id, payload)
+        conn.execute("UPDATE pending_actions SET payload_json = ?, preview_text = ? WHERE id = ?",
+                     (json.dumps(payload), preview, pend["id"]))
+        conn.commit()
+        return warn + "\n\n" + preview
     _replace_book_line(payload, line_no, section, entry)
     payload.setdefault("awaiting", [])
     if await_entry is not None:
@@ -7911,6 +8024,8 @@ def _queue_daily_sales_pdf(conn: sqlite3.Connection, shop_id: str,
         pdf = str(_reports.REPORTS_DIR / f"{safe}-daily-sales-{day}.pdf")
         with _doc_lang(_owner_lang(conn, shop_id)):
             data = _reports.daily_sales_data(payload)
+            if data.get("is_till"):
+                data["drawer"] = account_balance(conn, shop_id, "cash")
             _reports.render_daily_sales_pdf(
                 data, _reports.shop_brand(conn, shop_id), pdf)
         base = _os.environ.get("SISI_PUBLIC_URL", "").rstrip("/")

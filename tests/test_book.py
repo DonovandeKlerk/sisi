@@ -746,3 +746,86 @@ def test_daily_pdf_failure_keeps_save(conn, monkeypatch):
     handle_text(conn, SHOP, "skip line 7")
     assert confirm_pending(conn, SHOP).startswith("✅ *Book saved*")
     assert take_media(SHOP) == []
+
+
+def test_book_price_challenge_needs_same_pick_twice(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    take_buttons(SHOP)
+    out = propose_book_page(conn, SHOP, {
+        "date": "2026-10-21", "page_total_cents": None, "crossed_out": 0,
+        "lines": [{"line_no": 1, "text": "1 coke 200", "item": "coke",
+                   "qty": 1, "price_cents": 20000, "kind": "cash",
+                   "customer": ""}]})
+    assert "way off the list (R36.00)" in out  # challenged, not bound
+    assert "⏳ Answer the open lines first" in out
+    msg, _ = handle_text(conn, SHOP, "line 1 coke")  # same pick: confirmed
+    assert "• 1x Coke 2L = R200.00" in msg
+    assert assert_format(confirm_pending(conn, SHOP)).startswith(
+        "✅ *Book saved*")
+
+
+def test_book_till_count_match(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    out = assert_format(propose_book_page(conn, SHOP, {
+        "date": "2026-10-21", "page_total_cents": 7200,
+        "page_total_label": "Till", "crossed_out": 0,
+        "lines": [{"line_no": 1, "text": "2 coke 72", "item": "coke",
+                   "qty": 2, "price_cents": 7200, "kind": "cash",
+                   "customer": ""}]}))
+    assert "✅ *Till matches the drawer (R72.00).*" in out
+
+
+def test_book_till_count_diff(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    out = assert_format(propose_book_page(conn, SHOP, {
+        "date": "2026-10-21", "page_total_cents": 8000,
+        "page_total_label": "counted", "crossed_out": 0,
+        "lines": [{"line_no": 1, "text": "2 coke 72", "item": "coke",
+                   "qty": 2, "price_cents": 7200, "kind": "cash",
+                   "customer": ""}]}))
+    assert "⚠️ *Till counted R80.00 — R8.00 over of R72.00.*" in out
+    assert "reply 'counted R80.00'" in out
+
+
+def test_book_supply_no_qty_no_price_plain_prompt(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    take_buttons(SHOP)
+    out = propose_book_page(conn, SHOP, {
+        "date": "2026-10-21", "page_total_cents": None, "crossed_out": 0,
+        "lines": [{"line_no": 15, "text": "Supplier: coke",
+                   "item": "coke", "qty": None, "price_cents": None,
+                   "kind": "supplier", "customer": ""}]})
+    assert "How many Coke 2L arrived?" in out
+    assert "did R0.00 buy?" not in out
+    msg, _ = handle_text(conn, SHOP, "5")
+    assert "how much?" in msg
+    msg, _ = handle_text(conn, SHOP, "line 15 is R80")
+    assert "• 5x Coke 2L = R80.00 (Till)" in msg
+    assert assert_format(confirm_pending(conn, SHOP)).startswith(
+        "✅ *Book saved*")
+    assert _prod(conn, "Coke 2L")["stock_qty"] == 10
+
+
+def test_daily_pdf_till_line(conn, tmp_path):
+    from app import reports
+
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    payload = {
+        "display_date": "21 Oct", "date": "2026-10-21",
+        "cash": [{"line_no": 1, "short": "2x Coke 2L", "total": 7200}],
+        "credit": [], "card": [], "supply": [], "waste": [],
+        "payments": [], "page_total": 7200, "page_total_label": "Till",
+    }
+    data = reports.daily_sales_data(payload)
+    assert data["is_till"] is True
+    data["drawer"] = 7200
+    pdf = str(tmp_path / "till.pdf")
+    reports.render_daily_sales_pdf(data, reports.shop_brand(conn, SHOP), pdf)
+    raw = open(pdf, "rb").read()
+    assert raw.startswith(b"%PDF")
+    assert b"Till matches the drawer" in raw  # parens are PDF-escaped

@@ -365,11 +365,12 @@ def test_month_end_pdf_uses_owner_language(conn, shop, monkeypatch):
     conn.commit()
     msg, _ = handle_text(conn, SHOP, "month-end report")
     assert msg.startswith("📊 *Month-end:")  # WhatsApp text follows the message
-    row = reports.get_report(conn, SHOP, today_str()[:7])
+    row = reports.get_report(conn, SHOP, reports.default_month())
     pdf = open(row["pdf_path"], "rb").read()
     assert b"Wins" in pdf  # …but the filed PDF follows the owner
     assert "Oktober".encode() in pdf or "November".encode() in pdf
-    assert calendar.month_name[int(today_str()[5:7])].encode() in msg.encode()
+    filed = reports.default_month()
+    assert calendar.month_name[int(filed[5:7])].encode() in msg.encode()
 
 
 def test_compliance_per_language(conn, shop):

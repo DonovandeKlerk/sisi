@@ -102,6 +102,7 @@ SHOP_PHOTO_SCHEMA = {
                 "properties": {
                     "date": {"type": "string"},
                     "page_total_cents": {"type": ["integer", "null"]},
+                    "page_total_label": {"type": "string"},
                     "crossed_out": {"type": "integer"},
                     "lines": {
                         "type": "array",
@@ -111,7 +112,7 @@ SHOP_PHOTO_SCHEMA = {
                                 "line_no": {"type": "integer"},
                                 "text": {"type": "string"},
                                 "item": {"type": "string"},
-                                "qty": {"type": "number"},
+                                "qty": {"type": ["number", "null"]},
                                 "price_cents": {"type": ["integer", "null"]},
                                 "kind": {"type": "string", "enum": ["cash", "credit",
                                                                     "card", "payment",
@@ -125,7 +126,8 @@ SHOP_PHOTO_SCHEMA = {
                         },
                     },
                 },
-                "required": ["date", "page_total_cents", "crossed_out", "lines"],
+                "required": ["date", "page_total_cents", "page_total_label",
+                             "crossed_out", "lines"],
                 "additionalProperties": False,
             },
             "receipt": {
@@ -196,9 +198,11 @@ SHOP_PHOTO_PROMPT = (
     "print DD/MM/YYYY so convert carefully). Never use PD/MAN dates. "
     "BOOK PAGE: transcribe every written line with its line number and the raw "
     "text. Skip crossed-out lines (count them in crossed_out) and skip the page's "
-    "own total line (put it in page_total_cents). For each kept line: the item as "
+    "own total line (put its amount in page_total_cents and its words, e.g. 'till "
+    "counted' or 'total', in page_total_label). For each kept line: the item as "
     "written (keep abbreviations like chap, brd, stny and isiZulu spellings as-is), "
-    "qty as written (default 1; quantities are loose singles), the written price in "
+    "qty as written (default 1; quantities are loose singles; null when a "
+    "supplier line shows no quantity), the written price in "
     "cents or null, kind (cash sale, card sale for lines under a Card heading, "
     "credit sale with the customer's name, a credit payment with the customer, "
     "a supplier purchase with what was paid, a damaged or thrown-away line, "
@@ -386,6 +390,7 @@ def read_shop_photo(image: bytes, shop_id: str = "") -> dict:
             })
         doc["book"] = {"date": _sane_date(book.get("date")),
                        "page_total_cents": _sane_cents(book.get("page_total_cents")),
+                       "page_total_label": str(book.get("page_total_label") or "").strip()[:60],
                        "crossed_out": _sane_int(book.get("crossed_out")),
                        "lines": book_lines}
         receipt = doc.get("receipt")
