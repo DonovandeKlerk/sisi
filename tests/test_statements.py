@@ -221,3 +221,48 @@ def test_merged_lines_sort_chronologically(conn, ledger):
     data = reports.statement_data(conn, SHOP, "Sipho")
     assert [i["date"] for i in data["items"]] == ["2026-10-05", "2026-10-08",
                                                   "2026-10-12"]
+
+
+@pytest.mark.parametrize("name", ["Bongi's Spaza Shop",
+                                  "Bongi’s Spaza Shop"])
+def test_draft_uses_shop_name_verbatim(conn, ledger, name):
+    """The saved business name reaches the draft quote untouched — never
+    truncated to Bong's or otherwise respelled (straight + curly)."""
+    from app.tools import draft_reminder
+
+    conn.execute("UPDATE shops SET name = ? WHERE shop_id = ?", (name, SHOP))
+    conn.commit()
+    out = draft_reminder(conn, SHOP, "Sipho")
+    assert name in out
+    assert "Bongi" in out  # the 'i' survives: not Bong's
+
+
+def test_shop_context_anchors_exact_name(conn, ledger):
+    from app.llm import _shop_context
+
+    conn.execute("UPDATE shops SET name = ? WHERE shop_id = ?",
+                 ("Bongi’s Spaza Shop", SHOP))
+    conn.commit()
+    assert "SHOP: Bongi’s Spaza Shop" in _shop_context(conn, SHOP)
+
+
+def test_batch_filenames_dated_customer_slugs(conn, monkeypatch):
+    """Every batch PDF is statement-<slug>-<date>.pdf, oldest debt first."""
+    monkeypatch.setenv("SISI_TODAY", "2026-11-01")
+    ensure_shop(conn, SHOP, "Batch Spaza")
+    conn.execute("UPDATE shops SET language = 'en' WHERE shop_id = ?", (SHOP,))
+    for i, (nm, day) in enumerate([("Sipho", "2026-10-20"),
+                                   ("Thandi", "2026-10-21"),
+                                   ("Mama Zodwa", "2026-10-22")]):
+        cid = conn.execute("INSERT INTO customers (shop_id, name)"
+                           " VALUES (?, ?)", (SHOP, nm)).lastrowid
+        conn.execute("INSERT INTO credit_entries (shop_id, customer_id,"
+                     " amount_cents, action_id, created_at)"
+                     " VALUES (?, ?, 1000, ?, ?)",
+                     (SHOP, cid, f"fn-{i}", f"{day}T10:00:00.000Z"))
+    conn.commit()
+    statements_for_all(conn, SHOP)
+    got = [m["filename"] for m in take_media(SHOP) if m["kind"] == "file"]
+    assert got == ["statement-sipho-2026-11-01.pdf",
+                   "statement-thandi-2026-11-01.pdf",
+                   "statement-mama-zodwa-2026-11-01.pdf"]

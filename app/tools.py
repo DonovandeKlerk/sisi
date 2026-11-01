@@ -8094,6 +8094,9 @@ def _queue_statement(conn: sqlite3.Connection, shop_id: str, data: dict,
     from app import reports as _reports
     safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
     slug = "".join(c.lower() if c.isalnum() else "-" for c in data["name"]).strip("-")
+    slug = slug or "customer"
+    day = "".join(c for c in str(data.get("date") or today_str())
+                  if c.isdigit() or c == "-") or "undated"
     prefix = str(_reports.REPORTS_DIR / f"{safe}-statement-{slug}")
     with _doc_lang(lang):
         pages = _reports.render_statement_pngs(data, brand, prefix)
@@ -8109,7 +8112,7 @@ def _queue_statement(conn: sqlite3.Connection, shop_id: str, data: dict,
     token = _reports.store_card(conn, shop_id, f"stmt-{slug}-pdf", pdf)
     media.append({"kind": "file", "url": f"{base}/media/{token}?f=pdf",
                   "caption": _t("stmt_pdf_cap", name=data['name']),
-                  "filename": f"statement-{slug}.pdf"})
+                  "filename": f"statement-{slug}-{day}.pdf"})
     if base:
         _queue(shop_id, media)
     return len(media) if base else 0

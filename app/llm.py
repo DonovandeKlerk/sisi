@@ -197,6 +197,10 @@ def _shop_context(conn: sqlite3.Connection, shop_id: str) -> str:
     """Compact live snapshot (stock, debtors, pending reminders) for the intent engine."""
     lines: list[str] = []
     try:
+        shop = conn.execute("SELECT name FROM shops WHERE shop_id = ?",
+                            (shop_id,)).fetchone()
+        if shop is not None and (shop["name"] or "").strip():
+            lines.append(f"SHOP: {shop['name'].strip()}")
         rows = conn.execute(
             "SELECT name, stock_qty, price_cents FROM products"
             " WHERE shop_id = ? ORDER BY name LIMIT 15", (shop_id,)).fetchall()
