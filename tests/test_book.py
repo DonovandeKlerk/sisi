@@ -829,3 +829,61 @@ def test_daily_pdf_till_line(conn, tmp_path):
     raw = open(pdf, "rb").read()
     assert raw.startswith(b"%PDF")
     assert b"Till matches the drawer" in raw  # parens are PDF-escaped
+
+
+def test_book_payment_balance_includes_same_page_credit(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    out = assert_format(propose_book_page(conn, SHOP, {
+        "date": "2026-10-21", "page_total_cents": None, "crossed_out": 0,
+        "lines": [
+            {"line_no": 1, "text": "1 milk Thandi", "item": "milk", "qty": 1,
+             "price_cents": None, "kind": "credit", "customer": "Thandi"},
+            {"line_no": 2, "text": "Thandi paid 15", "item": "", "qty": 1,
+             "price_cents": 1500, "kind": "payment", "customer": "Thandi"},
+        ]}))
+    # Thandi opens at R45.50: +R27.00 milk, then -R15.00 paid.
+    assert "• Thandi: 1x Fresh Milk 1L = R27.00 → owes R72.50" in out
+    assert "• Thandi paid R15.00 → owes R57.50" in out
+    assert assert_format(confirm_pending(conn, SHOP)).startswith(
+        "✅ *Book saved*")
+    assert get_balance(conn, SHOP, "Thandi") == "💳 *Thandi* owes R57.50."
+
+
+def test_book_second_page_same_date_warns(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    page = {
+        "date": "2026-10-21", "page_total_cents": None, "crossed_out": 0,
+        "lines": [{"line_no": 1, "text": "1 coke 36", "item": "coke",
+                   "qty": 1, "price_cents": 3600, "kind": "cash",
+                   "customer": ""}]}
+    out = propose_book_page(conn, SHOP, page)
+    assert "already saved" not in out
+    assert confirm_pending(conn, SHOP).startswith("✅ *Book saved*")
+    out = assert_format(propose_book_page(conn, SHOP, page))
+    assert out.startswith("⚠️ *A page for 21 Oct is already saved"
+                         " — Yes will add these lines too.*")
+    assert assert_format(confirm_pending(conn, SHOP)).startswith(
+        "✅ *Book saved*")  # warning only: a real page 2 still saves
+    undo_last(conn, SHOP)
+    undo_last(conn, SHOP)
+    out = propose_book_page(conn, SHOP, page)
+    assert "already saved" not in out  # undone saves don't count
+
+
+def test_book_price_challenge_exact_half(conn):
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    take_buttons(SHOP)
+    out = propose_book_page(conn, SHOP, {
+        "date": "2026-10-21", "page_total_cents": None, "crossed_out": 0,
+        "lines": [{"line_no": 1, "text": "1 coke 18", "item": "coke",
+                   "qty": 1, "price_cents": 1800, "kind": "cash",
+                   "customer": ""}]})
+    assert "way off the list (R36.00)" in out  # 0.5x binds only on confirm
+    assert "⏳ Answer the open lines first" in out
+    msg, _ = handle_text(conn, SHOP, "line 1 coke")  # same pick: confirmed
+    assert "• 1x Coke 2L = R18.00" in msg
+    assert assert_format(confirm_pending(conn, SHOP)).startswith(
+        "✅ *Book saved*")

@@ -5472,6 +5472,15 @@ def _is_till_count(label: str) -> bool:
                      (label or "").lower()) is not None
 
 
+def _book_saved_for_date(conn: sqlite3.Connection, shop_id: str, day: str) -> bool:
+    """A live (non-undone) book save already covers this shop day."""
+    row = conn.execute(
+        "SELECT 1 FROM actions WHERE shop_id = ? AND kind = 'book'"
+        " AND summary = ? AND undone = 0 LIMIT 1",
+        (shop_id, f"book page {day}")).fetchone()
+    return row is not None
+
+
 def _price_deviant(total, list_total) -> bool:
     """True when written money is half-or-less / double-or-more of list."""
     if not total or total <= 0 or not list_total or list_total <= 0:
@@ -5624,6 +5633,8 @@ def _render_book_preview(conn: sqlite3.Connection, shop_id: str, payload: dict) 
     payments = sorted(payload["payments"], key=lambda e: e["line_no"])
     flagged = sorted(payload["flagged"], key=lambda e: e["line_no"])
     blocks = [_t("book_prev_head", date=payload['display_date'])]
+    if payload.get("date") and _book_saved_for_date(conn, shop_id, payload["date"]):
+        blocks.insert(0, _t("book_dup_date", date=payload['display_date']))
     if cash:
         lines = [_t("book_cash_head")]
         for e in cash:
@@ -5645,24 +5656,35 @@ def _render_book_preview(conn: sqlite3.Connection, shop_id: str, payload: dict) 
             lines.append(line)
         blocks.append("\n".join(lines))
     credit_lines = []
+    running: dict = {}
+
+    def _running(name: str) -> tuple:
+        row = _get_customer(conn, shop_id, name)
+        key = row["id"] if row else ("new", (name or "").strip().lower())
+        if key not in running:
+            running[key] = balance_cents(conn, shop_id, row["id"]) \
+                if row else 0
+        return row, key
+
     for e in credit:
-        row = _get_customer(conn, shop_id, e["customer"])
-        bal = balance_cents(conn, shop_id, row["id"]) + e["total"] if row else e["total"]
+        _row, key = _running(e["customer"])
+        running[key] += e["total"]
         who = e["customer"]
         if e["new_customer"]:
             who = _t("book_who_new", name=e['customer'])
         line = _t("book_credit_line", who=who, short=e['short'],
-                  total=cents_to_rand(e['total']), bal=cents_to_rand(bal))
+                  total=cents_to_rand(e['total']),
+                  bal=cents_to_rand(running[key]))
         if e["total"] != e["list_total"]:
             line += _t("book_cash_list",
                        total=cents_to_rand(e['list_total']))
         credit_lines.append(line)
     for e in payments:
-        row = _get_customer(conn, shop_id, e["customer"])
-        bal = balance_cents(conn, shop_id, row["id"]) - e["amount"] if row else -e["amount"]
+        _row, key = _running(e["customer"])
+        running[key] -= e["amount"]
         credit_lines.append(_t("book_pay_line", name=e['customer'],
                                amt=cents_to_rand(e['amount']),
-                               bal=cents_to_rand(bal)))
+                               bal=cents_to_rand(running[key])))
     if credit_lines:
         blocks.append(_t("book_credit_head") + "\n" + "\n".join(credit_lines))
     supply = sorted(payload.get("supply") or [], key=lambda e: e["line_no"])
