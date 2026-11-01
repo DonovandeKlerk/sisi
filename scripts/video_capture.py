@@ -2,7 +2,7 @@
 
 Usage (from repo root), one part per run:
     .venv/bin/modal run scripts/video_capture.py --shop <live-shop> --only chat1
-    ... --only multi | voice | book | chat3 | setup | draft | zulvoice
+    ... --only multi | voice | book | chat3 | setup | draft | zulutext | zulvoice
 
 Drives the real handlers on the test shop and dumps replies, buttons and
 media to /data/videocap (cap-<part>.json + media/). Sends NO WhatsApp
@@ -367,6 +367,22 @@ def capture(shop: str = "", only: str = "all") -> str:
             if get_pending(conn, shop_id) is not None:
                 text("draft_no", "No")
             take_media(shop_id)
+
+        if only in ("all", "zulutext"):
+            # Typed isiZulu sale (no honest Zulu speech available): real
+            # understanding + confirmation, undone right after.
+            from app.tools import get_pending as _gp
+            text("zulu_sale",
+                 "Ngithengise izinkwa ezimbili kuSipho ngesikweletu")
+            last = turns[-1]["sisi"] or ""
+            if "Which one" in last or "which one" in last:
+                text("zulu_which", "Albany")
+            if _gp(conn, shop_id) is None:
+                text("zulu_retry",
+                     "Ngithengise izinkwa ezimbili ze-Albany kuSipho "
+                     "ngesikweletu")
+            text("zulu_yes", "Yes")
+            text("zulu_undo", "undo")
 
         if only in ("all", "zulvoice"):
             audio = Path("/root/zu_sale.ogg").read_bytes()
