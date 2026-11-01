@@ -887,3 +887,31 @@ def test_book_price_challenge_exact_half(conn):
     assert "• 1x Coke 2L = R18.00" in msg
     assert assert_format(confirm_pending(conn, SHOP)).startswith(
         "✅ *Book saved*")
+
+
+def test_undo_book_keeps_new_customer(conn):
+    """Undoing a page that created a customer must not trip the FK from the
+    (reversed but still present) credit rows. Keeps the zero-balance row."""
+    from app.tools import balance_cents
+
+    seed_demo(SHOP, conn)
+    _set_en(conn)
+    assert conn.execute("SELECT id FROM customers WHERE shop_id = ? AND name = ?",
+                        (SHOP, "Zanele")).fetchone() is None
+    propose_book_page(conn, SHOP, {
+        "date": "2026-10-21", "page_total_cents": 2700, "crossed_out": 0,
+        "lines": [{"line_no": 1, "text": "1 milk Zanele", "item": "milk",
+                   "qty": 1, "price_cents": None, "kind": "credit",
+                   "customer": "Zanele"}]})
+    assert assert_format(confirm_pending(conn, SHOP)).startswith(
+        "✅ *Book saved*")
+    row = conn.execute("SELECT id FROM customers WHERE shop_id = ? AND name = ?",
+                       (SHOP, "Zanele")).fetchone()
+    assert row is not None
+    assert balance_cents(conn, SHOP, row["id"]) == 2700
+    msg, _ = handle_text(conn, SHOP, "undo book")  # was: FK crash
+    assert msg == "Undone: removed the book page from 21 Oct."
+    assert balance_cents(conn, SHOP, row["id"]) == 0
+    kept = conn.execute("SELECT id FROM customers WHERE shop_id = ? AND name = ?",
+                        (SHOP, "Zanele")).fetchone()
+    assert kept is not None  # zero balance, kept like sale undos

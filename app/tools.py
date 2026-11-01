@@ -6172,7 +6172,16 @@ def _undo_book(conn: sqlite3.Connection, shop_id: str, undo: dict, action_id: st
             conn.execute("UPDATE products SET cost_cents = ? WHERE id = ?",
                          (d["old_cost"], d["product_id"]))
     for cust_id in undo.get("new_customers", []):
-        conn.execute("DELETE FROM customers WHERE id = ?", (cust_id,))
+        # Reversed rows still reference the customer, so unconditional
+        # DELETE fails the FOREIGN KEY constraint. Keep them when used.
+        refs = 0
+        for table in ("credit_entries", "payments", "sales"):
+            refs += conn.execute(
+                f"SELECT COUNT(*) n FROM {table}"
+                " WHERE shop_id = ? AND customer_id = ?",
+                (shop_id, cust_id)).fetchone()["n"]
+        if not refs:
+            conn.execute("DELETE FROM customers WHERE id = ?", (cust_id,))
     _reverse_moves(conn, shop_id, action_id)
     return _t("undo_book", date=undo.get('display_date', 'that day'))
 
