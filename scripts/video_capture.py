@@ -2,7 +2,7 @@
 
 Usage (from repo root), one part per run:
     .venv/bin/modal run scripts/video_capture.py --shop <live-shop> --only chat1
-    ... --only multi | voice | book | chat3 | setup | draft | zulutext | zulvoice
+    ... --only multi | voice | book | chat3 | setup | draft | zulutext | zulvoice | stmt | remind2 | lang2
 
 Drives the real handlers on the test shop and dumps replies, buttons and
 media to /data/videocap (cap-<part>.json + media/). Sends NO WhatsApp
@@ -204,8 +204,7 @@ def capture(shop: str = "", only: str = "all") -> str:
                          (shop_id, digest))
             conn.commit()
 
-        if only in ("all", "chat3"):
-            from app.schedule import _nudge_text, _snapshot_data
+        if only in ("all", "stmt"):
             t = text("statements_all", "send all debtors their statements")
             t["media"] = snap_media("stmt")
             red = brand_red()
@@ -218,6 +217,9 @@ def capture(shop: str = "", only: str = "all") -> str:
                     R.render_statement_pdf(data, red, pdf)
                     files[f"card_{name}"] = pages[0]
                     files[f"pdf_{name}"] = pdf
+
+        if only in ("all", "remind2"):
+            from app.schedule import _nudge_text, _snapshot_data
             before = conn.execute(
                 "SELECT COUNT(*) n FROM reminders WHERE shop_id = ?",
                 (shop_id,)).fetchone()["n"]
@@ -228,19 +230,22 @@ def capture(shop: str = "", only: str = "all") -> str:
                 "SELECT COUNT(*) n FROM reminders WHERE shop_id = ?",
                 (shop_id,)).fetchone()["n"]
             turns.append({"shot": "remind_clean", "before": before, "after": after})
+            turns.append({"shot": "nudge",
+                          "sisi": _nudge_text(conn, shop_id, "2026-11-01")})
+            with _doc_lang("en"):
+                red = brand_red()
+                data = _snapshot_data(conn, shop_id, "2026-11-01")
+                snap = str(cap / "red" / "snapshot-week.png")
+                R.render_snapshot_png(data, red, snap, "2026-11-01")
+                files["snapshot"] = snap
+
+        if only in ("all", "lang2"):
             text("lang_xh", "language isiXhosa")
             lang = conn.execute("SELECT language FROM shops WHERE shop_id = ?",
                                 (shop_id,)).fetchone()["language"]
             if lang != "xh":
                 text("lang_xh_speak", "speak isiXhosa")
             text("lang_en", "speak English")
-            turns.append({"shot": "nudge",
-                          "sisi": _nudge_text(conn, shop_id, "2026-11-01")})
-            with _doc_lang("en"):
-                data = _snapshot_data(conn, shop_id, "2026-11-01")
-                snap = str(cap / "red" / "snapshot-week.png")
-                R.render_snapshot_png(data, red, snap, "2026-11-01")
-                files["snapshot"] = snap
 
         if only in ("all", "setup"):
             from app.setup import setup_step
