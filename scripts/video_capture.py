@@ -2,7 +2,7 @@
 
 Usage (from repo root), one part per run:
     .venv/bin/modal run scripts/video_capture.py --shop <live-shop> --only chat1
-    ... --only multi | voice | book | chat3 | setup
+    ... --only multi | voice | book | chat3 | setup | draft | zulvoice
 
 Drives the real handlers on the test shop and dumps replies, buttons and
 media to /data/videocap (cap-<part>.json + media/). Sends NO WhatsApp
@@ -251,7 +251,7 @@ def capture(shop: str = "", only: str = "all") -> str:
             brand = R.shop_brand(conn, shop_id)
             logo_bytes = Path(brand["logo"]).read_bytes() if brand.get("logo") else b""
             answers = {1: "Bongi’s Spaza Shop", 2: "Main Road, Amanzimtoti",
-                       3: THROWAWAY, 5: "1500", 6: "English"}
+                       3: THROWAWAY, 5: "1500 cash", 6: "English"}
             setup_turns = []
             msg, _ = handle_text(conn, THROWAWAY, "hi")
             setup_turns.append({"owner": "hi", "sisi": msg})
@@ -262,8 +262,9 @@ def capture(shop: str = "", only: str = "all") -> str:
                 if step == 4 and logo_bytes:
                     _d, reply, _b = handle_photo(conn, THROWAWAY, logo_bytes, "logo")
                     setup_turns.append({"owner": "[logo photo]", "sisi": reply})
-                    msg, _ = handle_text(conn, THROWAWAY, "Yes")
-                    setup_turns.append({"owner": "Yes", "sisi": msg})
+                    if setup_step(conn, THROWAWAY) == 4:
+                        msg, _ = handle_text(conn, THROWAWAY, "Yes")
+                        setup_turns.append({"owner": "Yes", "sisi": msg})
                 else:
                     msg, _ = handle_text(conn, THROWAWAY, answers.get(step, "ok"))
                     setup_turns.append({"owner": answers.get(step, "ok"), "sisi": msg})
@@ -359,6 +360,27 @@ def capture(shop: str = "", only: str = "all") -> str:
             conn.execute("DELETE FROM photo_hashes WHERE shop_id = ? AND hash = ?",
                          (shop_id, digest))
             conn.commit()
+
+        if only in ("all", "draft"):
+            t = text("draft", "Draft a reminder for Thandi")
+            t["media"] = snap_media("draft")
+            if get_pending(conn, shop_id) is not None:
+                text("draft_no", "No")
+            take_media(shop_id)
+
+        if only in ("all", "zulvoice"):
+            audio = Path("/root/zu_sale.ogg").read_bytes()
+            heard, reply, _b = handle_voice(conn, shop_id, audio)
+            pend = get_pending(conn, shop_id)
+            turns.append({"shot": "zulvoice",
+                          "owner": {"type": "voice", "file": "zu_sale.ogg"},
+                          "heard": heard, "sisi": reply,
+                          "pending": (pend["action_type"]) if pend else None})
+            (cap / "zu_sale.ogg").write_bytes(audio)
+            files["zu_audio"] = str(cap / "zu_sale.ogg")
+            if get_pending(conn, shop_id) is not None:
+                text("zulvoice_yes", "Yes")
+                text("zulvoice_undo", "undo")
 
         if only in ("cleanup",):
             rows = conn.execute(
