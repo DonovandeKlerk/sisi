@@ -14,7 +14,7 @@ import os
 import re
 import sqlite3
 from contextvars import ContextVar
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Union
 
@@ -645,12 +645,30 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
+# Africa/Johannesburg is a fixed +02:00 with no daylight saving.
+SAST = timezone(timedelta(hours=2))
+
+
 def today_str() -> str:
-    """Calendar date for shop logic. SISI_TODAY freezes it for a recorded demo."""
+    """Calendar date for shop logic, in Africa/Johannesburg.
+
+    Servers run on UTC, which is still yesterday for the first two hours
+    of every South African day. SISI_TODAY freezes it for a recorded demo.
+    """
     frozen = os.environ.get("SISI_TODAY", "").strip()
     if frozen:
         return frozen
-    return date.today().isoformat()
+    return datetime.now(timezone.utc).astimezone(SAST).date().isoformat()
+
+
+def today_line() -> str:
+    """'Sunday 2026-11-01 (Africa/Johannesburg)' — server-computed so the
+    model never has to work out a weekday itself (it gets them wrong)."""
+    try:
+        day = date.fromisoformat(today_str())
+    except ValueError:
+        day = datetime.now(timezone.utc).astimezone(SAST).date()
+    return f"{day.strftime('%A')} {day.isoformat()} (Africa/Johannesburg)"
 
 
 def cents_to_rand(cents: int) -> str:

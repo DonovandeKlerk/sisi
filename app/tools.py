@@ -7696,12 +7696,24 @@ def month_end_report(conn: sqlite3.Connection, shop_id: str,
     return text
 
 
+_QUOTE_FIX = {"\u2019": "'", "\u2018": "'", "\u02bc": "'", "`": "'",
+                "\u00b4": "'"}
+
+
+def straight_quotes(name: str) -> str:
+    """Phone keyboards send curly quotes; store straight ASCII so each
+    quote style spells the same shop name everywhere (cards, PDFs, chat)."""
+    for curly, straight in _QUOTE_FIX.items():
+        name = name.replace(curly, straight)
+    return name
+
+
 def set_shop_name(conn: sqlite3.Connection, shop_id: str, name: str) -> str:
     blocked = _staff_blocked()
     if blocked:
         return blocked
     ensure_shop(conn, shop_id)
-    name = (name or "").strip()
+    name = straight_quotes((name or "").strip())
     if not name:
         return _t("shop_ask_name")
     conn.execute("UPDATE shops SET name = ? WHERE shop_id = ?", (name[:60], shop_id))

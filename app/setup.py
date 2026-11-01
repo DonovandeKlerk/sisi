@@ -166,7 +166,8 @@ def _answer(conn: sqlite3.Connection, shop_id: str, sender: str, text: str) -> s
     """Handle one setup reply. Returns the next prompt or the finish card."""
     from app.agent import _parse_float
     from app.i18n import CURRENT_LANG, normalize_lang, t
-    from app.tools import set_float, set_shop_address, set_shop_name, set_shop_phone
+    from app.tools import (set_float, set_shop_address, set_shop_name,
+                           set_shop_phone, straight_quotes)
     step = setup_step(conn, shop_id) or 1
     word = " ".join((text or "").strip().lower().split())
     if word in BACK_WORDS:
@@ -180,7 +181,7 @@ def _answer(conn: sqlite3.Connection, shop_id: str, sender: str, text: str) -> s
             _set_flag(conn, shop_id, "setup-return", str(step))
             return _goto(conn, shop_id, target)
     if step == 1:
-        name = (text or "").strip()
+        name = straight_quotes((text or "").strip())
         if not name or len(name) < 2:
             return t("setup_name_invalid",
                      prompt=step_prompt(conn, shop_id, 1))

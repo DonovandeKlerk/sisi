@@ -18,7 +18,7 @@ import traceback
 from pathlib import Path
 
 from app import config
-from app.db import now_iso
+from app.db import now_iso, today_line
 from app.prompts import SYSTEM_PROMPT
 from app.tools import TOOL_DEFS, TOOL_FUNCS
 
@@ -236,11 +236,18 @@ def chat(conn: sqlite3.Connection, shop_id: str, text: str) -> str:
     return reply
 
 
+def _today_context() -> str:
+    """Server-computed date line so the model never derives a weekday."""
+    return (f"TODAY IS {today_line()}. The shop keeps South African time. "
+            "Never compute a weekday yourself: for today reuse the weekday "
+            "above; for any other date write the date WITHOUT a weekday.")
+
+
 def chat_full(conn: sqlite3.Connection, shop_id: str,
               text: str) -> tuple[str, list[str] | None]:
     """chat() plus reply-button options when the model asked to clarify."""
     model = config.model_name()
-    system = SYSTEM_PROMPT
+    system = SYSTEM_PROMPT + "\n\n" + _today_context()
     ctx = _shop_context(conn, shop_id)
     if ctx:
         system += ("\n\nLIVE SHOP CONTEXT (facts for this shop; use the tools to"

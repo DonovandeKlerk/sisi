@@ -20,7 +20,7 @@ from datetime import date
 from pathlib import Path
 
 from app import config
-from app.db import today_str
+from app.db import today_line
 from app.i18n import STRINGS
 from app.i18n import t as _t
 from app.llm import get_client, log_usage, print_api_error
@@ -352,7 +352,7 @@ def read_shop_photo(image: bytes, shop_id: str = "") -> dict:
     data_url = f"data:{mime};base64," + base64.b64encode(prepared).decode("ascii")
     messages = [{"role": "user", "content": [
         {"type": "text",
-         "text": f"Today is {today_str()}. " + SHOP_PHOTO_PROMPT},
+         "text": f"Today is {today_line()}. " + SHOP_PHOTO_PROMPT},
         {"type": "image_url", "image_url": {"url": data_url}},
     ]}]
     try:
