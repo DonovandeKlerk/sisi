@@ -1,7 +1,7 @@
 """Reset + reseed the TEST shop only (Modal run, never deployed).
 
 Usage (from repo root):
-    .venv/bin/modal run scripts/reseed_test_shop.py::main --confirm RESET-BONGI
+    .venv/bin/modal run scripts/reseed_test_shop.py::main --confirm RESET-BONGI --shop <live-shop>
 
 Wipes ALL business data for shop 27710000002 (Bongi's Spaza Shop) and
 reseeds a small deterministic demo dataset. REFUSES to touch any other
@@ -28,7 +28,7 @@ app = modal.App(
     volumes={"/data": modal.volume.Volume.from_name("sisi-data")},
 )
 
-TEST_SHOP = "27710000002"
+DEFAULT_SHOP = "27710000002"
 TEST_NAME = "Bongi’s Spaza Shop"  # curly apostrophe, as stored
 CONFIRM = "RESET-BONGI"
 
@@ -94,7 +94,8 @@ EXTRA_WIPE_TABLES = (
 
 
 @app.function(timeout=300)
-def reseed(confirm: str = "") -> str:
+def reseed(confirm: str = "", shop: str = "") -> str:
+    shop_id = (shop or DEFAULT_SHOP).strip()  # live id via --shop, never git
     import json
     import os
     from datetime import date, timedelta
@@ -115,25 +116,25 @@ def reseed(confirm: str = "") -> str:
                 "created_at"]
         shop = conn.execute(
             f"SELECT {', '.join(cols)} FROM shops WHERE shop_id = ?",
-            (TEST_SHOP,)).fetchone()
+            (shop_id,)).fetchone()
         if shop is None:
-            return f"REFUSED: shop {TEST_SHOP} does not exist"
+            return f"REFUSED: shop {shop_id} does not exist"
         if shop["name"] != TEST_NAME:
-            return (f"REFUSED: shop {TEST_SHOP} is named {shop['name']!r},"
+            return (f"REFUSED: shop {shop_id} is named {shop['name']!r},"
                     f" expected {TEST_NAME!r}")
         snap = {c: shop[c] for c in cols}
-        out = [f"shop: {TEST_SHOP} ({snap['name']}) lang={snap['language']}"
+        out = [f"shop: {shop_id} ({snap['name']}) lang={snap['language']}"
                f" ch={snap['channel'] or '-'} logo={snap['logo_path'] or '-'}"]
 
         for table in EXTRA_WIPE_TABLES:
-            conn.execute(f"DELETE FROM {table} WHERE shop_id = ?", (TEST_SHOP,))
-        conn.execute("DELETE FROM send_queue WHERE to_number = ?", (TEST_SHOP,))
-        conn.execute("DELETE FROM send_pacing WHERE to_number = ?", (TEST_SHOP,))
-        wipe_shop(conn, TEST_SHOP)
+            conn.execute(f"DELETE FROM {table} WHERE shop_id = ?", (shop_id,))
+        conn.execute("DELETE FROM send_queue WHERE to_number = ?", (shop_id,))
+        conn.execute("DELETE FROM send_pacing WHERE to_number = ?", (shop_id,))
+        wipe_shop(conn, shop_id)
         # Restore the shops row exactly (name, language, logo, consent).
         # Idempotent: a failed run may have deleted everything but shops.
         have = conn.execute("SELECT 1 FROM shops WHERE shop_id = ?",
-                            (TEST_SHOP,)).fetchone()
+                            (shop_id,)).fetchone()
         if have is None:
             conn.execute(f"INSERT INTO shops ({', '.join(cols)}) VALUES "
                          f"({', '.join('?' * len(cols))})",
@@ -141,11 +142,11 @@ def reseed(confirm: str = "") -> str:
         else:
             conn.execute(f"UPDATE shops SET {', '.join(f'{c} = ?' for c in cols if c != 'shop_id')}"
                          " WHERE shop_id = ?",
-                         tuple(snap[c] for c in cols if c != 'shop_id') + (TEST_SHOP,))
+                         tuple(snap[c] for c in cols if c != 'shop_id') + (shop_id,))
 
         # Stale volume files for this shop only; logos are never touched.
         from pathlib import Path
-        safe = "".join(c for c in TEST_SHOP if c.isdigit())
+        safe = "".join(c for c in shop_id if c.isdigit())
         reports_dir = Path("/data/reports")
         gone = 0
         if reports_dir.exists():
@@ -165,30 +166,30 @@ def reseed(confirm: str = "") -> str:
                    stock_qty, reorder_level, wholesaler, unit, category,
                    pack_name, pack_size, pack_price_cents)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (TEST_SHOP, name, price, cost, qty, reorder, wholesaler, unit,
+                (shop_id, name, price, cost, qty, reorder, wholesaler, unit,
                  cat, pack_name, pack_size, pack_price))
             prices[name] = price
             conn.execute(
                 """INSERT INTO stock_moves (shop_id, product_id, delta_qty, reason,
                    action_id, created_at) VALUES (?, ?, ?, 'seed', ?, ?)""",
-                (TEST_SHOP, cur.lastrowid, qty, f"reseed-stock-{i}", ts))
+                (shop_id, cur.lastrowid, qty, f"reseed-stock-{i}", ts))
         cust_ids: dict[str, int] = {}
         for name in CUSTOMERS:
             cur = conn.execute(
                 "INSERT INTO customers (shop_id, name, created_at) VALUES (?, ?, ?)",
-                (TEST_SHOP, name, ts))
+                (shop_id, name, ts))
             cust_ids[name] = cur.lastrowid
         for i, (cust, amount, items) in enumerate(CREDIT):
             aid = f"reseed-credit-{i}"
             conn.execute(
                 """INSERT INTO credit_entries (shop_id, customer_id, amount_cents,
                    items_text, action_id, created_at) VALUES (?, ?, ?, ?, ?, ?)""",
-                (TEST_SHOP, cust_ids[cust], amount, items, aid,
+                (shop_id, cust_ids[cust], amount, items, aid,
                  "2026-10-26T10:00:00.000Z"))
             conn.execute(
                 """INSERT INTO actions (action_id, shop_id, kind, summary, data_json,
                    created_at) VALUES (?, ?, 'seed', ?, ?, ?)""",
-                (aid, TEST_SHOP, f"seed credit {cust}",
+                (aid, shop_id, f"seed credit {cust}",
                  json.dumps({"customer": cust, "amount_cents": amount}),
                  "2026-10-26T10:00:00.000Z"))
 
@@ -200,7 +201,7 @@ def reseed(confirm: str = "") -> str:
                 """INSERT INTO cash_moves (shop_id, account, amount_cents, kind,
                    category, note, action_id, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (TEST_SHOP, account, amount, kind, category, note,
+                (shop_id, account, amount, kind, category, note,
                  f"reseed-move-{move_no}", day_ts))
             move_no += 1
 
@@ -213,13 +214,13 @@ def reseed(confirm: str = "") -> str:
             total = prices[name] * qty
             prod_id = conn.execute(
                 "SELECT id FROM products WHERE shop_id = ? AND name = ?",
-                (TEST_SHOP, name)).fetchone()["id"]
+                (shop_id, name)).fetchone()["id"]
             aid = f"reseed-sale-{sale_no}"
             conn.execute(
                 """INSERT INTO sales (shop_id, product_id, product_name, qty,
                    total_cents, action_id, created_at, pay_method)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (TEST_SHOP, prod_id, name, qty, total, aid, day_ts, method))
+                (shop_id, prod_id, name, qty, total, aid, day_ts, method))
             _move("bank" if method == "card" else "cash", total, "sale",
                   day_ts, note=name)
             sale_no += 1
@@ -229,33 +230,33 @@ def reseed(confirm: str = "") -> str:
             conn.execute(
                 """INSERT INTO payments (shop_id, customer_id, amount_cents,
                    action_id, created_at) VALUES (?, ?, ?, ?, ?)""",
-                (TEST_SHOP, cust_ids[cust], amount, f"reseed-pay-{i}", day_ts))
+                (shop_id, cust_ids[cust], amount, f"reseed-pay-{i}", day_ts))
             _move("cash", amount, "credit_payment", day_ts, note=cust)
         # Suppliers: Jumbo delivery on account + part payment; Devland delivery.
         d4 = today - timedelta(days=4)
         conn.execute(
             """INSERT INTO supplier_moves (shop_id, supplier, amount_cents,
                action_id, created_at) VALUES (?, ?, ?, ?, ?)""",
-            (TEST_SHOP, "Jumbo Amanzimtoti", 68000, "reseed-sup-0",
+            (shop_id, "Jumbo Amanzimtoti", 68000, "reseed-sup-0",
              f"{d4}T09:00:00.000Z"))
         conn.execute(
             """INSERT INTO supplier_moves (shop_id, supplier, amount_cents,
                action_id, created_at) VALUES (?, ?, ?, ?, ?)""",
-            (TEST_SHOP, "Devland Cash & Carry", 12000, "reseed-sup-1",
+            (shop_id, "Devland Cash & Carry", 12000, "reseed-sup-1",
              f"{d4}T09:00:00.000Z"))
         d2 = today - timedelta(days=2)
         _move("cash", -18000, "supplier_payment", f"{d2}T09:00:00.000Z", note="Jumbo")
         conn.execute(
             """INSERT INTO supplier_moves (shop_id, supplier, amount_cents,
                action_id, created_at) VALUES (?, ?, ?, ?, ?)""",
-            (TEST_SHOP, "Jumbo Amanzimtoti", -18000, "reseed-suppay",
+            (shop_id, "Jumbo Amanzimtoti", -18000, "reseed-suppay",
              f"{d2}T09:00:00.000Z"))
         # Running costs + a bank sweep so the drawer stays sensible.
         d3 = today - timedelta(days=3)
         conn.execute(
             """INSERT INTO expenses (shop_id, category, amount_cents, account,
                action_id, created_at) VALUES (?, ?, ?, ?, ?, ?)""",
-            (TEST_SHOP, "electricity", 15000, "petty", "reseed-exp-0",
+            (shop_id, "electricity", 15000, "petty", "reseed-exp-0",
              f"{d3}T11:00:00.000Z"))
         _move("petty", -15000, "expense", f"{d3}T11:00:00.000Z",
               category="electricity")
@@ -264,35 +265,35 @@ def reseed(confirm: str = "") -> str:
             conn.execute(
                 """INSERT INTO expiry_items (shop_id, product_name, qty, expiry_date,
                    note) VALUES (?, ?, ?, ?, 'fridge, front row')""",
-                (TEST_SHOP, name, qty, (today + timedelta(days=ahead)).isoformat()))
+                (shop_id, name, qty, (today + timedelta(days=ahead)).isoformat()))
         conn.commit()
 
         cash = conn.execute(
             "SELECT COALESCE(SUM(amount_cents),0) s FROM cash_moves"
             " WHERE shop_id=? AND account='cash' AND reversed=0",
-            (TEST_SHOP,)).fetchone()["s"]
+            (shop_id,)).fetchone()["s"]
         bank = conn.execute(
             "SELECT COALESCE(SUM(amount_cents),0) s FROM cash_moves"
             " WHERE shop_id=? AND account='bank' AND reversed=0",
-            (TEST_SHOP,)).fetchone()["s"]
+            (shop_id,)).fetchone()["s"]
         n_prod = conn.execute("SELECT COUNT(*) n FROM products WHERE shop_id=?",
-                              (TEST_SHOP,)).fetchone()["n"]
+                              (shop_id,)).fetchone()["n"]
         n_cust = conn.execute("SELECT COUNT(*) n FROM customers WHERE shop_id=?",
-                              (TEST_SHOP,)).fetchone()["n"]
+                              (shop_id,)).fetchone()["n"]
         n_sales = conn.execute("SELECT COUNT(*) n FROM sales WHERE shop_id=?",
-                               (TEST_SHOP,)).fetchone()["n"]
+                               (shop_id,)).fetchone()["n"]
         bals = []
         for name in CUSTOMERS:
             cid = cust_ids[name]
             c = conn.execute("SELECT COALESCE(SUM(amount_cents),0) s FROM credit_entries"
                              " WHERE shop_id=? AND customer_id=? AND reversed=0",
-                             (TEST_SHOP, cid)).fetchone()["s"]
+                             (shop_id, cid)).fetchone()["s"]
             p = conn.execute("SELECT COALESCE(SUM(amount_cents),0) s FROM payments"
                              " WHERE shop_id=? AND customer_id=? AND reversed=0",
-                             (TEST_SHOP, cid)).fetchone()["s"]
+                             (shop_id, cid)).fetchone()["s"]
             bals.append(f"{name} R{(c - p) / 100:.2f}")
         shop2 = conn.execute("SELECT name, language, logo_path FROM shops WHERE shop_id=?",
-                             (TEST_SHOP,)).fetchone()
+                             (shop_id,)).fetchone()
         out.append(f"seeded {n_prod} products, {n_cust} customers, {n_sales} sales")
         out.append(f"drawer R{cash / 100:.2f} bank R{bank / 100:.2f}")
         out.append("credit: " + ", ".join(bals))
@@ -304,5 +305,5 @@ def reseed(confirm: str = "") -> str:
 
 
 @app.local_entrypoint()
-def main(confirm: str = ""):
-    print(reseed.remote(confirm))
+def main(confirm: str = "", shop: str = ""):
+    print(reseed.remote(confirm, shop))

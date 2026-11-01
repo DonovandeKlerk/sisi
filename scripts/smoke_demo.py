@@ -1,7 +1,7 @@
 """End-to-end smoke against PROD, test shop only (Modal run, never deployed).
 
 Usage (from repo root):
-    .venv/bin/modal run scripts/smoke_demo.py
+    .venv/bin/modal run scripts/smoke_demo.py --shop <live-shop>
 
 Drives the real handlers (text, voice, photo, planner, renders) against the
 reseeded test shop 27710000002. Sends NO WhatsApp traffic (outboxes are
@@ -31,12 +31,13 @@ app = modal.App(
     volumes={"/data": modal.volume.Volume.from_name("sisi-data")},
 )
 
-TEST_SHOP = "27710000002"
+DEFAULT_SHOP = "27710000002"
 TEST_NAME = "Bongi’s Spaza Shop"  # curly apostrophe, as stored
 
 
 @app.function(timeout=600)
-def smoke() -> str:
+def smoke(shop: str = "") -> str:
+    shop_id = (shop or DEFAULT_SHOP).strip()  # live id via --shop, never git
     import hashlib
     import json
     import os
@@ -61,20 +62,20 @@ def smoke() -> str:
     try:
         shop = conn.execute(
             "SELECT name, language FROM shops WHERE shop_id = ?",
-            (TEST_SHOP,)).fetchone()
+            (shop_id,)).fetchone()
         if shop is None or shop["name"] != TEST_NAME:
             return "REFUSED: test shop missing or renamed"
         lang = shop["language"]
-        snap_cash = account_balance(conn, TEST_SHOP, "cash")
-        snap_bank = account_balance(conn, TEST_SHOP, "bank")
+        snap_cash = account_balance(conn, shop_id, "cash")
+        snap_bank = account_balance(conn, shop_id, "bank")
         custs = conn.execute(
             "SELECT id, name FROM customers WHERE shop_id = ?",
-            (TEST_SHOP,)).fetchall()
-        snap_bal = {r["name"]: balance_cents(conn, TEST_SHOP, r["id"])
+            (shop_id,)).fetchall()
+        snap_bal = {r["name"]: balance_cents(conn, shop_id, r["id"])
                     for r in custs}
         turn_max = conn.execute(
             "SELECT COALESCE(MAX(id),0) m FROM conversation_turns"
-            " WHERE shop_id = ?", (TEST_SHOP,)).fetchone()["m"]
+            " WHERE shop_id = ?", (shop_id,)).fetchone()["m"]
         # Restart-proofing: a preempted attempt leaves the fixture hash behind
         # (its book save was undone, but the hash stays), which would trip the
         # dup guard. Fixture bytes never occur naturally, so deleting it at
@@ -83,89 +84,89 @@ def smoke() -> str:
             Path("/root/book_page.png").read_bytes()).hexdigest()
         had_hash = conn.execute(
             "SELECT 1 FROM photo_hashes WHERE shop_id = ? AND hash = ?",
-            (TEST_SHOP, fix_digest)).fetchone() is not None
+            (shop_id, fix_digest)).fetchone() is not None
         conn.execute("DELETE FROM photo_hashes WHERE shop_id = ? AND hash = ?",
-                     (TEST_SHOP, fix_digest))
+                     (shop_id, fix_digest))
         if had_hash:  # a first attempt ran: drop its chatter too (LLM context only)
             conn.execute(
                 "DELETE FROM conversation_turns WHERE shop_id = ?"
                 " AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-2 hours')",
-                (TEST_SHOP,))
+                (shop_id,))
             turn_max = conn.execute(
                 "SELECT COALESCE(MAX(id),0) m FROM conversation_turns"
-                " WHERE shop_id = ?", (TEST_SHOP,)).fetchone()["m"]
+                " WHERE shop_id = ?", (shop_id,)).fetchone()["m"]
         conn.commit()
         clar_max = conn.execute(
             "SELECT COALESCE(MAX(rowid),0) m FROM clarify_context"
-            " WHERE shop_id = ?", (TEST_SHOP,)).fetchone()["m"]
+            " WHERE shop_id = ?", (shop_id,)).fetchone()["m"]
         plan_ids = {r["plan_id"] for r in conn.execute(
             "SELECT plan_id FROM task_plans WHERE shop_id = ?",
-            (TEST_SHOP,)).fetchall()}
+            (shop_id,)).fetchall()}
 
         # 1. hi / menu list.
-        take_lists(TEST_SHOP)
-        take_media(TEST_SHOP)
-        take_buttons(TEST_SHOP)
-        msg, _ = handle_text(conn, TEST_SHOP, "hi")
-        lists = take_lists(TEST_SHOP)
+        take_lists(shop_id)
+        take_media(shop_id)
+        take_buttons(shop_id)
+        msg, _ = handle_text(conn, shop_id, "hi")
+        lists = take_lists(shop_id)
         check("hi_menu", len(lists) == 1 and lists[0]["rows"] == MENU_ROWS
               and bool(msg.strip()),
               f"reply={msg[:60]!r} rows={lists[0]['rows'] if lists else []}")
 
         # 2. Sale by text (planner path), then No.
-        msg, _ = handle_text(conn, TEST_SHOP, "sold 2 coke")
-        pend = get_pending(conn, TEST_SHOP)
+        msg, _ = handle_text(conn, shop_id, "sold 2 coke")
+        pend = get_pending(conn, shop_id)
         preview = (pend["preview_text"] or "") if pend else ""
         ok = pend is not None and "Coke" in preview and "R72.00" in preview
         check("sale_text", ok, f"pend={pend['action_type'] if pend else None}"
               f" prev={preview[:100]!r} reply={msg[:100]!r}")
-        if get_pending(conn, TEST_SHOP) is not None:
-            handle_text(conn, TEST_SHOP, "No")
-        check("sale_text_cancelled", get_pending(conn, TEST_SHOP) is None)
+        if get_pending(conn, shop_id) is not None:
+            handle_text(conn, shop_id, "No")
+        check("sale_text_cancelled", get_pending(conn, shop_id) is None)
 
         # 3. Sale by voice (real Meta ASR), then No.
         audio = Path("/root/voice_sale_cash.ogg").read_bytes()
         try:
-            heard, reply, _ = handle_voice(conn, TEST_SHOP, audio)
+            heard, reply, _ = handle_voice(conn, shop_id, audio)
         except Exception as e:  # noqa: BLE001 - smoke must report, not crash
             heard, reply = "", f"VOICE ERROR: {e}"
-        pend = get_pending(conn, TEST_SHOP)
+        pend = get_pending(conn, shop_id)
         preview = (pend["preview_text"] or "") if pend else ""
         check("sale_voice", bool((heard or "").strip()) and pend is not None,
               f"heard={heard[:80]!r} pend={pend['action_type'] if pend else None}"
               f" prev={preview[:80]!r} reply={reply[:80]!r}")
-        if get_pending(conn, TEST_SHOP) is not None:
-            handle_text(conn, TEST_SHOP, "No")
+        if get_pending(conn, shop_id) is not None:
+            handle_text(conn, shop_id, "No")
 
         # 4. Book-page photo -> answer -> Yes -> daily PDF -> undo.
         photo = Path("/root/book_page.png").read_bytes()
         digest = hashlib.sha256(photo).hexdigest()
-        _doc, reply, _ = handle_photo(conn, TEST_SHOP, photo, "")
-        pend = get_pending(conn, TEST_SHOP)
+        _doc, reply, _ = handle_photo(conn, shop_id, photo, "")
+        pend = get_pending(conn, shop_id)
         check("book_photo_proposes",
               pend is not None and pend["action_type"] == "book_page",
               f"pend={pend['action_type'] if pend else None} reply={reply[:120]!r}")
         bound_detail = ""
         if pend is not None and pend["action_type"] == "book_page":
             for _ in range(6):
-                payload = json.loads(get_pending(conn, TEST_SHOP)["payload_json"])
+                payload = json.loads(get_pending(conn, shop_id)["payload_json"])
                 entry = first_book_question(payload)
                 if entry is None:
                     break
                 if entry.get("options"):
-                    answer_book_line(conn, TEST_SHOP, entry["line_no"],
+                    answer_book_line(conn, shop_id, entry["line_no"],
                                      entry["options"][0])
                 else:  # supplier qty/cost or unanswerable: stop and report
                     bound_detail = f"open q line {entry['line_no']} need={entry.get('need')}"
                     break
-            payload = json.loads(get_pending(conn, TEST_SHOP)["payload_json"])
+            payload = json.loads(get_pending(conn, shop_id)["payload_json"])
             n_bound = sum(len(payload.get(k) or [])
                           for k in ("cash", "credit", "card", "payments",
                                     "supply", "waste"))
             check("book_lines_bind", n_bound >= 1 and
                   first_book_question(payload) is None,
                   f"bound={n_bound} {bound_detail} date={payload.get('date')}")
-            msg, _ = handle_text(conn, TEST_SHOP, "Yes")
+            msg, _ = handle_text(conn, shop_id, "Yes")
             check("book_yes_saves", msg.startswith("✅ *Book saved*"),
                   msg[:120])
         else:
@@ -177,7 +178,7 @@ def smoke() -> str:
         day = (payload or {}).get("date", "")
         row = conn.execute(
             "SELECT png_path, token FROM reports WHERE shop_id = ? AND month = ?",
-            (TEST_SHOP, f"daily-{day}")).fetchone() if day else None
+            (shop_id, f"daily-{day}")).fetchone() if day else None
         pdf_ok, pdf_detail = False, f"day={day or '-'}"
         if row is not None:
             pdf_path = row["png_path"] or ""  # store_card keeps the pdf path here
@@ -191,12 +192,12 @@ def smoke() -> str:
 
         # 6. Undo the book save; balances must restore.
         if day:
-            msg, _ = handle_text(conn, TEST_SHOP, "undo book")
-            restored = account_balance(conn, TEST_SHOP, "cash") == snap_cash
-            bals = {r["name"]: balance_cents(conn, TEST_SHOP, r["id"])
+            msg, _ = handle_text(conn, shop_id, "undo book")
+            restored = account_balance(conn, shop_id, "cash") == snap_cash
+            bals = {r["name"]: balance_cents(conn, shop_id, r["id"])
                     for r in conn.execute(
                         "SELECT id, name FROM customers WHERE shop_id = ?",
-                        (TEST_SHOP,)).fetchall()}
+                        (shop_id,)).fetchall()}
             check("book_undo_restores",
                   "undone" in msg.lower() or "Undone" in msg
                   and restored and bals == snap_bal,
@@ -205,9 +206,9 @@ def smoke() -> str:
             check("book_undo_restores", False, "no save to undo")
 
         # 7. All debtors' statements: one card + PDF per debtor, logo checks.
-        take_media(TEST_SHOP)
-        msg, _ = handle_text(conn, TEST_SHOP, "send all debtors' statements")
-        media = take_media(TEST_SHOP)
+        take_media(shop_id)
+        msg, _ = handle_text(conn, shop_id, "send all debtors' statements")
+        media = take_media(shop_id)
         debtors = [n for n, b in snap_bal.items() if b > 0]
         kinds = {}
         months = set()
@@ -230,15 +231,15 @@ def smoke() -> str:
               and per_debtor,
               f"debtors={debtors} kinds={kinds} per_debtor={per_debtor}"
               f" reply={msg[:100]!r}")
-        logo_ok, logo_detail = _logo_pixel_check(conn, R, TEST_SHOP, media)
+        logo_ok, logo_detail = _logo_pixel_check(conn, R, shop_id, media)
         check("statement_logo", logo_ok, logo_detail)
 
         # 8. Multi-intent: sale + statement in one message.
-        take_media(TEST_SHOP)
-        msg, _ = handle_text(conn, TEST_SHOP,
+        take_media(shop_id)
+        msg, _ = handle_text(conn, shop_id,
                              "sold 2 bread and send Thandi her statement")
-        media = take_media(TEST_SHOP)
-        pend = get_pending(conn, TEST_SHOP)
+        media = take_media(shop_id)
+        pend = get_pending(conn, shop_id)
         sale_side = (pend is not None and "bread" in
                      ((pend["preview_text"] or "") + msg).lower()) \
             or "bread" in msg.lower()
@@ -248,9 +249,9 @@ def smoke() -> str:
         check("multi_intent", sale_side and stmt_side,
               f"sale={sale_side} stmt={stmt_side} pend={pend['action_type'] if pend else None}"
               f" media={len(media)} reply={msg[:150]!r}")
-        if get_pending(conn, TEST_SHOP) is not None:
-            handle_text(conn, TEST_SHOP, "No")
-        take_media(TEST_SHOP)
+        if get_pending(conn, shop_id) is not None:
+            handle_text(conn, shop_id, "No")
+        take_media(shop_id)
 
         # 9. isiZulu / Afrikaans / isiXhosa statement requests.
         for name, text, marker in [
@@ -259,9 +260,9 @@ def smoke() -> str:
             ("lang_xh", "ndicela istatimenti sikaMama Zodwa",
              "Mthumelele ku-Mama Zodwa"),
         ]:
-            take_media(TEST_SHOP)
-            msg, _ = handle_text(conn, TEST_SHOP, text)
-            media = take_media(TEST_SHOP)
+            take_media(shop_id)
+            msg, _ = handle_text(conn, shop_id, text)
+            media = take_media(shop_id)
             caps = " ".join((m.get("caption") or "") for m in media)
             check(name, marker in caps and len(media) >= 2,
                   f"marker={marker in caps} media={len(media)} reply={msg[:80]!r}")
@@ -269,29 +270,29 @@ def smoke() -> str:
         # Cleanup: smoke chatter + fixture hash + any question/plan state
         # the multi-intent step parked; final balance check.
         conn.execute("DELETE FROM conversation_turns WHERE shop_id = ? AND id > ?",
-                     (TEST_SHOP, turn_max))
+                     (shop_id, turn_max))
         conn.execute("DELETE FROM photo_hashes WHERE shop_id = ? AND hash = ?",
-                     (TEST_SHOP, digest))
+                     (shop_id, digest))
         conn.execute("DELETE FROM clarify_context WHERE shop_id = ? AND rowid > ?",
-                     (TEST_SHOP, clar_max))
+                     (shop_id, clar_max))
         for r in conn.execute("SELECT plan_id FROM task_plans WHERE shop_id = ?",
-                              (TEST_SHOP,)).fetchall():
+                              (shop_id,)).fetchall():
             if r["plan_id"] not in plan_ids:
                 conn.execute("DELETE FROM task_plans WHERE shop_id = ? AND plan_id = ?",
-                             (TEST_SHOP, r["plan_id"]))
+                             (shop_id, r["plan_id"]))
         conn.commit()
-        leaked = get_pending(conn, TEST_SHOP) is not None
-        bals = {r["name"]: balance_cents(conn, TEST_SHOP, r["id"])
+        leaked = get_pending(conn, shop_id) is not None
+        bals = {r["name"]: balance_cents(conn, shop_id, r["id"])
                 for r in conn.execute(
                     "SELECT id, name FROM customers WHERE shop_id = ?",
-                    (TEST_SHOP,)).fetchall()}
+                    (shop_id,)).fetchall()}
         check("books_balanced",
               not leaked
-              and account_balance(conn, TEST_SHOP, "cash") == snap_cash
-              and account_balance(conn, TEST_SHOP, "bank") == snap_bank
+              and account_balance(conn, shop_id, "cash") == snap_cash
+              and account_balance(conn, shop_id, "bank") == snap_bank
               and bals == snap_bal and
               conn.execute("SELECT language FROM shops WHERE shop_id = ?",
-                           (TEST_SHOP,)).fetchone()["language"] == lang,
+                           (shop_id,)).fetchone()["language"] == lang,
               f"pending={leaked}")
         lines = [f"{n}: {'PASS' if ok else 'FAIL'}" + (f" — {d}" if d else "")
                  for n, ok, d in results]
@@ -352,5 +353,5 @@ def _logo_pixel_check(conn, R, shop_id: str, media: list[dict]):
 
 
 @app.local_entrypoint()
-def main():
-    print(smoke.remote())
+def main(shop: str = ""):
+    print(smoke.remote(shop))

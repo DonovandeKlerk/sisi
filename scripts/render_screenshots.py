@@ -1,7 +1,7 @@
 """Render README screenshots from live demo data (Modal run, never deployed).
 
 Usage (from repo root):
-    .venv/bin/modal run scripts/render_screenshots.py
+    .venv/bin/modal run scripts/render_screenshots.py --shop <live-shop>
     .venv/bin/modal volume get sisi-data screenshots screenshots
 
 Renders real statement/month/snapshot/shop PNG cards for the test shop
@@ -26,12 +26,13 @@ app = modal.App(
     volumes={"/data": modal.volume.Volume.from_name("sisi-data")},
 )
 
-TEST_SHOP = "27710000002"
+DEFAULT_SHOP = "27710000002"
 TEST_NAME = "Bongi’s Spaza Shop"  # curly apostrophe, as stored
 
 
 @app.function(timeout=300)
-def render() -> str:
+def render(shop: str = "") -> str:
+    shop_id = (shop or DEFAULT_SHOP).strip()  # live id via --shop, never git
     import os
     from pathlib import Path
 
@@ -46,10 +47,10 @@ def render() -> str:
     conn = connect()
     try:
         shop = conn.execute(
-            "SELECT name FROM shops WHERE shop_id = ?", (TEST_SHOP,)).fetchone()
+            "SELECT name FROM shops WHERE shop_id = ?", (shop_id,)).fetchone()
         if shop is None or shop["name"] != TEST_NAME:
             return "REFUSED: test shop missing or renamed"
-        brand = R.shop_brand(conn, TEST_SHOP)
+        brand = R.shop_brand(conn, shop_id)
         out = [f"brand: {brand['name']} addr={brand.get('address') or '-'}"
                f" phone={brand.get('phone') or '-'}"
                f" logo={'yes' if brand.get('logo') else 'no'}"]
@@ -61,22 +62,22 @@ def render() -> str:
         shots.mkdir(parents=True, exist_ok=True)
 
         with _doc_lang("en"):
-            data = R.statement_data(conn, TEST_SHOP, "Sipho")
+            data = R.statement_data(conn, shop_id, "Sipho")
             pages = R.render_statement_pngs(
                 data, brand, str(shots / "shot-statement-sipho-en"))
             out.append(f"statement-sipho-en: {len(pages)} page(s)")
         with _doc_lang("zu"):
-            data = R.statement_data(conn, TEST_SHOP, "Thandi")
+            data = R.statement_data(conn, shop_id, "Thandi")
             pages = R.render_statement_pngs(
                 data, brand, str(shots / "shot-statement-thandi-zu"))
             out.append(f"statement-thandi-zu: {len(pages)} page(s)")
         with _doc_lang("en"):
-            d = R.month_data(conn, TEST_SHOP, "2026-10")
+            d = R.month_data(conn, shop_id, "2026-10")
             R.render_card(d, str(shots / "shot-month-2026-10.png"), brand)
             out.append("month-2026-10.png")
             R.render_shop_card(brand, str(shots / "shot-shop-card.png"))
             out.append("shop-card.png")
-            data = _snapshot_data(conn, TEST_SHOP, "2026-11-01")
+            data = _snapshot_data(conn, shop_id, "2026-11-01")
             R.render_snapshot_png(data, brand,
                                   str(shots / "shot-snapshot-week.png"),
                                   "2026-11-01")
@@ -87,5 +88,5 @@ def render() -> str:
 
 
 @app.local_entrypoint()
-def main():
-    print(render.remote())
+def main(shop: str = ""):
+    print(render.remote(shop))
