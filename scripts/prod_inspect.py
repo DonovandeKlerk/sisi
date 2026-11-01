@@ -118,6 +118,9 @@ def inspect() -> str:
                     out.append(f"    DAILY30_TOKEN={tok}")
         import os as _os
         out.append("base=" + _os.environ.get("SISI_PUBLIC_URL", "").rstrip("/"))
+        for k in ("SISI_PROVIDER", "INFOBIP_WHATSAPP_FROM", "WHAPI_NUMBER",
+                  "VONAGE_WHATSAPP_FROM", "SISI_MODEL"):
+            out.append(f"{k}={_os.environ.get(k, '')}")
         return "\n".join(out)
     finally:
         conn.close()

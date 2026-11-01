@@ -2,37 +2,39 @@
 
 Sisi is a WhatsApp-first assistant for South African spaza shop owners. The owner sends a voice note in her own words ("Sipho took two bread and a 2L Coke on the book"), a photo of a shelf or wholesaler slip, or a short text, and Sisi keeps the books. Every write is shown as a short preview with Yes/No buttons and nothing is saved until the owner confirms; every saved action can be undone.
 
-**Features.** Guided 6-step setup (name, address, contact, logo, float, language) · credit book with limits, overdue flags and reminders · stock and sales in single units out of packs · cash book (till, petty, bank) with float, counts, expenses and drawings · handwritten book-page photos and wholesaler receipt photos with duplicate detection · restock orders with forwardable wholesaler messages · month-end P&L / balance sheet / cash flow as branded PDF + PNG card · customer statements (PNG + PDF) · branded shop logo with background removal · staff numbers with permissions · 19:00 book nudge and Sunday snapshot · expiry and price-change alerts · compliance helper for registration and the Spaza Shop Support Fund.
+**Features.** Guided 6-step setup (name, address, contact, logo, float, language) · credit book with limits, overdue flags and reminders · stock and sales in single units out of packs · cash book (till, petty, bank) with float, counts, expenses and drawings · handwritten book-page photos and wholesaler receipt photos with duplicate detection · restock orders with forwardable wholesaler messages · month-end P&L / balance sheet / cash flow as branded PDF + PNG card · customer statements (PNG + PDF) · branded shop logo on every document · staff numbers with permissions · 19:00 book nudge and Sunday snapshot · expiry and price-change alerts · compliance helper for registration and the Spaza Shop Support Fund · full isiZulu, Afrikaans and isiXhosa support alongside English.
 
 **The problem.** After the 2024 foodborne-illness deaths linked to spaza shops, every spaza had to register with its municipality (registration closed 28 Feb 2025); of 44,696 verified shops only about 15,000 hold trading permits. The R500 million Spaza Shop Support Fund offers up to R100,000 per shop but is gated by paperwork, and government warns of fake paid "application assistants" — applications are free. Sources: [gov.za media statement, 29 May 2026](https://www.gov.za), [the dtic, 6 Jun 2025](https://www.thedtic.gov.za), [SAnews, 17 Apr 2025](https://www.sanews.gov.za), [spazashopfund.co.za](https://spazashopfund.co.za).
 Video stats: ±150,000 spaza shops (UCT Case Writing Centre; Accenture Africa 2023 via Daily Investor), 5.2% of GDP and 2.6 million jobs (UCT via supermarket.co.za).
 
 **Built during the hackathon.** Everything in this repo was built during the Meta Global AI Developer Hackathon 2026 (26 Oct – 4 Nov 2026). No earlier code was imported. The git history shows when each feature was built.
 
-## Architecture (WhatsApp → Vonage → Modal → Muse)
+## Architecture (WhatsApp → Modal → Meta models → Turso)
 
 ```mermaid
 flowchart LR
     Owner -- voice/photo/text --> WA[WhatsApp]
-    WA -- inbound --> VON[Vonage Messages sandbox]
-    VON -- "/webhook/vonage" --> API[FastAPI on Modal]
-    WA -- "/webhook (alt)" --> API
+    WA -- Infobip / Vonage / Meta --> API[FastAPI on Modal]
     API -- spawn --> Worker[worker: slow jobs off-request]
-    API --> Agent[agent.py: exact commands in code]
+    API --> Agent[agent.py: deterministic fast paths]
     Agent --> Voice[Muse Voice Transcribe]
-    Agent --> Vision[Muse Spark vision + SAM 3.1]
-    Agent --> Plan[interpreter.py: planner proposes JSON]
+    Agent --> Vision[Muse Spark vision]
+    Agent --> Plan[interpreter.py: JSON plan via Meta]
+    Agent --> Loop[llm.py: tool loop fallback]
+    Plan --> Meta[Muse Spark @ api.meta.ai]
+    Loop --> Meta
     Plan --> Exec[executors validate + run in code]
     Exec --> Tools[tools.py: dry-run preview]
-    Tools --> DB[(SQLite + files on Modal volume)]
-    Agent -- reply + Yes/No buttons --> VON
-    CRON[15-min tick: nudges, snapshots, expiry] --> Agent
+    Tools --> DB[(Turso Cloud SQLite)]
+    Tools --> Vol[PDF/PNG/logo files on Modal volume]
+    Agent -- reply + buttons + media --> WA
+    CRON[1-min drain + 15-min nudges] --> Agent
 ```
 
-The Meta Cloud API webhook stays as an alternative path; Vonage is the live
-channel. Webhooks return 200 instantly: each message is handled by a spawned
-Modal worker (background task locally), with read receipts, typing indicators
-and ⏳ status lines while slow work runs.
+The live channel is Infobip; Vonage and the Meta Cloud API stay as
+alternative paths. Webhooks return 200 instantly: each message is handled by
+a spawned Modal worker (background task locally), with read receipts,
+typing indicators and ⏳ status lines while slow work runs.
 
 Understanding is split: the model reads the full message (transcript,
 caption, vision brief, history, open state) and proposes a structured plan;
@@ -40,29 +42,63 @@ code validates it and runs each task through the existing tools, so Yes/No,
 undo, money math, permissions and duplicate protection never depend on the
 model. Exact commands (menus, Yes/No/Undo, reminder management, statements)
 stay on deterministic fast paths; multi-intent messages always reach the
-planner. A manual probe script (`scripts/eval_live.py`, fictional data only)
-checks planner quality, latency and cost per case.
+planner, and anything the planner declines falls through to a bounded
+tool-calling loop. A manual probe script (`scripts/eval_live.py`, fictional
+data only) checks planner quality, latency and cost per case, and
+`scripts/smoke_demo.py` runs the full end-to-end smoke against production.
 
-## AI models (Meta Muse)
+## AI models (Meta)
+
+All model calls go to `https://api.meta.ai/v1` with `MODEL_API_KEY`
+(OpenAI-SDK compatible). No other model provider is used.
 
 | Job | Model | How |
 |---|---|---|
-| Understanding + task plans | `muse-spark-1.3` (`-contributor` for dev/tests) | Chat Completions, strict JSON plan schema, `reasoning_effort: low` (env `SISI_REASONING_EFFORT`) |
-| Vision (expiry, slips, shelves) | `muse-spark-1.3` | base64 data URL + `response_format: json_schema` |
-| Voice notes | `muse-voice-transcribe-1.0` | `POST /v1/asr/transcribe`, 16 kHz mono wav via ffmpeg |
-| Shelf counting (stretch) | `sam-3.1` | `POST /v1/responses` (streamed) |
+| Understanding + task plans | `muse-spark-1.3` (`-contributor` in dev/prod) | Chat Completions, strict JSON plan schema, `reasoning_effort: low` (env `SISI_REASONING_EFFORT`) |
+| Fallback conversation | `muse-spark-1.3` | tool-calling loop, `tool_choice: auto`, max 6 rounds, client-side arg validation |
+| Vision (book pages, slips, shelves) | `muse-spark-1.3` | base64 data URL + `response_format: json_schema`, Today context for dates |
+| Voice notes | `muse-voice-transcribe-1.0` | `POST /v1/asr/transcribe`, 16 kHz mono wav via ffmpeg, English bias + local brand keywords |
+
+The owner always sees what Sisi understood (transcript, vision lines,
+preview with Yes/No) before anything is saved, and every saved action can
+be undone.
+
+## Languages
+
+English, isiZulu, Afrikaans and isiXhosa throughout: the message language
+is detected per message, the owner has a default language, and each
+customer can have their own statement language. Replies, buttons,
+documents, reminders and the month-end report are all translated
+(`app/i18n.py`, enforced by `tests/test_i18n.py`).
 
 ## Setup
+
+Prereqs: Python 3.12 and `ffmpeg` (voice notes).
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env   # fill in MODEL_API_KEY, WhatsApp tokens
-python -m seed.seed_demo
-pytest
+python -m seed.seed_demo   # local demo shop 27710000001 (MaZulu's Spaza, fictional)
+pytest                   # full suite, must be green
 ```
 
 Run the API: `.venv/bin/python -m uvicorn app.main:app --port 8000`.
+Local dev uses SQLite (`SISI_DB`, default `data/sisi.db`); set
+`TURSO_DATABASE_URL` + `TURSO_AUTH_TOKEN` to use Turso Cloud instead
+(production always uses Turso).
+
+## Screenshots
+
+Real documents rendered by Sisi for the demo shop (contact redacted):
+
+| Customer statement (English) | Customer statement (isiZulu) |
+|---|---|
+| ![Statement in English](screenshots/shot-statement-sipho-en-p1.png) | ![Statement in isiZulu](screenshots/shot-statement-thandi-zu-p1.png) |
+
+| Month-end card | Sunday snapshot | Shop profile |
+|---|---|---|
+| ![Month-end card](screenshots/shot-month-2026-10.png) | ![Sunday snapshot](screenshots/shot-snapshot-week.png) | ![Shop profile](screenshots/shot-shop-card.png) |
 
 ## Try it (judges)
 
@@ -86,7 +122,7 @@ Run the API: `.venv/bin/python -m uvicorn app.main:app --port 8000`.
   dated props.
 - Compliance: `python scripts/simulate.py "Can I get the spaza fund?"` answers
   with the checklist, the official link, and the applications-are-free warning.
-- Live WhatsApp: message the test number (see hackathon submission) — try "Sipho took two bread and a 2L Coke on the book", tap Yes, then Undo.
+- Live WhatsApp: message the demo number **+44 7860 088970** — try "Sipho took two bread and a 2L Coke on the book", tap Yes, then Undo. (Infobip trial sender: verified signup numbers only, ~100 free messages, free-form replies inside the 24h window — see the Infobip section.)
 - Screenshots: [screenshots/](screenshots/).
 
 ## Reply style guide (standing rule)
