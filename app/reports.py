@@ -1154,6 +1154,209 @@ def render_pdf(d: dict, path: str, brand: dict | None = None) -> str:
     return path
 
 
+# ------------------------------------------------------- funding pack
+
+def _last_full_months(n: int = 3, today: str | None = None) -> list[str]:
+    """Last `n` full calendar months (YYYY-MM), oldest first."""
+    t = today or today_str()
+    y, m = int(t[:4]), int(t[5:7])
+    out = []
+    for _ in range(n):
+        m -= 1
+        if m == 0:
+            m, y = 12, y - 1
+        out.append(f"{y}-{m:02d}")
+    return out[::-1]
+
+
+def funding_data(conn, shop_id: str) -> dict:
+    """Credit-readiness figures: 3 full months + current snapshot.
+
+    Covers P&L per month, cash flow across the period, monthly sales
+    trend with top sellers, credit-book health and a closing snapshot.
+    `empty` is True when the shop has no books yet.
+    """
+    tools.ensure_shop(conn, shop_id)
+    months = _last_full_months(3)
+    per = [month_data(conn, shop_id, m) for m in months]
+    labels = [p["label"] for p in per]
+    rows = [{"month": m, "label": p["label"], "sales": p["sales"],
+             "cogs": p["cogs"], "gross": p["gross"],
+             "exp_total": p["exp_total"], "net": p["net"]}
+            for m, p in zip(months, per)]
+    cash = {
+        "opening": per[0]["opening_cash"],
+        "cash_sales": sum(p["cash_sales"] for p in per),
+        "collected": sum(p["collected"] for p in per),
+        "count_adj": sum(p["count_adj"] for p in per),
+        "paid_cash": sum(p["paid_cash"] for p in per),
+        "exp_cash": sum(p["exp_cash"] for p in per),
+        "draws": sum(p["draws"] for p in per),
+        "closing": per[-1]["closing_cash"],
+    }
+    placeholders = ", ".join("?" for _ in months)
+    trend = [{"month": m, "label": p["label"], "sales": p["sales"]}
+             for m, p in zip(months, per)]
+    best = conn.execute(
+        "SELECT product_name, COALESCE(SUM(qty), 0) q,"
+        " COALESCE(SUM(total_cents), 0) t FROM sales"
+        " WHERE shop_id = ? AND reversed = 0"
+        f" AND substr(datetime(created_at, '+2 hours'), 1, 7) IN ({placeholders})"
+        " GROUP BY product_name ORDER BY t DESC LIMIT 5",
+        (shop_id, *months)).fetchall()
+    best = [{"name": r["product_name"], "qty": r["q"], "cents": r["t"]}
+            for r in best]
+    latest = per[-1]
+    stale_cutoff = (date.fromisoformat(today_str())
+                    - timedelta(days=30)).isoformat()
+    stale = 0
+    for c in conn.execute("SELECT id FROM customers WHERE shop_id = ?",
+                          (shop_id,)).fetchall():
+        if tools.balance_cents(conn, shop_id, c["id"]) <= 0:
+            continue
+        oldest = conn.execute(
+            "SELECT substr(MIN(created_at), 1, 10) d FROM credit_entries"
+            " WHERE customer_id = ? AND reversed = 0",
+            (c["id"],)).fetchone()["d"]
+        if oldest and oldest <= stale_cutoff:
+            stale += 1
+    credit = {
+        "total": latest["debt_total"],
+        "n": len(latest["debtors"]),
+        "top": latest["debtors"][:5],
+        "collected": cash["collected"],
+        "new_credit": sum(p["credit_sales"] for p in per),
+        "stale": stale,
+    }
+    snap = {
+        "stock_value": latest["closing_value"],
+        "cash": latest["cash"], "petty": latest["petty"],
+        "bank": latest["bank"], "debtors": latest["debt_total"],
+        "creditors": latest["cred_total"], "equity": latest["equity"],
+    }
+    empty = True
+    for table in ("sales", "credit_entries", "payments", "expenses",
+                  "products"):
+        if conn.execute(f"SELECT COUNT(*) n FROM {table} WHERE shop_id = ?",
+                        (shop_id,)).fetchone()["n"]:
+            empty = False
+            break
+    return {"months": months, "labels": labels, "rows": rows, "cash": cash,
+            "trend": trend, "best": best, "credit": credit, "snap": snap,
+            "empty": empty}
+
+
+def render_funding_pdf(d: dict, path: str, brand: dict | None = None) -> str:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (PageBreak, Paragraph, SimpleDocTemplate,
+                                    Spacer)
+    from reportlab.platypus import Paragraph as P
+    st = _pdf_styles()
+    doc = SimpleDocTemplate(path, pagesize=A4, topMargin=18 * mm,
+                            bottomMargin=18 * mm,
+                            title=f"Sisi {_t('fund_title')}",
+                            author="Sisi", pageCompression=0)
+    W = A4[0] - doc.leftMargin - doc.rightMargin
+    story: list = []
+    _pdf_brand_header(story, st, brand or {"name": "", "address": "",
+                                           "phone": "", "logo": ""},
+                      _t("fund_title"), d["labels"][-1] if d["labels"] else "",
+                      W)
+    for para in _t("fund_free").split("\n"):
+        story.append(Paragraph(_esc(para), st["body"]))
+        story.append(Spacer(1, 3))
+    story.append(Paragraph(_esc(_t("fund_sec_pl")), st["h1"]))
+    head = [P(f"<b>{_t(k)}</b>", st["cell"])
+            for k in ("fund_h_month", "fund_h_sales", "fund_h_cogs",
+                      "fund_h_gross", "fund_h_exp", "fund_h_net")]
+    table = [head]
+    for r in d["rows"]:
+        table.append([P(r["label"], st["cell"]),
+                      P(cents_to_rand(r["sales"]), st["cell_r"]),
+                      P(cents_to_rand(r["cogs"]), st["cell_r"]),
+                      P(cents_to_rand(r["gross"]), st["cell_r"]),
+                      P(cents_to_rand(r["exp_total"]), st["cell_r"]),
+                      P(cents_to_rand(r["net"]), st["cell_r"])])
+    story.append(_pdf_table(table, [W * 0.30, W * 0.14, W * 0.14, W * 0.14,
+                                    W * 0.14, W * 0.14]))
+    story.append(Paragraph(_esc(_t("fund_sec_cash")), st["h1"]))
+    story.append(_pdf_table(_kv_rows(st, [
+        (_t("doc_open_cash"), cents_to_rand(d["cash"]["opening"])),
+        (_t("doc_cash_sales"), "+" + cents_to_rand(d["cash"]["cash_sales"])),
+        (_t("doc_collected"), "+" + cents_to_rand(d["cash"]["collected"])),
+        (_t("doc_count_adj"), cents_to_rand(d["cash"]["count_adj"])),
+        (_t("doc_paid"), "−" + cents_to_rand(d["cash"]["paid_cash"])),
+        (_t("doc_exp_paid"), "−" + cents_to_rand(d["cash"]["exp_cash"])),
+        (_t("doc_draws"), "−" + cents_to_rand(d["cash"]["draws"])),
+        (_t("doc_close_cash"), cents_to_rand(d["cash"]["closing"])),
+    ]), [W - 130, 130]))
+    story.append(Paragraph(_esc(_t("fund_sec_trend")), st["h1"]))
+    story.append(_pdf_table(_kv_rows(st, [
+        (r["label"], cents_to_rand(r["sales"])) for r in d["trend"]],
+        bold_last=False), [W - 130, 130]))
+    if d["best"]:
+        story.append(Spacer(1, 4))
+        story.append(Paragraph(_t("doc_best"), st["h2"]))
+        story.append(_pdf_table(_kv_rows(st, [
+            (b["name"], _t("doc_sold", qty=b["qty"],
+                           amt=cents_to_rand(b["cents"])))
+            for b in d["best"]], bold_last=False), [W - 170, 170]))
+    story.append(PageBreak())
+    story.append(Paragraph(_esc(_t("fund_sec_credit")), st["h1"]))
+    story.append(_pdf_table(_kv_rows(st, [
+        (_t("doc_debtors"), cents_to_rand(d["credit"]["total"])),
+        (_t("doc_collected"), "+" + cents_to_rand(d["credit"]["collected"])),
+        (_t("fund_new_credit"), "+" + cents_to_rand(d["credit"]["new_credit"])),
+    ]), [W - 130, 130]))
+    for name, cents in [(c["name"], c["cents"])
+                        for c in d["credit"]["top"]]:
+        story.append(Paragraph(f"• {_esc(name)} — {cents_to_rand(cents)}",
+                               st["body"]))
+    if not d["credit"]["top"]:
+        story.append(Paragraph(_esc(_t("doc_none")), st["body"]))
+    story.append(Spacer(1, 6))
+    story.append(Paragraph(_esc(_t("fund_sec_snap")), st["h1"]))
+    story.append(_pdf_table(_kv_rows(st, [
+        (_t("doc_stock_cost"), cents_to_rand(d["snap"]["stock_value"])),
+        (_acct_name("cash"), cents_to_rand(d["snap"]["cash"])),
+        (_acct_name("petty"), cents_to_rand(d["snap"]["petty"])),
+        (_acct_name("bank"), cents_to_rand(d["snap"]["bank"])),
+        (_t("doc_debtors"), cents_to_rand(d["snap"]["debtors"])),
+        (_t("doc_suppliers"), cents_to_rand(d["snap"]["creditors"])),
+        (_t("doc_equity"), cents_to_rand(d["snap"]["equity"])),
+    ]), [W - 130, 130]))
+    doc.build(story, onFirstPage=_pdf_footer, onLaterPages=_pdf_footer)
+    return path
+
+
+def build_funding_pack(conn, shop_id: str, base_url: str = "") -> tuple[str, list[dict]]:
+    """Generate the credit-readiness funding PDF. Returns (text, media)."""
+    brand = shop_brand(conn, shop_id)
+    with doc_lang(owner_lang(conn, shop_id)):
+        d = funding_data(conn, shop_id)
+        if d["empty"]:
+            return _t("fund_empty"), []
+        ensure_dirs()
+        safe = "".join(c for c in shop_id if c.isdigit()) or "shop"
+        pdf_path = str(_reports_dir() / f"{safe}-funding.pdf")
+        render_funding_pdf(d, pdf_path, brand)
+    token = store_card(conn, shop_id, "funding", pdf_path)
+    text = _t("fund_text", shop=brand["name"],
+              months=_t("fund_months", months=", ".join(d["labels"])))
+    base = (base_url or "").rstrip("/")
+    if base:
+        media = [{"kind": "file",
+                  "url": f"{base}/media/{token}?f=pdf",
+                  "caption": _t("fund_head"),
+                  "filename": "sisi-funding-pack.pdf"}]
+        text += _t("rep_files_below")
+    else:
+        media = []
+        text += _t("rep_files_saved")
+    return text, media
+
+
 # ---------------------------------------------------------------- PNG card
 
 def _card_font(size: int):

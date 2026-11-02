@@ -52,6 +52,7 @@ def _recorded_today(conn: sqlite3.Connection, shop_id: str, day: str) -> bool:
 def _nudge_text(conn: sqlite3.Connection, shop_id: str, day: str) -> str:
     from app.i18n import t
     from app.reminders import due_today
+    from app.tools import _runout_rows
     base = t("nudge_base")
     open_items = []
     for r in due_today(conn, shop_id, day)[:4]:
@@ -63,6 +64,8 @@ def _nudge_text(conn: sqlite3.Connection, shop_id: str, day: str) -> str:
         open_items.append(t("nudge_buy_one"))
     elif low:
         open_items.append(t("nudge_buy_many", n=low))
+    for r in _runout_rows(conn, shop_id, today=day)[:3]:
+        open_items.append(t("nudge_runout", name=r["name"], when=r["when"]))
     owed = conn.execute(
         "SELECT COUNT(*) n FROM customers c WHERE c.shop_id = ? AND ("
         "  (SELECT COALESCE(SUM(amount_cents), 0) FROM credit_entries e"
@@ -312,10 +315,14 @@ def _snapshot_data(conn: sqlite3.Connection, shop_id: str, day: str) -> dict:
                                      (shop_id,)).fetchall()]
     owed = sum(b for _, b in debtors if b > 0)
     cash = tools.account_balance(conn, shop_id, "cash")
+    runs = tools._runout_rows(conn, shop_id, today=day)[:1]
     if owed > 0 and any(b > 0 for _, b in debtors):
         top = max(((n, b) for n, b in debtors if b > 0), key=lambda t: t[1])
         tip = t("sch_tip_chase", name=top[0],
                 amt=tools.cents_to_rand(top[1]))
+    elif runs:
+        tip = t("sch_tip_runout", name=runs[0]["name"],
+                when=runs[0]["when"])
     elif slowest["name"] != "—":
         tip = t("sch_tip_push", name=slowest['name'])
     else:

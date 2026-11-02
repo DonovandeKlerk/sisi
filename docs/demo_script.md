@@ -3,7 +3,7 @@
 **Runtime target:** 3:00  
 **Demo shop:** Bongi's Spaza Shop  
 **Customers on screen:** Sipho, Thandi, Mama Zodwa, Bongani  
-**Languages shown:** English, isiZulu, Afrikaans (isiXhosa mentioned in VO)  
+**Languages shown:** English, isiZulu, Afrikaans, Sesotho, Setswana (isiXhosa mentioned in VO)  
 **Recording tip:** Film the WhatsApp chat in portrait on a phone, then crop/letterbox to 16:9 in the edit. Keep the status bar clean (Do Not Disturb on).
 
 ---
@@ -16,7 +16,7 @@
 
 ## Submission description (~150 words)
 
-Sisi is a WhatsApp-first AI bookkeeper for South African spaza shops — the township corner stores that keep communities fed, but still run on handwritten books, memory, and trust. Owners message Sisi the way they already talk: text, voice notes, and photos, in English, isiZulu, Afrikaans, isiXhosa, or mixed slang. Sisi logs sales, reads a handwritten book page and asks Yes/Undo before saving, keeps credit customers with per-debtor statement cards and PDFs carrying the shop logo, drafts gentle reminders, and sends a daily 7pm nudge plus a Sunday snapshot. Tap menus work; free typing still works; one message can chain actions ("sold 2 bread and send Thandi her statement"). Built on Meta models, WhatsApp, Modal, and Turso, Sisi needs no new app — just the chat they already open every day. Demo shop: Bongi's Spaza Shop.
+Sisi is a WhatsApp-first AI bookkeeper for South African spaza shops — the township corner stores that keep communities fed, but still run on handwritten books, memory, and trust. Owners message Sisi the way they already talk: text, voice notes, and photos, in English, isiZulu, Afrikaans, isiXhosa, Sesotho, Setswana, or mixed slang. Sisi logs sales, reads a handwritten book page and asks Yes/Undo before saving, keeps credit customers with per-debtor statement cards and PDFs carrying the shop logo, drafts gentle reminders, and sends a daily 7pm nudge plus a Sunday snapshot. Tap menus work; free typing still works; one message can chain actions ("sold 2 bread and send Thandi her statement"). Built on Meta models, WhatsApp, Modal, and Turso, Sisi needs no new app — just the chat they already open every day. Demo shop: Bongi's Spaza Shop.
 
 ---
 
@@ -89,7 +89,7 @@ Sisi:   Send your logo (photo)
 Owner:  [photo of logo]
 Sisi:   Starting float for today?
 Owner: 1500
-Sisi:   Language?  [English · isiZulu · Afrikaans · isiXhosa]
+Sisi:   Language?  [English · isiZulu · Afrikaans · isiXhosa · Sesotho · Setswana]
 Owner: English
 Sisi:   You're set. Here's your shop card. [image: profile preview with logo]
 ```
@@ -114,7 +114,7 @@ Sisi:   Logged ✅
 
 | Time | Visual | On-screen WhatsApp / UI | Voiceover |
 |------|--------|-------------------------|-----------|
-| **0:55–1:02** | Owner holds to talk; waveform of voice note. | Voice note plays/appears in chat (4–6s). | "Or just speak — isiZulu, Afrikaans, isiXhosa, English." |
+| **0:55–1:02** | Owner holds to talk; waveform of voice note. | Voice note plays/appears in chat (4–6s). | "Or just speak — isiZulu, Afrikaans, isiXhosa, Sesotho, Setswana, English." |
 | **1:02–1:15** | Transcript + confirmation appears. | Voice → text preview → confirm. | "Voice in. Books updated." |
 
 **Exact messages:**
@@ -218,7 +218,7 @@ Sisi:   Draft reminder for Sipho:
 | Time | Visual | On-screen WhatsApp / UI | Voiceover |
 |------|--------|-------------------------|-----------|
 | **2:30–2:40** | Clean motion diagram (simple shapes, not a slide dump): Phone → WhatsApp → **Sisi on Modal** → **Meta Llama / Meta multimodal** → **Turso** → media cards/PDFs back to WhatsApp. | Diagram animation; tiny labels only. | "Under the hood: WhatsApp in, Meta models for language, voice, and document understanding, Modal for scale, Turso for the shop's ledger." |
-| **2:40–2:50** | Return to chat for one beat; show language switch. | Owner: `language isiXhosa` or taps Settings → isiXhosa; Sisi replies in isiXhosa. | "Four languages. Offline-friendly habits. Built on Meta's stack so a spaza owner never leaves WhatsApp." |
+| **2:40–2:50** | Return to chat for one beat; show language switch. | Owner: `language isiXhosa` or taps Settings → isiXhosa; Sisi replies in isiXhosa. | "Six languages. Offline-friendly habits. Built on Meta's stack so a spaza owner never leaves WhatsApp." |
 
 **Exact messages:**
 ```
@@ -255,13 +255,13 @@ Meta Global AI Developer Hackathon 2026
 > Meet Sisi — a WhatsApp assistant that keeps the books for township shops, in the languages they already speak.  
 > Setup is guided: shop name, logo, float, language. Then you're live — no dashboard to learn.  
 > Log a sale the way you'd tell a cousin. Sisi understands mixed slang, confirms, and keeps an Undo.  
-> Or just speak — isiZulu, Afrikaans, isiXhosa, English. Voice in. Books updated.  
+> Or just speak — isiZulu, Afrikaans, isiXhosa, Sesotho, Setswana, English. Voice in. Books updated.  
 > Still using the counter book? Photograph the page. Sisi reads it, shows a preview, and only saves when you say Yes — with Undo if you change your mind.  
 > Ask for every creditor's statement in one breath. One card and one PDF per customer — each carrying Bongi's logo. Built for forwarding on WhatsApp.  
 > One message. Two actions. Sisi chains them. Tap menus when you want them. Keep typing when you don't. Daily 7pm nudge, sales PDF, Sunday snapshot — Sisi runs the rhythm of the shop.  
 > Gentle reminder drafts. A 7pm nudge. A Sunday snapshot. The shop stays ahead.  
 > Under the hood: WhatsApp in, Meta models for language, voice, and document understanding, Modal for scale, Turso for the shop's ledger.  
-> Four languages. Offline-friendly habits. Built on Meta's stack so a spaza owner never leaves WhatsApp.  
+> Six languages. Offline-friendly habits. Built on Meta's stack so a spaza owner never leaves WhatsApp.  
 > When the books live in WhatsApp, credit stays fair, cash stays clear, and a small shop can grow.  
 > Sisi. The spaza shop's AI assistant — on WhatsApp.
 

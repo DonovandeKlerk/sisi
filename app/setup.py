@@ -34,7 +34,8 @@ CHANGE_WORDS = {
     "logo": 4, "picture": 4,
     "float": 5, "cash": 5, "money": 5, "imali": 5, "geld": 5,
     "language": 6, "zulu": 6, "english": 6, "taal": 6, "ulimi": 6,
-    "ulwimi": 6,
+    "ulwimi": 6, "sesotho": 6, "sotho": 6, "setswana": 6, "tswana": 6,
+    "puo": 6,
     "plan": 7, "daily plan": 7, "icebo": 7, "dagplan": 7,
 }
 
@@ -183,9 +184,10 @@ def _safe_finish(conn: sqlite3.Connection, shop_id: str) -> str:
     return t("setup_safe")
 
 
-BACK_WORDS = ("back", "buyela", "terug")
-SKIP_WORDS = ("skip", "yeqa", "slaan oor", "tsiba")
-CHANGE_PREFIXES = ("change ", "verander ", "shintsha ", "tshintsha ")
+BACK_WORDS = ("back", "buyela", "terug", "kgutlela", "boela")
+SKIP_WORDS = ("skip", "yeqa", "slaan oor", "tsiba", "tlola")
+CHANGE_PREFIXES = ("change ", "verander ", "shintsha ", "tshintsha ",
+                   "fetola ")
 
 SETUP_BUTTONS = {
     2: ["Skip"],
@@ -196,8 +198,9 @@ SETUP_BUTTONS = {
 }
 """Tap buttons per step (≤3, ≤25 chars). Bare '1' taps resolve to these."""
 SETUP_LIST_BUTTON = "Language"
-SETUP_LIST_ROWS = ["English", "isiZulu", "Afrikaans", "isiXhosa"]
-"""Step 6 arrives as a list message (digits 1-4 resolve the fallback)."""
+SETUP_LIST_ROWS = ["English", "isiZulu", "Afrikaans", "isiXhosa", "Sesotho",
+                   "Setswana"]
+"""Step 6 arrives as a list message (digits 1-6 resolve the fallback)."""
 
 
 def setup_buttons(step: int | None) -> list[str] | None:
@@ -294,12 +297,12 @@ def _answer(conn: sqlite3.Connection, shop_id: str, sender: str, text: str) -> s
     return _answer_plan(conn, shop_id, word, text)
 
 
-PLAN_YES = ("yes", "y", "yebo", "yeah", "ja", "ewe", "ok", "okay", "sharp",
-            "shap", "sure", "on", "please", "yep", "yea", "aye",
-            "definitely", "certainly")
+PLAN_YES = ("yes", "y", "yebo", "yeah", "ja", "ewe", "ee", "eya", "ok",
+            "okay", "sharp", "shap", "sure", "on", "please", "yep",
+            "yea", "aye", "definitely", "certainly")
 PLAN_NO = ("no", "n", "nope", "nah", "nee", "off", "hayi", "cha", "aikona",
-           "never", "not", "dont", "don't", "aowa", "skip", "yeqa",
-           "slaan oor", "tsiba")
+           "never", "not", "dont", "don't", "aowa", "tjhe", "nnyaa",
+           "nyaa", "skip", "yeqa", "slaan oor", "tsiba", "tlola")
 PICK_TIME_WORDS = ("pick a time", "pick time", "choose a time", "choose time",
                    "set a time", "set time", "a time", "another time",
                    "different time")
@@ -314,8 +317,9 @@ _PHONE_YES = _PHONE_YES_TOKENS + _PHONE_YES_EXTRA
 _FLOAT_ZERO = ("none", "no", "nope", "zero", "0", "r0", "nothing", "no float",
                "akukho", "niks", "geen", "hayi")
 
-_LANG_NUMBERS = {"1": "en", "2": "zu", "3": "af", "4": "xh"}
-"""Digit answers follow the prompt order: English, isiZulu, Afrikaans, isiXhosa."""
+_LANG_NUMBERS = {"1": "en", "2": "zu", "3": "af", "4": "xh", "5": "st",
+                "6": "tn"}
+"""Digit answers follow the prompt order: English, isiZulu, Afrikaans, isiXhosa, Sesotho, Setswana."""
 
 
 def _tokens(word: str) -> list[str]:
@@ -334,7 +338,7 @@ def _has_any(word: str, options: tuple[str, ...]) -> bool:
 
 
 def _lenient_lang(word: str) -> str | None:
-    """Language answer: exact, digit (1-4), or name anywhere in the text."""
+    """Language answer: exact, digit (1-6), or name anywhere in the text."""
     from app.i18n import LANG_CODES, normalize_lang
     code = normalize_lang(word)
     if code is not None:

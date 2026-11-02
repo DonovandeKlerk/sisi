@@ -252,7 +252,7 @@ def test_step_buttons_and_language_list(conn):
     lists = take_lists(SHOP)
     assert len(lists) == 1
     assert lists[0]["button_text"] == "Language"
-    assert lists[0]["rows"] == ["English", "isiZulu", "Afrikaans", "isiXhosa"]
+    assert lists[0]["rows"] == ["English", "isiZulu", "Afrikaans", "isiXhosa", "Sesotho", "Setswana"]
     msg, buttons = handle_text(conn, SHOP, "2")
     assert "Isinyathelo 7 kwezi-7" in msg  # digit fallback -> isiZulu
     assert buttons == ["Yes", "Pick a time", "No"]

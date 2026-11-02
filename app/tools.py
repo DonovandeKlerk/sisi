@@ -4965,6 +4965,10 @@ def restock_list(conn: sqlite3.Connection, shop_id: str) -> str:
     groups: dict[str, list[str]] = {}
     for r in rows:
         need = max(1, int(r["reorder_level"] * 2 - r["stock_qty"]))
+        velocity = _sales_velocity(conn, shop_id, r["id"])
+        if velocity > 0:
+            need = max(need, math.ceil(velocity * COVER_DAYS
+                                      - r["stock_qty"]))
         have = _fmt_qty(r["stock_qty"])
         if r["pack_size"]:
             packs = math.ceil(need / r["pack_size"])
@@ -5313,6 +5317,83 @@ def _avg_daily_sales(conn: sqlite3.Connection, shop_id: str, product_id: int,
         " AND reversed = 0 AND substr(datetime(created_at, '+2 hours'), 1, 10) >= ?",
         (shop_id, product_id, start_day)).fetchone()["s"]
     return s / 7
+
+
+COVER_DAYS = 14
+"""Target cover when sizing restock quantities from sales velocity."""
+FORECAST_DAYS = 7
+"""Default run-out horizon (days) for the stock forecast and nudges."""
+VELOCITY_DAYS = 14
+"""Sales window (days) used for velocity and run-out projections."""
+
+
+def _sales_velocity(conn: sqlite3.Connection, shop_id: str, product_id: int,
+                    days: int = VELOCITY_DAYS,
+                    today: str | None = None) -> float:
+    """Units/day over the recent window; 0.0 when history is thin.
+
+    Falls back gracefully: no sales rows means no velocity, never a guess.
+    """
+    today = today or today_str()
+    try:
+        start = (date.fromisoformat(today)
+                 - timedelta(days=days - 1)).isoformat()
+    except ValueError:
+        return 0.0
+    s = conn.execute(
+        "SELECT COALESCE(SUM(qty), 0) s FROM sales WHERE shop_id = ? AND product_id = ?"
+        " AND reversed = 0 AND substr(datetime(created_at, '+2 hours'), 1, 10) >= ?",
+        (shop_id, product_id, start)).fetchone()["s"]
+    return (s or 0) / days
+
+
+def _runout_rows(conn: sqlite3.Connection, shop_id: str,
+                 within_days: int = FORECAST_DAYS,
+                 days: int = VELOCITY_DAYS,
+                 today: str | None = None) -> list[dict]:
+    """Products projected to run out within `within_days`, soonest first.
+
+    Days-of-cover = stock_qty / velocity. Items with zero stock or zero
+    velocity are skipped (low_stock covers the former; the latter has no
+    signal to project from). Deterministic: no planner, no guesses.
+    """
+    from app.i18n import day_stamp as _day_stamp
+    today = today or today_str()
+    try:
+        base = date.fromisoformat(today)
+    except ValueError:
+        return []
+    out = []
+    for r in conn.execute(
+            "SELECT id, name, stock_qty FROM products"
+            " WHERE shop_id = ? AND stock_qty > 0", (shop_id,)).fetchall():
+        velocity = _sales_velocity(conn, shop_id, r["id"], days, today)
+        if velocity <= 0:
+            continue
+        cover = (r["stock_qty"] or 0) / velocity
+        if cover > within_days:
+            continue
+        runout = base + timedelta(days=int(cover))
+        out.append({"id": r["id"], "name": r["name"],
+                    "days_left": int(cover), "date": runout.isoformat(),
+                    "when": _day_stamp(runout.weekday(), f"{runout.day:02d}",
+                                       runout.month)})
+    out.sort(key=lambda d: (d["days_left"], d["name"]))
+    return out
+
+
+def stock_forecast(conn: sqlite3.Connection, shop_id: str,
+                   within_days: int = FORECAST_DAYS) -> str:
+    """Short WhatsApp list of what runs out soon (deterministic)."""
+    ensure_shop(conn, shop_id)
+    rows = _runout_rows(conn, shop_id, within_days)
+    if not rows:
+        return _t("forecast_none", days=within_days)
+    lines = [_t("forecast_head")]
+    lines += [_t("forecast_line", name=r["name"], days=r["days_left"],
+                  when=r["when"]) for r in rows[:5]]
+    lines.append(_t("forecast_hint"))
+    return "\n".join(lines)
 
 
 def photo_seen(conn: sqlite3.Connection, shop_id: str, digest: str):
@@ -6451,7 +6532,8 @@ _MONTH_NAMES = {m: i for i, m in enumerate(
     ["january", "february", "march", "april", "may", "june", "july",
      "august", "september", "october", "november", "december"], 1)}
 _MONTH_NAMES.update({m[:3]: i for m, i in list(_MONTH_NAMES.items())})
-# isiZulu, Afrikaans and isiXhosa month names (must match i18n.MON_FULL).
+# isiZulu, Afrikaans, isiXhosa, Sesotho and Setswana month names
+# (must match i18n.MON_FULL).
 _MONTH_NAMES.update({
     "ujanuwari": 1, "ufebruwari": 2, "umashi": 3, "u-ephreli": 4,
     "uapreli": 4, "uephreli": 4, "umeyi": 5, "ujuni": 6, "ujulayi": 7,
@@ -6466,6 +6548,13 @@ _MONTH_NAMES.update({
     "meyi": 5, "juni": 6, "julayi": 7, "agasti": 8, "septhemba": 9,
     "septemba": 9, "okthoba": 10, "oktobha": 10, "novemba": 11,
     "disemba": 12,
+    # Sesotho (Pherekgong … Tshitwe) and Setswana (Ferikgong … Sedimonthole)
+    "pherekgong": 1, "hlakola": 2, "hlakubele": 3, "mesa": 4,
+    "motsheanong": 5, "phupjane": 6, "phupu": 7, "phato": 8,
+    "loetse": 9, "mphalane": 10, "pudungwana": 11, "tshitwe": 12,
+    "ferikgong": 1, "tlhakole": 2, "mopitlwe": 3, "moranang": 4,
+    "motsheganong": 5, "seetebosigo": 6, "phukwi": 7, "phatwe": 8,
+    "lwetse": 9, "phalane": 10, "ngwanatsele": 11, "sedimonthole": 12,
 })
 
 
@@ -7707,6 +7796,23 @@ def month_end_report(conn: sqlite3.Connection, shop_id: str,
 
 _QUOTE_FIX = {"\u2019": "'", "\u2018": "'", "\u02bc": "'", "`": "'",
                 "\u00b4": "'"}
+
+
+def funding_pack(conn: sqlite3.Connection, shop_id: str) -> str:
+    """Credit-readiness pack: branded funding PDF queued as WhatsApp media."""
+    blocked = _staff_blocked()
+    if blocked:
+        return blocked
+    import os as _os
+
+    from app import reports as _reports
+
+    from app.agent import queue_media as _queue
+    ensure_shop(conn, shop_id)
+    text, media = _reports.build_funding_pack(
+        conn, shop_id, _os.environ.get("SISI_PUBLIC_URL", ""))
+    _queue(shop_id, media)
+    return text
 
 
 def straight_quotes(name: str) -> str:
@@ -8959,6 +9065,10 @@ TOOL_DEFS = [
           {"month": {"type": "string",
                      "description": "YYYY-MM or month name; omit for the books due"}},
           []),
+    _tool("funding_pack", "Credit-readiness pack for the bank or the free"
+          " Spaza Shop Support Fund: branded PDF with 3-month P&L, cash flow,"
+          " sales trend, credit book and shop snapshot. Use for 'funding pack',"
+          " 'credit pack', 'readiness pack'.", {}, []),
     _tool("set_shop_name", "Save the OWNER's own spaza shop name. Never invent one.",
           {"name": {"type": "string"}}, ["name"]),
     _tool("set_shop_address", "Save the shop's address (optional).",
@@ -9038,6 +9148,9 @@ TOOL_DEFS = [
           " or ask if they want the rest.", {}, []),
     _tool("best_sellers", "Top-selling products by revenue over the last N days (default 7).", {"days": {"type": "integer"}}, []),
     _tool("restock_list", "Restock list grouped by wholesaler.", {}, []),
+    _tool("stock_forecast", "What runs out soon: projected run-out dates"
+          " from recent sales velocity. Use for 'what runs out',"
+          " 'stock forecast'.", {}, []),
     _tool("cash_up", "Today's takings and money summary: cash sales, book sales, payments in."
           " Use for 'cash up', 'takings', 'how much did I make', 'how did we do today'.",
           {"day": {"type": "string", "description": "YYYY-MM-DD, default today"}}, []),
@@ -9092,6 +9205,8 @@ TOOL_FUNCS = {
     "list_stock": list_stock,
     "best_sellers": best_sellers,
     "restock_list": restock_list,
+    "stock_forecast": stock_forecast,
+    "funding_pack": funding_pack,
     "cash_up": cash_up,
     "check_expiry_photo": check_expiry_photo,
     "read_slip_photo": read_slip_photo,

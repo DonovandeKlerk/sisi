@@ -383,7 +383,9 @@ def _parse_float(text: str) -> dict:
 _STAFF_BLOCKED_PREFIX = ("month-end", "month end", "monthend", "report ",
                                "statement", "set ", "add staff", "delete ",
                                "reset ", "nudge", "undo", "speak", "khuluma",
-                               "praat", "thetha")
+                               "praat", "thetha", "bua", "funding pack",
+                               "credit pack", "fund pack",
+                               "readiness pack", "spaza fund pack")
 _STAFF_BLOCKED_EXACT = {"undo", "demo reset", "reset demo", "delete my data",
                         "erase my data", "forget me",
                         "statements for everyone who owes",
@@ -403,8 +405,12 @@ def slow_status(text: str) -> str | None:
         return _t("ag_busy_report")
     if word.startswith("report ") and parse_month_name(word[7:]):
         return _t("ag_busy_report")
+    if word in ("funding pack", "credit pack", "spaza fund pack",
+                "fund pack", "readiness pack"):
+        return _t("ag_busy_report")
     if word.startswith(("statement", "statements", "staat", "strokie",
-                          "isitatimende", "sitatimende", "istatimenti")) \
+                          "isitatimende", "sitatimende", "istatimenti",
+                          "setatemente")) \
             or word in ("statements for everyone who owes",
                         "statements for everyone", "all statements"):
         return _t("ag_busy_stmt")
@@ -420,7 +426,7 @@ _STATEMENT_TRIGGERS = ("statement", "isitatimende", "sitatimende",
                        "itatimende", "receipt",
                        "irisithi", "risithi", "iresithi", "slip",
                        "staat", "strokie", "afskrif", "istatimenti",
-                       "isiliphu",
+                       "isiliphu", "setatemente",
                        "something to send", "to send to", "send it to",
                        "send this to", "make a picture", "picture for")
 
@@ -464,7 +470,8 @@ def _customers_in_text(word: str, names: list[str]) -> list[str]:
 
 
 _CUST_STMT_WORDS = ("statement", "isitatimende", "sitatimende",
-                    "itatimende", "istatimenti", "staat", "strokie", "afskrif")
+                    "itatimende", "istatimenti", "staat", "strokie", "afskrif",
+                    "setatemente")
 
 
 def try_multi_statement_request(conn: sqlite3.Connection, shop_id: str,
@@ -534,7 +541,8 @@ _SOCIAL_WORDS = {"how are you", "how are u", "how r u", "how are things",
                  "unjan", "unjani", "kunjani", "kunjan", "hoe gaan dit",
                  "hoe gaan", "how is it going", "sisi"}
 _THANKS_WORDS = {"thanks", "thank you", "thx", "ta", "ngiyabonga", "dankie",
-                 "enkosi", "cool", "great", "bye", "bye bye", "cheers",
+                 "enkosi", "kea leboga", "ke a leboga", "leboga", "cool",
+                 "great", "bye", "bye bye", "cheers",
                  "goodbye", "good night", "goodnight", "all good",
                  "all sharp", "pleasure"}
 _WHO_OWES_WORDS = {"who owes me", "who owes", "who owes money", "debtors",
@@ -549,6 +557,10 @@ _STOCK_WORDS = {"stock list", "list stock", "show stock", "show my stock",
                 "stock on hand", "isitokwe", "voorraad", "my stock"}
 _LOW_WORDS = {"low stock", "running low", "what is low", "whats low",
               "what's low", "out of stock", "what ran out", "what is short"}
+_FORECAST_WORDS = {"stock forecast", "what runs out", "what runs out soon",
+                   "runs out", "run out", "running out",
+                   "what will run out", "show run outs", "e tlo fela",
+                   "e tla fela", "tla fela", "e a fela"}
 _PAY_WORDS = ("paid", "payment", "paying", "khokha", "betaal", "hlawula",
               "settled", "ibhadalile")
 
@@ -596,6 +608,9 @@ def try_fast_lookup(conn: sqlite3.Connection, shop_id: str, text: str):
     if word in _LOW_WORDS:
         from app.tools import low_stock
         return low_stock(conn, shop_id)
+    if word in _FORECAST_WORDS:
+        from app.tools import stock_forecast
+        return stock_forecast(conn, shop_id)
     toks = set(re.findall(r"[a-z0-9]+", word))
     balance_hit = bool({"owe", "owes", "owing", "owed"} & toks) or any(
         s in word for s in ("balance", "ibhalansi", "saldo", "kwelet",
@@ -1121,7 +1136,7 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str,
     resumed = try_deferred_link_resume(conn, shop_id, text)
     if resumed is not None:
         return resumed
-    m = re.match(r"(speak|khuluma|praat|thetha)\s+(.+)$", word)
+    m = re.match(r"(speak|khuluma|praat|thetha|bua)\s+(.+)$", word)
     if m and normalize_lang(m.group(2).strip()) is not None:
         return set_owner_language(conn, shop_id, m.group(2).strip()), None
     m = re.match(r"add staff ([\d\s+()\-]{9,}) (.+)$", (text or "").strip(),
@@ -1242,6 +1257,12 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str,
                 conn, shop_id, m, os.environ.get("SISI_PUBLIC_URL", ""))
             queue_media(shop_id, media)
             return text, None
+    if word in ("funding pack", "credit pack", "spaza fund pack",
+                "fund pack", "readiness pack"):
+        text, media = reports.build_funding_pack(
+            conn, shop_id, os.environ.get("SISI_PUBLIC_URL", ""))
+        queue_media(shop_id, media)
+        return text, None
     if word.startswith("set shop name "):
         return set_shop_name(conn, shop_id, text.strip()[len("set shop name "):]), None
     if word.startswith("set address "):

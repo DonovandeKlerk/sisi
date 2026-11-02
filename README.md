@@ -2,7 +2,7 @@
 
 Sisi is a WhatsApp-first assistant for South African spaza shop owners. The owner sends a voice note in her own words ("Sipho took two bread and a 2L Coke on the book"), a photo of a shelf or wholesaler slip, or a short text, and Sisi keeps the books. Every write is shown as a short preview with Yes/No buttons and nothing is saved until the owner confirms; every saved action can be undone.
 
-**Features.** Guided 6-step setup (name, address, contact, logo, float, language) · credit book with limits, overdue flags and reminders · stock and sales in single units out of packs · cash book (till, petty, bank) with float, counts, expenses and drawings · handwritten book-page photos and wholesaler receipt photos with duplicate detection · restock orders with forwardable wholesaler messages · month-end P&L / balance sheet / cash flow as branded PDF + PNG card · customer statements (PNG + PDF) · branded shop logo on every document · staff numbers with permissions · 19:00 book nudge and Sunday snapshot · expiry and price-change alerts · compliance helper for registration and the Spaza Shop Support Fund · full isiZulu, Afrikaans and isiXhosa support alongside English.
+**Features.** Guided 6-step setup (name, address, contact, logo, float, language) · credit book with limits, overdue flags and reminders · stock and sales in single units out of packs · cash book (till, petty, bank) with float, counts, expenses and drawings · handwritten book-page photos and wholesaler receipt photos with duplicate detection · restock orders with forwardable wholesaler messages · month-end P&L / balance sheet / cash flow as branded PDF + PNG card · customer statements (PNG + PDF) · branded shop logo on every document · staff numbers with permissions · 19:00 book nudge and Sunday snapshot · expiry and price-change alerts · compliance helper for registration and the Spaza Shop Support Fund · credit-readiness funding pack as branded PDF · stock run-out forecasts from sales velocity · full isiZulu, Afrikaans, isiXhosa, Sesotho and Setswana support alongside English.
 
 **The problem.** After the 2024 foodborne-illness deaths linked to spaza shops, every spaza had to register with its municipality (registration closed 28 Feb 2025); of 44,696 verified shops only about 15,000 hold trading permits. The R500 million Spaza Shop Support Fund offers up to R100,000 per shop but is gated by paperwork, and government warns of fake paid "application assistants" — applications are free. Sources: [gov.za media statement, 29 May 2026](https://www.gov.za), [the dtic, 6 Jun 2025](https://www.thedtic.gov.za), [SAnews, 17 Apr 2025](https://www.sanews.gov.za), [spazashopfund.co.za](https://spazashopfund.co.za).
 Video stats: ±150,000 spaza shops (UCT Case Writing Centre; Accenture Africa 2023 via Daily Investor), 5.2% of GDP and 2.6 million jobs (UCT via supermarket.co.za).
@@ -65,11 +65,11 @@ be undone.
 
 ## Languages
 
-English, isiZulu, Afrikaans and isiXhosa throughout: the message language
-is detected per message, the owner has a default language, and each
-customer can have their own statement language. Replies, buttons,
-documents, reminders and the month-end report are all translated
-(`app/i18n.py`, enforced by `tests/test_i18n.py`).
+English, isiZulu, Afrikaans, isiXhosa, Sesotho and Setswana throughout:
+the message language is detected per message, the owner has a default
+language, and each customer can have their own statement language.
+Replies, buttons, documents, reminders and the month-end report are all
+translated (`app/i18n.py`, enforced by `tests/test_i18n.py`).
 
 ## Setup
 
