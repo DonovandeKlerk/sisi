@@ -31,6 +31,7 @@ def sim_env(tmp_path, monkeypatch):
     monkeypatch.setenv("SISI_DB", str(tmp_path / "sim.db"))
     monkeypatch.setenv("APP_SECRET", SECRET)
     monkeypatch.setenv("VERIFY_TOKEN", "test-verify")
+    monkeypatch.setenv("SISI_PUBLIC_URL", "https://x.example")
     monkeypatch.delenv("WHATSAPP_PHONE_NUMBER_ID", raising=False)
     monkeypatch.delenv("WHATSAPP_TOKEN", raising=False)
     monkeypatch.setattr(llm, "TOKEN_LOG", tmp_path / "usage.log")
