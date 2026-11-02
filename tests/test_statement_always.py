@@ -60,8 +60,9 @@ def _image_for(conn):
     VOICE_TRANSCRIPT,
 ])
 def test_text_triggers_produce_statement_image(conn, ledger, text):
+    import app.agent as agent
     msg, buttons = handle_text(conn, SHOP, text)
-    assert buttons == ["All statements", "Set reminder", "Menu"]
+    assert buttons == agent.after_statement_buttons()
     assert "R40.00" in msg  # one short text with the total
     image = _image_for(conn)
     # The forward-caption is an instruction to the owner: same language as
@@ -188,7 +189,7 @@ def test_sale_plus_statement_reaches_planner(conn, ledger, monkeypatch,
     assert "Save sale? (2 items)" in msg  # every item proposed ...
     assert "I'll send that once you confirm" in msg  # ... statement held
     assert "Outstanding" not in msg
-    assert buttons == ["Yes", "No"]
+    assert buttons == ["✅ Yes", "❌ No"]
     assert take_media(SHOP) == []
     msg, _ = handle_text(conn, SHOP, "yes")
     assert "Sale saved" in msg and "Outstanding R108.00" in msg

@@ -62,7 +62,7 @@ def test_set_commands_route(conn):
 def test_logo_caption_upload(conn):
     ensure_shop(conn, SHOP, "Corner Spaza")
     _, reply, buttons = handle_photo(conn, SHOP, _logo_bytes(), "logo")
-    assert "New logo?" in reply and buttons == ["Yes", "No"]
+    assert "New logo?" in reply and buttons == ["✅ Yes", "❌ No"]
     assert reports.shop_brand(conn, SHOP)["logo"] == ""
     handle_text(conn, SHOP, "yes")
     brand = reports.shop_brand(conn, SHOP)
@@ -77,7 +77,7 @@ def test_logo_reply_to_photo(conn):
     LAST_PHOTO[SHOP] = (_logo_bytes(), __import__("datetime").datetime.now(
         __import__("datetime").timezone.utc))
     msg, buttons = handle_text(conn, SHOP, "logo")
-    assert "New logo?" in msg and buttons == ["Yes", "No"]
+    assert "New logo?" in msg and buttons == ["✅ Yes", "❌ No"]
     msg, _ = handle_text(conn, SHOP, "yes")
     assert "Logo updated" in msg
 

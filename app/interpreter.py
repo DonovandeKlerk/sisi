@@ -356,6 +356,15 @@ def _chat_ok(reply: str) -> str:
 
 _SUG_AFTER_REMINDERS = ["Set reminder", "Menu"]
 _SUG_AFTER_STATEMENT = ["All statements", "Set reminder", "Menu"]
+"""Canonical English ids (display titles are localized per turn)."""
+
+
+def _sug_after_reminders() -> list[str]:
+    return [_t("btn_set_reminder"), _t("btn_menu")]
+
+
+def _sug_after_statement() -> list[str]:
+    return [_t("btn_all_statements"), _t("btn_set_reminder"), _t("btn_menu")]
 
 
 def _exec_reminder(conn, shop_id, args, bundle):
@@ -413,7 +422,7 @@ def _exec_reminder(conn, shop_id, args, bundle):
             conn.commit()
             out = confirm_text(datetime.fromisoformat(row["due_at"]),
                                wording.strip()[:120], row["recurrence"])
-    return out, _SUG_AFTER_REMINDERS
+    return out, _sug_after_reminders()
 
 
 def _exec_reminder_offer(conn, shop_id, args, bundle):
@@ -434,7 +443,7 @@ def _exec_reminder_offer(conn, shop_id, args, bundle):
 
 def _exec_reminder_list(conn, shop_id, args, bundle):
     from app.reminders import list_reminders
-    return list_reminders(conn, shop_id), _SUG_AFTER_REMINDERS
+    return list_reminders(conn, shop_id), _sug_after_reminders()
 
 
 def _exec_reminder_cancel(conn, shop_id, args, bundle):
@@ -746,7 +755,7 @@ def _exec_statement(conn, shop_id, args, bundle):
         conn, shop_id, f"statement for {_customer(args.get('customer'))}")
     if out is None:
         raise _TaskFail(_t("cust_which"))
-    return out, _SUG_AFTER_STATEMENT
+    return out, _sug_after_statement()
 
 
 def _exec_statements_all(conn, shop_id, args, bundle):
@@ -760,7 +769,7 @@ def _exec_statements_all(conn, shop_id, args, bundle):
             out = agent.try_multi_statement_request(
                 conn, shop_id, "statements for " + ", ".join(clean))
             if out is not None:
-                return out, _SUG_AFTER_STATEMENT
+                return out, _sug_after_statement()
             raise _TaskFail(_t("cust_which"))
     try:
         top_n = int(args.get("top_n"))
@@ -770,9 +779,9 @@ def _exec_statements_all(conn, shop_id, args, bundle):
         out = agent.try_multi_statement_request(
             conn, shop_id, f"statements for {top_n} creditors")
         if out is not None:
-            return out, _SUG_AFTER_STATEMENT
+            return out, _sug_after_statement()
         raise _TaskFail(_t("cust_which"))
-    return statements_for_all(conn, shop_id), _SUG_AFTER_STATEMENT
+    return statements_for_all(conn, shop_id), _sug_after_statement()
 
 
 def _exec_receipts(conn, shop_id, args, bundle):

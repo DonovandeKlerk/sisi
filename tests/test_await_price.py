@@ -48,7 +48,7 @@ def test_price_reply_completes_credit_sale(conn):
     _seed(conn)
     record_sale(conn, SHOP, "Stoney 2L", 2, buyer="Sipho")
     msg, buttons = handle_text(conn, SHOP, "stoney 2l R25")
-    assert buttons == ["Yes", "No"]
+    assert buttons == ["✅ Yes", "❌ No"]
     assert "2 × Stoney 2L @ R25.00 = R50.00 to Sipho" in msg
     saved, _ = handle_text(conn, SHOP, "Yes")
     assert "✅ *Sale saved*" in saved and "Sipho owes R50.00 more" in saved
@@ -62,7 +62,7 @@ def test_price_reply_completes_credit_book_entry(conn):
     msg = add_credit(conn, SHOP, "Sipho", [{"product": "Stoney 2L", "qty": 2}])
     assert "and I'll add it and record Sipho's credit." in msg
     preview, buttons = handle_text(conn, SHOP, "R25")
-    assert buttons == ["Yes", "No"]
+    assert buttons == ["✅ Yes", "❌ No"]
     assert "• Sipho +R50.00 (2x Stoney 2L)" in preview
     handle_text(conn, SHOP, "Yes")
     assert undo_last(conn, SHOP).startswith("Undone: removed Sipho's R50.00 credit.")
@@ -75,7 +75,7 @@ def test_unpriced_known_item_ask_resumes_on_price(conn):
     _seed(conn)
     assert record_sale(conn, SHOP, "Milk 1L", 1) == "❓ What is the price of Milk 1L?"
     preview, buttons = handle_text(conn, SHOP, "milk R22")
-    assert buttons == ["Yes", "No"]
+    assert buttons == ["✅ Yes", "❌ No"]
     assert "1 × Milk 1L @ R22.00 = R22.00 cash" in preview
 
 

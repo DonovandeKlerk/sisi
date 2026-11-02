@@ -182,7 +182,7 @@ def test_handle_photo_proposes_preview(photo_env, monkeypatch):
         conn.close()
     assert findings["expiry"]["items"][0]["product"] == "Fresh Milk 1L"
     assert "• 2 × Fresh Milk 1L 30 Oct — expired" in reply
-    assert buttons == ["Yes", "No"]
+    assert buttons == ["✅ Yes", "❌ No"]
 
 
 def test_handle_photo_nothing_readable(photo_env, monkeypatch):
@@ -224,7 +224,7 @@ def test_sim_photo_endpoint(photo_env, monkeypatch):
     data = r.json()
     assert data["findings"]["expiry"]["items"][0]["qty"] == 2
     assert "expired" in data["reply"]
-    assert data["buttons"] == ["Yes", "No"]
+    assert data["buttons"] == ["✅ Yes", "❌ No"]
 
 
 def test_sim_photo_404_when_live(photo_env, monkeypatch):

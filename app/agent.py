@@ -180,14 +180,132 @@ MENU_WORDS = {"menu", "hi", "hello", "hey", "imenyu"}
 
 MENU_ROWS = ["Sell", "Stock", "Who owes me", "Statements", "Reports",
              "Reminders", "Settings"]
-"""Main menu: each row is typed text the router already handles."""
+"""Main menu canonical ids: typed English the router already handles."""
+
+MENU_ITEMS = [("Sell", "menu_row_sell"), ("Stock", "menu_row_stock"),
+              ("Who owes me", "menu_row_owes"),
+              ("Statements", "menu_row_statements"),
+              ("Reports", "menu_row_reports"),
+              ("Reminders", "menu_row_reminders"),
+              ("Settings", "menu_row_settings")]
+"""Canonical id -> display-title i18n key (≤24 chars per language)."""
+
+
+def menu_display_rows() -> list[str]:
+    """Localized main-menu row titles for the wire (canonical ids stay put)."""
+    return [_t(key) for _, key in MENU_ITEMS]
 
 
 def show_menu(conn: sqlite3.Connection, shop_id: str) -> str:
     """Queue the main interactive list; the intro text is the reply."""
     _store_options(conn, shop_id, MENU_ROWS)
-    queue_list(shop_id, _t("menu_intro"), _t("menu_button"), MENU_ROWS)
+    queue_list(shop_id, _t("menu_intro"), _t("menu_button"),
+               menu_display_rows())
     return _t("menu_intro")
+
+
+def yes_no_buttons() -> list[str]:
+    """Localized ✅ Yes / ❌ No reply buttons (≤3, ≤20 chars)."""
+    return [_t("btn_yes"), _t("btn_no")]
+
+
+def after_statement_buttons() -> list[str]:
+    return [_t("btn_all_statements"), _t("btn_set_reminder"), _t("btn_menu")]
+
+
+def after_reminder_buttons() -> list[str]:
+    return [_t("btn_set_reminder"), _t("btn_menu")]
+
+
+def after_order_buttons() -> list[str]:
+    return [_t("btn_send_it"), _t("btn_menu")]
+
+
+def link_choice_buttons() -> list[str]:
+    return [_t("btn_link"), _t("btn_new")]
+
+
+_UI_CANONICAL: dict[str, str] | None = None
+
+
+def _ui_canonical_map() -> dict[str, str]:
+    """Localized button/row title -> canonical router phrase.
+
+    WhatsApp returns the tapped title verbatim, so a localized tap
+    ('Dayisa', '📤 Thumela') must reach the same router branch as the
+    typed English ('Sell', 'Send it'). Numbered fallback keeps working
+    because last-options stores the canonical ids.
+    """
+    global _UI_CANONICAL
+    if _UI_CANONICAL is not None:
+        return _UI_CANONICAL
+    from app.i18n import LANGS, STRINGS
+    pairs = ([(canon, key) for canon, key in MENU_ITEMS]
+             + [("All statements", "btn_all_statements"),
+                ("Set reminder", "btn_set_reminder"), ("Menu", "btn_menu"),
+                ("Send it", "btn_send_it"), ("link", "btn_link"),
+                ("new", "btn_new")])
+    table: dict[str, str] = {}
+    for lang in LANGS:
+        for canon, key in pairs:
+            shown = STRINGS.get(lang, {}).get(key, "")
+            if shown:
+                table[_normalize(shown)] = canon.lower()
+    for canon, _ in pairs:
+        table[_normalize(canon)] = canon.lower()
+    table[_normalize("Menu")] = "menu"
+    _UI_CANONICAL = table
+    return table
+
+
+def canonicalize_ui(text: str) -> str:
+    """Map a localized button/list tap back to its canonical phrase."""
+    hit = _ui_canonical_map().get(_normalize(text or ""))
+    if hit is None:
+        return text
+    if hit in ("link", "new", "menu"):
+        return hit
+    for canon in MENU_ROWS + ["All statements", "Set reminder", "Send it"]:
+        if canon.lower() == hit:
+            return canon
+    return text
+
+
+def _ui_word_set(*keys: str) -> set[str]:
+    """All normalized display words for the given button keys, all langs."""
+    from app.i18n import LANGS, STRINGS
+    out: set[str] = set()
+    for lang in LANGS:
+        for key in keys:
+            shown = STRINGS.get(lang, {}).get(key, "")
+            if shown:
+                out.add(_normalize(shown))
+    return out
+
+
+def is_link_word(word: str) -> bool:
+    return _normalize(word) in _ui_word_set("btn_link") | {"link", "same"}
+
+
+def is_new_word(word: str) -> bool:
+    return _normalize(word) in _ui_word_set("btn_new") | {"new"}
+
+
+def coerce_options(conn: sqlite3.Connection, shop_id: str, message: str,
+                    options: list[str] | None) -> tuple[str, list[str] | None]:
+    """Return interactive UI for options: ≤3 buttons, >3 a queued list.
+
+    The numbered fallback keeps working either way: last-options stores
+    the full option list while the wire shows buttons or a list.
+    """
+    if not options:
+        return message, None
+    if len(options) <= 3:
+        _store_options(conn, shop_id, options)
+        return message, list(options)
+    queue_list(shop_id, message, _t("menu_button"), options)
+    _store_options(conn, shop_id, options)
+    return message, None
 
 
 _OPTIONS_TTL = timedelta(minutes=10)
@@ -269,8 +387,10 @@ def _fresh_photo(shop_id: str) -> bytes | None:
     return image
 
 
-YES_WORDS = {"yes", "y", "yebo", "yeah", "ja", "ewe", "ok", "okay", "sharp", "shap", "sure"}
-NO_WORDS = {"no", "n", "nope", "cha", "hayi", "nee", "aowa"}
+YES_WORDS = {"yes", "y", "yebo", "yeah", "ja", "ewe", "ee", "eya",
+             "ok", "okay", "sharp", "shap", "sure", "yep", "yea", "aye"}
+NO_WORDS = {"no", "n", "nope", "cha", "hayi", "nee", "aowa", "tjhe",
+            "nnyaa", "nyaa", "aikona"}
 UNDO_WORDS = {"undo"}
 RESET_WORDS = {"demo reset", "reset demo"}
 NEW_LOGO_WORDS = {"redo logo", "fix logo", "new logo", "change logo",
@@ -300,8 +420,21 @@ def _set_message_lang(conn: sqlite3.Connection, shop_id: str,
     return code
 
 
+def _strip_ui_symbols(text: str) -> str:
+    """Drop emoji/symbol prefixes from interactive button titles.
+
+    WhatsApp returns the tapped title verbatim (e.g. '✅ Yes'); routing
+    matches the words, so symbols are noise. Letters, digits, spaces and
+    ordinary punctuation survive in every language.
+    """
+    return "".join(
+        ch for ch in (text or "")
+        if ch.isalnum() or ch in " ',.-?!/:") \
+        .strip()
+
+
 def _normalize(text: str) -> str:
-    word = " ".join(text.strip().lower().split())
+    word = " ".join(_strip_ui_symbols(text).lower().split())
     word = word.strip(" .!?,")
     changed = True
     while changed:
@@ -864,6 +997,7 @@ def _intent_hits(word: str) -> set[str]:
 _AFTER_STATEMENT = ["All statements", "Set reminder", "Menu"]
 _AFTER_REMINDERS = ["Set reminder", "Menu"]
 _AFTER_ORDER = ["Send it", "Menu"]
+"""Canonical English next-step ids (display titles are localized per turn)."""
 
 CANCEL_WORDS = {"cancel", "cancel that", "never mind", "nevermind",
                 "kanselleer", "kanselleer dit", "khansela", "ngiyayekisa",
@@ -1118,6 +1252,7 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str,
     """
     ensure_shop(conn, shop_id)
     text = _resolve_numbered(conn, shop_id, text)
+    text = canonicalize_ui(text)
     word = _normalize(text or "")
     if _STAFF_NAME.get() and (word in _STAFF_BLOCKED_EXACT
                               or word.startswith(_STAFF_BLOCKED_PREFIX)):
@@ -1158,19 +1293,19 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str,
         return set_float(conn, shop_id, _parse_float(word)), None
     managed = try_reminder_exact(conn, shop_id, text)
     if managed is not None:
-        return managed, _AFTER_REMINDERS
+        return managed, after_reminder_buttons()
     if not _looks_multi(text):
         multi_stmts = try_multi_statement_request(conn, shop_id, text)
         if multi_stmts is not None:
-            return multi_stmts, _AFTER_STATEMENT
+            return multi_stmts, after_statement_buttons()
         statement = try_statement_request(conn, shop_id, text)
         if statement is not None:
-            return statement, _AFTER_STATEMENT
+            return statement, after_statement_buttons()
         lookup = try_fast_lookup(conn, shop_id, text)
         if lookup is not None:
             return lookup, None
     if word in ORDER_WORDS:
-        return build_order(conn, shop_id), _AFTER_ORDER
+        return build_order(conn, shop_id), after_order_buttons()
     if word == "send it" or word.startswith("send it "):
         return send_order(conn, shop_id, word[7:].strip() or None), None
     if word == "use original logo":
@@ -1309,7 +1444,7 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str,
         if image is None:
             return _t("logo_howto"), None
         LAST_PHOTO.pop(shop_id, None)
-        return stage_shop_logo(conn, shop_id, image), ["Yes", "No"]
+        return stage_shop_logo(conn, shop_id, image), yes_no_buttons()
     priced = try_price_reply(conn, shop_id, text)
     if priced is not None:
         return priced, None
@@ -1330,7 +1465,7 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str,
     if get_clarify_context(conn, shop_id) is not None:
         resumed = try_order_plan(conn, shop_id, text, sent_at)
         if resumed is not None:
-            return resumed, ["Yes", "No"]
+            return resumed, yes_no_buttons()
     detail = try_reminder_detail(conn, shop_id, text)
     if detail is not None:
         return detail, None
@@ -1382,7 +1517,7 @@ def _interpret(conn: sqlite3.Connection, shop_id: str, text: str, sent_at):
             and _single_reminder(text):
         fb = try_reminder_command(conn, shop_id, text, sent_at)
         if fb is not None:
-            return fb, _AFTER_REMINDERS
+            return fb, after_reminder_buttons()
     bundle: dict = {"text": text, "sent_at": sent_at}
     ctx = get_clarify_context(conn, shop_id)
     if ctx is not None:  # follow-up answers reuse the stored photo
@@ -1590,7 +1725,7 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
         reply = stage_shop_logo(conn, shop_id, image or b"")
         save_turn(conn, shop_id, "user", "[logo photo]")
         save_turn(conn, shop_id, "assistant", reply)
-        buttons = ["Yes", "No"] \
+        buttons = yes_no_buttons() \
             if get_staged_logo(conn, shop_id) is not None else None
         if buttons:
             _store_options(conn, shop_id, buttons)
@@ -1608,7 +1743,7 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
         reply = stage_shop_logo(conn, shop_id, image or b"")
         save_turn(conn, shop_id, "user", "[logo photo]")
         save_turn(conn, shop_id, "assistant", reply)
-        buttons = ["Yes", "No"] \
+        buttons = yes_no_buttons() \
             if get_staged_logo(conn, shop_id) is not None else None
         if buttons:
             _store_options(conn, shop_id, buttons)
@@ -1654,12 +1789,12 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
         if had_logo_pending and not staged:
             reply = (_t("logo_req_dropped") + "\n\n") + reply
         if after is not None and after["action_type"] == "link_choice":
-            buttons = ["link", "new"]
+            buttons = link_choice_buttons()
         elif after is not None and after["action_type"] == "book_page" \
                 and _book_awaits(conn, shop_id):
             buttons = None  # which-one options go as tap buttons
         else:
-            buttons = ["Yes", "No"]
+            buttons = yes_no_buttons()
     elif not plan["tasks"] and plan.get("question"):
         save_clarify_context(conn, shop_id, digest, caption, doc)
     save_turn(conn, shop_id, "assistant", reply)
@@ -1809,17 +1944,19 @@ def handle_text(conn: sqlite3.Connection, shop_id: str, text: str,
     after_plan = get_plan(conn, shop_id)
     if after is not None and after["id"] != before_id:
         if after["action_type"] == "link_choice":
-            buttons = ["link", "new"]
+            buttons = link_choice_buttons()
         elif after["action_type"] == "book_page" \
                 and _book_awaits(conn, shop_id):
             buttons = None  # which-one options go as tap buttons
         else:
-            buttons = ["Yes", "No"]
+            buttons = yes_no_buttons()
     elif after_plan is not None and after_plan["plan_id"] != before_plan_id:
-        buttons = ["Yes", "No"]
+        buttons = yes_no_buttons()
     else:
         buttons = det_buttons
-    if buttons:
+    if buttons and len(buttons) > 3:
+        message, buttons = coerce_options(conn, shop_id, message, buttons)
+    elif buttons:
         _store_options(conn, shop_id, buttons)
     _offer_book_question(conn, shop_id)
     return _with_overview(conn, shop_id, before_books,
@@ -1861,7 +1998,7 @@ def _book_awaits(conn: sqlite3.Connection, shop_id: str) -> bool:
 
 
 def _offer_book_question(conn: sqlite3.Connection, shop_id: str) -> None:
-    """Queue tap buttons for the open which-one line, if any."""
+    """Queue tap buttons (≤3) or a list (>3) for the open which-one line."""
     pend = get_pending(conn, shop_id)
     if pend is None or pend["action_type"] != "book_page":
         return
@@ -1875,10 +2012,12 @@ def _offer_book_question(conn: sqlite3.Connection, shop_id: str) -> None:
         # numbers answer it instead of a dead button row.
         _store_options(conn, shop_id, [])
         return
-    queue_buttons(shop_id,
-                  _t("book_tap_answer", n=entry["line_no"],
-                     ex=_example_word(entry["options"])),
-                  labels)
+    body = _t("book_tap_answer", n=entry["line_no"],
+               ex=_example_word(entry["options"]))
+    if len(labels) > 3:
+        queue_list(shop_id, body, _t("menu_button"), labels)
+    else:
+        queue_buttons(shop_id, body, labels)
     _store_options(conn, shop_id, labels)
 
 
@@ -1988,7 +2127,7 @@ def try_deferred_link_resume(conn: sqlite3.Connection, shop_id: str,
     out = resume_deferred_link(conn, shop_id)
     if out is None:
         return None
-    return out, ["link", "new"]
+    return out, link_choice_buttons()
 
 
 def try_intake_reply(conn: sqlite3.Connection, shop_id: str,

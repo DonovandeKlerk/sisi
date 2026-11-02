@@ -376,7 +376,7 @@ def test_resend_live_preview_returns_buttons(shop_db):
     process_message(IncomingMessage("e2e-rs-1", SHOP, "text", "resend", ""))
     got = get_sender().pop_shop(SHOP)[-1]
     assert got["type"] == "buttons"  # live preview keeps working buttons
-    assert got["buttons"] == ["Yes", "No"]
+    assert got["buttons"] == ["✅ Yes", "❌ No"]
     assert "Reply Yes to save" in got["body"]
     assert "Albany Superior White Bread 700g" in got["body"]
     out = _send("Yes")[-1]  # the resent preview confirms normally

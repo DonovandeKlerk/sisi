@@ -255,10 +255,10 @@ def test_sender_429_raises_rate_limited(ib_env, monkeypatch):
 def test_buttons_fall_back_to_numbered_on_400(ib_env, monkeypatch):
     fake = _FakePost(script=[_http_error(400), _ok()])
     monkeypatch.setattr(infobip.httpx, "post", fake)
-    InfobipSender().send_buttons(SHOP, "Save?", ["Yes", "No"])
+    InfobipSender().send_buttons(SHOP, "Save?", ["✅ Yes", "❌ No"])
     assert len(fake.calls) == 2
     assert fake.calls[1]["url"].endswith("/whatsapp/1/message/text")
-    assert "1) Yes" in fake.calls[1]["json"]["content"]["text"]
+    assert "1) ✅ Yes" in fake.calls[1]["json"]["content"]["text"]
 
 
 def test_missing_config_names_the_var(monkeypatch):

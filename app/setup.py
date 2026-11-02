@@ -196,7 +196,7 @@ SETUP_BUTTONS = {
     5: ["Skip"],
     7: ["Yes", "Pick a time", "No"],
 }
-"""Tap buttons per step (≤3, ≤25 chars). Bare '1' taps resolve to these."""
+"""Canonical English tap buttons per step (display is localized per turn)."""
 SETUP_LIST_BUTTON = "Language"
 SETUP_LIST_ROWS = ["English", "isiZulu", "Afrikaans", "isiXhosa", "Sesotho",
                    "Setswana"]
@@ -204,10 +204,17 @@ SETUP_LIST_ROWS = ["English", "isiZulu", "Afrikaans", "isiXhosa", "Sesotho",
 
 
 def setup_buttons(step: int | None) -> list[str] | None:
-    """Button labels for a setup step, or None for free text / lists."""
+    """Localized button labels for a setup step (≤3, ≤20 chars each)."""
     if step is None:
         return None
-    return list(SETUP_BUTTONS[step]) if step in SETUP_BUTTONS else None
+    from app.i18n import t
+    if step in (2, 4, 5):
+        return [t("btn_skip")]
+    if step == 3:
+        return [t("btn_use_number")]
+    if step == 7:
+        return [t("btn_yes"), t("btn_pick_time"), t("btn_no")]
+    return None
 
 
 def setup_list(step: int | None):
@@ -224,7 +231,8 @@ def _answer(conn: sqlite3.Connection, shop_id: str, sender: str, text: str) -> s
     from app.tools import (set_float, set_shop_address, set_shop_name,
                            set_shop_phone, straight_quotes)
     step = setup_step(conn, shop_id) or 1
-    word = " ".join((text or "").strip().lower().split())
+    word = "".join(ch for ch in (text or "") if ch.isalnum() or ch in " ',.-?!/:").strip().lower()
+    word = " ".join(word.split())
     if word in BACK_WORDS:
         return _goto(conn, shop_id, max(1, step - 1))
     for prefix in CHANGE_PREFIXES:
@@ -236,11 +244,14 @@ def _answer(conn: sqlite3.Connection, shop_id: str, sender: str, text: str) -> s
             _set_flag(conn, shop_id, "setup-return", str(step))
             return _goto(conn, shop_id, target)
     m = re.match(r"\s*(\d{1,2})\s*[.)]?\s*$", text or "")
-    if m is not None and step in SETUP_BUTTONS:
-        idx = int(m.group(1)) - 1
-        if 0 <= idx < len(SETUP_BUTTONS[step]):
-            text = SETUP_BUTTONS[step][idx]
-            word = " ".join(text.strip().lower().split())
+    if m is not None:
+        btns = setup_buttons(step)
+        if btns is not None:
+            idx = int(m.group(1)) - 1
+            if 0 <= idx < len(btns):
+                text = btns[idx]
+                word = "".join(ch for ch in text if ch.isalnum() or ch in " ',.-?!/:").strip().lower()
+                word = " ".join(word.split())
     if step == 1:
         name = straight_quotes((text or "").strip())
         if not name or len(name) < 2:

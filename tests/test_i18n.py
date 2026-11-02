@@ -172,12 +172,14 @@ def test_owner_default_for_neutral_message(conn, shop):
     ("tn", "📋 *Lenane le legolo*"),
 ])
 def test_help_menu_per_language(conn, shop, lang, head):
-    from app.agent import LIST_OUTBOX, MENU_ROWS, take_lists
+    from app.agent import LIST_OUTBOX, MENU_ROWS, menu_display_rows, take_lists
     conn.execute("UPDATE shops SET language = ? WHERE shop_id = ?", (lang, SHOP))
     conn.commit()
     msg, _ = handle_text(conn, SHOP, "help")
     assert msg.startswith(head)
-    assert take_lists(SHOP)[0]["rows"] == MENU_ROWS
+    queued = take_lists(SHOP)
+    assert queued and queued[0]["rows"] == menu_display_rows()
+    assert len(queued[0]["rows"]) == 7
     assert SHOP not in LIST_OUTBOX
 
 
@@ -306,6 +308,12 @@ def test_isixhosa_voice_statement(conn, shop, ledger, monkeypatch):
 
 
 def test_afrikaans_voice_reminder(conn, shop, monkeypatch):
+    import app.interpreter as interp
+
+    def _no_model(messages):
+        raise RuntimeError("no live model in tests")
+
+    monkeypatch.setattr(interp, "propose_plan", _no_model)
     monkeypatch.setattr(agent, "transcribe_audio",
                         lambda *a, **k: "herinner my more 7vm om huur te betaal")
     _, reply, _ = handle_voice(conn, SHOP, b"fake-audio")

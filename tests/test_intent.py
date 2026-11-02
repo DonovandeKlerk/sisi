@@ -240,7 +240,7 @@ def test_14_sale_then_cash_up_creates_pending(conn, monkeypatch, tmp_path):
     msg, buttons = agent.handle_text(conn, SHOP, "sell 2 bread then cash up")
     assert calls["n"] == 1
     assert get_pending(conn, SHOP) is not None
-    assert buttons == ["Yes", "No"]
+    assert buttons == ["✅ Yes", "❌ No"]
     assert "R37.00" in msg  # 2 x R18.50 proposed
 
 

@@ -271,12 +271,14 @@ def test_partial_failure_keeps_good_task(conn, shop, sent, monkeypatch):
 
 
 def test_order_plan_preview_and_confirm(conn, shop, sent, monkeypatch):
+    conn.execute("UPDATE shops SET language = 'en' WHERE shop_id = ?", (SHOP,))
+    conn.commit()
     _script(monkeypatch, [_plan(
         [_t("order", {"customer": "Sipho",
                       "items": [{"product": "bread", "qty": 2}]},
             quote="Sipho: 2 bread")])])
     msg, buttons = agent.handle_text(conn, SHOP, "Sipho wants 2 bread", sent)
-    assert buttons == ["Yes", "No"]
+    assert buttons == ["✅ Yes", "❌ No"]
     assert "Sipho" in msg and _counts(conn)["task_plans"] == 1
     msg2, _ = agent.handle_text(conn, SHOP, "yes")
     assert _counts(conn)["task_plans"] == 1
@@ -291,7 +293,7 @@ def test_credit_sale_proposes_then_undo(conn, shop, sent, monkeypatch):
                        "items": [{"product": "Fresh Milk 1L", "qty": 2}]})])])
     before = _counts(conn)["credit_entries"]
     msg, buttons = agent.handle_text(conn, SHOP, "Sipho took 2 milk", sent)
-    assert buttons == ["Yes", "No"]
+    assert buttons == ["✅ Yes", "❌ No"]
     agent.handle_text(conn, SHOP, "yes")
     assert _counts(conn)["credit_entries"] == before + 1
     agent.handle_text(conn, SHOP, "undo")
@@ -312,6 +314,8 @@ def test_unknown_product_asks_price(conn, shop, sent, monkeypatch):
 
 
 def test_split_order_and_statement_fire_once(conn, shop, sent, monkeypatch):
+    conn.execute("UPDATE shops SET language = 'en' WHERE shop_id = ?", (SHOP,))
+    conn.commit()
     monkeypatch.setenv("SISI_PUBLIC_URL", "https://x.example")
     from app.agent import take_media
     _script(monkeypatch, [_plan(
@@ -322,7 +326,7 @@ def test_split_order_and_statement_fire_once(conn, shop, sent, monkeypatch):
         understood="order plus statement")])
     msg, buttons = agent.handle_text(
         conn, SHOP, "Sipho: 2 bread. Statement for Sipho.", sent)
-    assert buttons == ["Yes", "No"]
+    assert buttons == ["✅ Yes", "❌ No"]
     items = take_media(SHOP)
     assert [i["kind"] for i in items] == ["image", "file"]  # once, not twice
     agent.handle_text(conn, SHOP, "yes")

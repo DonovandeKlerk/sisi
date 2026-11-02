@@ -113,7 +113,7 @@ def test_offer_guards():
 
 def test_save_and_confirm_through_chat(conn):
     msg, buttons = handle_text(conn, SHOP, "remind me tomorrow 7am to pay rent")
-    assert buttons == ["Set reminder", "Menu"]
+    assert buttons == ["⏰ Set reminder", "📋 Menu"]
     assert msg.startswith("⏰ *Reminder set*")
     assert "pay rent" in msg and "07:00" in msg
     rows = conn.execute("SELECT * FROM reminders WHERE shop_id = ?",
@@ -151,7 +151,7 @@ def test_offer_yes_and_time_flows(conn, monkeypatch):
                         else orig(now))
     msg, buttons = handle_text(conn, SHOP,
                                "Sipho will pay on Friday")
-    assert buttons == ["Yes", "No"]
+    assert buttons == ["✅ Yes", "❌ No"]
     assert msg == "⏰ Want a reminder Friday at 07:00? Reply Yes or give a time."
     msg, _ = handle_text(conn, SHOP, "yes")
     assert msg.startswith("⏰ *Reminder set*")

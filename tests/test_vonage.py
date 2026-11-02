@@ -149,7 +149,7 @@ def test_sender_splits_long_replies(vg_env, monkeypatch):
 def test_sender_buttons_interactive_custom(vg_env, monkeypatch):
     fake = _FakePost()
     monkeypatch.setattr(vonage.httpx, "post", fake)
-    VonageSender().send_buttons(SHOP, "Save?", ["Yes", "No"])
+    VonageSender().send_buttons(SHOP, "Save?", ["✅ Yes", "❌ No"])
     assert len(fake.calls) == 1
     payload = fake.calls[0]["json"]
     assert payload["message_type"] == "custom"
@@ -157,8 +157,8 @@ def test_sender_buttons_interactive_custom(vg_env, monkeypatch):
     assert node["type"] == "button"
     assert node["body"]["text"] == "Save?"
     replies = [b["reply"] for b in node["action"]["buttons"]]
-    assert [(r["id"], r["title"]) for r in replies] == [("Yes", "Yes"),
-                                                         ("No", "No")]
+    assert [(r["id"], r["title"]) for r in replies] == [
+        ("✅ Yes", "✅ Yes"), ("❌ No", "❌ No")]
 
 
 def test_sender_logs_status_without_secrets(vg_env, monkeypatch, caplog):
@@ -326,7 +326,7 @@ def test_vonage_image_end_to_end(vg_env, monkeypatch):
     node = payload["custom"]["interactive"]
     assert "• 2 × Fresh Milk 1L 30 Oct — expired" in node["body"]["text"]
     replies = [b["reply"]["title"] for b in node["action"]["buttons"]]
-    assert replies == ["Yes", "No"]
+    assert replies == ["✅ Yes", "❌ No"]
 
 
 def _vg_flat_payload(message_type: str, mid: str = "vg-real-1", **extra) -> dict:

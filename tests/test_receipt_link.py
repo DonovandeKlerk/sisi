@@ -257,7 +257,7 @@ def test_link_choice_reask_and_cancel(conn, shop):
     for word in ("maybe", "yes", "no"):
         msg, btns = agent.handle_text(conn, SHOP, word)
         assert "Reply *link*" in msg  # anything else re-asks
-        assert btns == ["link", "new"]
+        assert btns == ["🔗 Link", "🆕 New"]
         assert get_pending(conn, SHOP)["action_type"] == "link_choice"
     msg, _ = agent.handle_text(conn, SHOP, "cancel")
     assert get_pending(conn, SHOP) is None  # cancel drops

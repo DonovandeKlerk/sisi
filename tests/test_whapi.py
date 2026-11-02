@@ -337,10 +337,10 @@ def test_send_buttons_shape_and_limits(wh_env, monkeypatch):
 def test_send_buttons_fallback_and_429(wh_env, monkeypatch):
     fake = _FakePost(script=[_http_error(400), _ok()])
     monkeypatch.setattr(whapi.httpx, "post", fake)
-    WhapiSender().send_buttons(SHOP, "Save it?", ["Yes", "No"])
+    WhapiSender().send_buttons(SHOP, "Save it?", ["✅ Yes", "❌ No"])
     assert len(fake.calls) == 2
     assert fake.calls[1]["url"].endswith("/messages/text")
-    assert "1) Yes" in fake.calls[1]["json"]["body"]
+    assert "1) ✅ Yes" in fake.calls[1]["json"]["body"]
 
     fake = _FakePost(script=[_http_error(429)] * 4)
     monkeypatch.setattr(whapi.httpx, "post", fake)

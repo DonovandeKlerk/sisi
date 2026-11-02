@@ -121,6 +121,8 @@ def overview_data(conn: sqlite3.Connection, shop_id: str) -> dict:
         "card_n": card["n"],
         "book_cents": book,
         "pay_cents": pay,
+        # Cash in hand = cash sales + payments (card listed separately;
+        # it never sits in the till).
         "takings_cents": cash["s"] + pay,
         "sales_cents": cash["s"] + card["s"] + book,
         "debt_total": sum(d["cents"] for d in debtors),
@@ -173,11 +175,29 @@ def initials_badge_path(shop_id: str, name: str) -> str:
     return path
 
 
+def _runout_phrase(days_left: int) -> str:
+    """Plain-language run-out timing in the current language."""
+    n = int(days_left)
+    if n <= 0:
+        return _t("ov_runout_today")
+    if n == 1:
+        return _t("ov_runout_tomorrow")
+    return _t("ov_runout_days", n=n)
+
+
 def render_overview_png(data: dict, brand: dict, path: str) -> str:
-    """Cream paper, green header with logo/badge, big readable numbers."""
+    """Cream paper, green header with logo/badge, big readable numbers.
+
+    Canvas height grows with content so the debtor / stock lines never
+    collide with the Updated/Generated footer (even with 4 low items
+    and a debtor line).
+    """
     from PIL import Image, ImageDraw
-    W, H = 1080, 1600
-    img = Image.new("RGB", (W, H), reports._hex(reports.SISI["paper"]))  # noqa: SLF001
+    W, MIN_H = 1080, 1600
+    FOOTER_SPACE = 170  # reserved band under the last content line
+    paper = reports._hex(reports.SISI["paper"])  # noqa: SLF001
+    # Tall scratch canvas; cropped to the final height at the end.
+    img = Image.new("RGB", (W, MIN_H + 800), paper)
     y = reports._png_brand_header(img, brand, _t("ov_title"), data["day"])
     dr = ImageDraw.Draw(img)
     f_big = reports._card_font(72, bold=True)
@@ -218,7 +238,7 @@ def render_overview_png(data: dict, brand: dict, path: str) -> str:
     y += 78
     if data["low"]:
         for item in data["low"][:4]:
-            label = f"• {item['name']} — {_t('ov_days', n=item['days_left'])}"
+            label = f"• {item['name']} — {_runout_phrase(item['days_left'])}"
             dr.text((60, y), label[:46], font=f_small, fill=ink)
             y += 58
     else:
@@ -243,14 +263,21 @@ def render_overview_png(data: dict, brand: dict, path: str) -> str:
     elif not data["debt_total"]:
         dr.text((60, y), "🎉 " + _t("ov_ok_owed"), font=f_small, fill=ink)
         y += 58
-    y = max(y + 30, H - 190)
-    dr.text((60, H - 150), _t("ov_updated", time=data["hm"]),
+    # Content ends at y; footer sits in a reserved band below it. Grow
+    # the canvas when that would exceed the minimum height.
+    content_bottom = y + 30
+    final_h = max(MIN_H, content_bottom + FOOTER_SPACE)
+    if final_h != img.height:
+        cropped = Image.new("RGB", (W, final_h), paper)
+        cropped.paste(img.crop((0, 0, W, min(img.height, final_h))), (0, 0))
+        img = cropped
+        dr = ImageDraw.Draw(img)
+    dr.text((60, final_h - 110), _t("ov_updated", time=data["hm"]),
             font=f_small, fill=muted)
-    dr.text((60, H - 96), _t("doc_footer"), font=f_small, fill=muted)
+    dr.text((60, final_h - 56), _t("doc_footer"), font=f_small, fill=muted)
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     img.save(path, "PNG")
     return path
-
 
 def overview_text(data: dict) -> str:
     """Short text standing for when the image itself fails to render."""

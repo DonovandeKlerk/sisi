@@ -77,7 +77,7 @@ def test_multipage_statement(conn, ledger, tmp_path):
 
 def test_statement_owner_only_forward(conn, ledger):
     msg, buttons = handle_text(conn, SHOP, "statement for Sipho")
-    assert buttons == ["All statements", "Set reminder", "Menu"]
+    assert buttons == ["📄 All statements", "⏰ Set reminder", "📋 Menu"]
     assert "Forward this to Sipho" in msg
     assert "R50.00" in msg
     media = take_media(SHOP)

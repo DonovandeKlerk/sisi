@@ -307,7 +307,7 @@ def test_statement_defers_until_credit_confirmed(conn, _follow_shop, monkeypatch
     assert "I'll send that once you confirm" in msg
     assert "Outstanding" not in msg  # statement held back, not rendered stale
     assert take_media(SHOP) == []  # no card queued either
-    assert buttons == ["Yes", "No"]
+    assert buttons == ["✅ Yes", "❌ No"]
     assert _pending_payload(conn)["plan_followups"] == [
         {"kind": "statement", "args": {"customer": "Sipho"}}]
     assert MEDIA_OUTBOX == {}

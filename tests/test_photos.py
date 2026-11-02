@@ -102,7 +102,7 @@ def test_duplicate_photo_detected_after_save(conn, monkeypatch):
                                         "quote": ""}],
                              "question": None, "options": []})
     _, first, buttons = handle_photo(conn, SHOP, b"same-bytes")
-    assert buttons == ["Yes", "No"]
+    assert buttons == ["✅ Yes", "❌ No"]
     handle_text(conn, SHOP, "Yes")
     _, second, _ = handle_photo(conn, SHOP, b"same-bytes")
     assert "already saved" in second and "restock" in second  # ask first

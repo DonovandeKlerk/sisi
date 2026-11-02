@@ -76,7 +76,7 @@ def test_new_preview_gets_yes_no_buttons(conn, monkeypatch):
                                   {"product": "Coke 2L", "qty": 1}]},
                               "quote": "Sipho took a Coke"}])
     msg, buttons = handle_text(conn, SHOP, "Sipho took a Coke")
-    assert buttons == ["Yes", "No"]
+    assert buttons == ["✅ Yes", "❌ No"]
     msg, buttons = handle_text(conn, SHOP, "yes")
     assert buttons is None and "Saved" in msg
 

@@ -221,7 +221,7 @@ def test_plan_step_pick_a_time_button(conn):
     _at_step(conn, SHOP, 7)
     msg, buttons = handle_text(conn, SHOP, "Pick a time")
     assert "What time" in msg and setup_step(conn, SHOP) == 7
-    assert buttons == ["Yes", "Pick a time", "No"]
+    assert buttons == ["✅ Yes", "🕐 Pick a time", "❌ No"]
     msg, _ = handle_text(conn, SHOP, "half past five")
     assert msg.startswith("✅")  # unclear twice: default 06:00, move on
     assert setup_step(conn, SHOP) is None
@@ -240,13 +240,13 @@ def test_step_buttons_and_language_list(conn):
     msg, buttons = handle_text(conn, SHOP, "hi")
     assert buttons is None  # step 1 is free text
     _, buttons = handle_text(conn, SHOP, "Kwamama")
-    assert buttons == ["Skip"]  # step 2
+    assert buttons == ["⏭ Skip"]  # step 2
     _, buttons = handle_text(conn, SHOP, "1")
-    assert buttons == ["Yes, use this number"]  # step 3, tap resolved
+    assert buttons == ["📞 Yes, use number"]  # step 3, tap resolved
     _, buttons = handle_text(conn, SHOP, "yes")
-    assert buttons == ["Skip"]  # step 4
+    assert buttons == ["⏭ Skip"]  # step 4
     _, buttons = handle_text(conn, SHOP, "skip")
-    assert buttons == ["Skip"]  # step 5
+    assert buttons == ["⏭ Skip"]  # step 5
     msg, buttons = handle_text(conn, SHOP, "skip")
     assert buttons is None  # step 6 arrives as a list
     lists = take_lists(SHOP)
@@ -255,7 +255,7 @@ def test_step_buttons_and_language_list(conn):
     assert lists[0]["rows"] == ["English", "isiZulu", "Afrikaans", "isiXhosa", "Sesotho", "Setswana"]
     msg, buttons = handle_text(conn, SHOP, "2")
     assert "Isinyathelo 7 kwezi-7" in msg  # digit fallback -> isiZulu
-    assert buttons == ["Yes", "Pick a time", "No"]
+    assert buttons == ["✅ Yebo", "🕐 Khetha isikhathi", "❌ Cha"]
 
 
 @pytest.mark.parametrize("step,bad", [

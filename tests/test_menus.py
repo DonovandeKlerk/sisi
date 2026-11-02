@@ -152,7 +152,8 @@ def test_help_words_open_menu(conn, word):
     _use_english(conn)
     msg, _ = agent.handle_text(conn, SHOP, word)
     assert "📋" in msg
-    assert LIST_OUTBOX[SHOP][0]["rows"] == MENU_ROWS
+    assert LIST_OUTBOX[SHOP][0]["rows"] == agent.menu_display_rows()
+    assert len(LIST_OUTBOX[SHOP][0]["rows"]) == 7
 
 
 def test_demo_help_keeps_full_text(conn):
@@ -240,7 +241,7 @@ def test_stale_options_leave_digit_alone(conn, monkeypatch, tmp_path):
 
 def test_digits_stay_data_during_setup(conn):
     agent.handle_text(conn, FRESH, "hi")
-    agent._store_options(conn, FRESH, ["Yes", "No"])
+    agent._store_options(conn, FRESH, ["✅ Yes", "❌ No"])
     assert agent._resolve_numbered(conn, FRESH, "5") == "5"
     msg, _ = agent.handle_text(conn, FRESH, "5")
     assert "Step 1" in msg  # still answering step 1, not a tap
@@ -251,7 +252,7 @@ def test_digit_kept_for_reminder_offer(conn):
     from app.tools import propose_reminder_offer
     propose_reminder_offer(conn, SHOP, "2026-10-29T05:30:00",
                            "Take order to the shop")
-    agent._store_options(conn, SHOP, ["Yes", "No"])
+    agent._store_options(conn, SHOP, ["✅ Yes", "❌ No"])
     assert agent._resolve_numbered(conn, SHOP, "6") == "6"
 
 
@@ -260,30 +261,30 @@ def test_digit_kept_for_reminder_offer(conn):
 def test_buttons_custom_payload_shape(vg, monkeypatch):
     fake = _ScriptPost([_ok()])
     monkeypatch.setattr(vonage.httpx, "post", fake)
-    VonageSender().send_buttons(SHOP, "Save?", ["Yes", "No"])
+    VonageSender().send_buttons(SHOP, "Save?", ["✅ Yes", "❌ No"])
     payload = fake.calls[0]["json"]
     assert payload["message_type"] == "custom"
     assert payload["channel"] == "whatsapp"
     node = payload["custom"]["interactive"]
     assert node["type"] == "button"
-    assert [b["reply"]["title"] for b in node["action"]["buttons"]] == ["Yes", "No"]
+    assert [b["reply"]["title"] for b in node["action"]["buttons"]] == ["✅ Yes", "❌ No"]
 
 
 def test_buttons_fall_back_to_numbered_on_400(vg, monkeypatch):
     fake = _ScriptPost([_http_error(400), _ok()])
     monkeypatch.setattr(vonage.httpx, "post", fake)
-    VonageSender().send_buttons(SHOP, "Save?", ["Yes", "No"])
+    VonageSender().send_buttons(SHOP, "Save?", ["✅ Yes", "❌ No"])
     assert len(fake.calls) == 2
     fallback = fake.calls[1]["json"]
     assert fallback["message_type"] == "text"
-    assert "1) Yes" in fallback["text"] and "2) No" in fallback["text"]
+    assert "1) ✅ Yes" in fallback["text"] and "2) ❌ No" in fallback["text"]
 
 
 def test_buttons_reraise_rate_limited_without_fallback(vg, monkeypatch):
     fake = _ScriptPost([_http_error(429)])
     monkeypatch.setattr(vonage.httpx, "post", fake)
     with pytest.raises(RateLimited):
-        VonageSender().send_buttons(SHOP, "Save?", ["Yes", "No"])
+        VonageSender().send_buttons(SHOP, "Save?", ["✅ Yes", "❌ No"])
     assert len(fake.calls) == 1  # queued for retry, no fallback text
 
 
@@ -318,21 +319,24 @@ def test_numbered_skips_body_with_numbers():
 
 def test_statement_returns_next_step_buttons(conn):
     seed_demo(SHOP, conn)
+    _use_english(conn)
     msg, buttons = agent.handle_text(conn, SHOP, "statement for Sipho")
     assert "Sipho" in msg
-    assert buttons == ["All statements", "Set reminder", "Menu"]
+    assert buttons == ["📄 All statements", "⏰ Set reminder", "📋 Menu"]
 
 
 def test_reminders_return_next_step_buttons(conn):
     seed_demo(SHOP, conn)
+    _use_english(conn)
     _, buttons = agent.handle_text(conn, SHOP, "my reminders")
-    assert buttons == ["Set reminder", "Menu"]
+    assert buttons == ["⏰ Set reminder", "📋 Menu"]
 
 
 def test_order_returns_next_step_buttons(conn):
     seed_demo(SHOP, conn)
+    _use_english(conn)
     _, buttons = agent.handle_text(conn, SHOP, "order stock")
-    assert buttons == ["Send it", "Menu"]
+    assert buttons == ["📤 Send it", "📋 Menu"]
 
 
 def test_button_tap_matches_typed_text(conn):
@@ -403,6 +407,14 @@ def test_process_message_delivers_menu_list(monkeypatch, tmp_path):
     monkeypatch.setenv("SISI_DB", str(tmp_path / "m.db"))
     reset_fake()
     seed_demo(SHOP)
+    conn = db.connect()
+    try:
+        db.init_db(conn)
+        conn.execute("UPDATE shops SET language = 'en' WHERE shop_id = ?",
+                     (SHOP,))
+        conn.commit()
+    finally:
+        conn.close()
     main.process_message(IncomingMessage("mid-menu", SHOP, "text", "menu",
                                          ""))
     sent = get_sender().pop_shop(SHOP)
@@ -478,3 +490,122 @@ def test_voice_composite_routes_to_planner(conn, monkeypatch, tmp_path):
     assert calls["n"] == 1
     assert reply.startswith("Heard:")
     assert "Jabu" in reply and "R120.00" in reply
+
+
+# native interactive buttons/lists, localized ---------------------------------
+
+def test_yes_no_buttons_have_emoji_and_fit_cap(conn):
+    seed_demo(SHOP, conn)
+    _use_english(conn)
+    agent.handle_text(conn, SHOP, "my reminders")
+    assert agent.yes_no_buttons() == ["✅ Yes", "❌ No"]
+    assert all(len(b) <= 20 for b in agent.yes_no_buttons())
+
+
+def test_yes_no_buttons_localized_all_langs(conn):
+    from app.i18n import CURRENT_LANG, LANGS, STRINGS
+    seed_demo(SHOP, conn)
+    seen = set()
+    for lang in LANGS:
+        CURRENT_LANG.set(lang)
+        pair = tuple(agent.yes_no_buttons())
+        assert pair == (STRINGS[lang]["btn_yes"], STRINGS[lang]["btn_no"])
+        assert all(len(b) <= 20 for b in pair)
+        seen.add(pair)
+    assert len(seen) == 6  # every language has its own titles
+
+
+def test_menu_rows_localized_all_langs(conn):
+    from app.i18n import CURRENT_LANG, LANGS, STRINGS
+    seed_demo(SHOP, conn)
+    for lang in LANGS:
+        CURRENT_LANG.set(lang)
+        rows = agent.menu_display_rows()
+        assert len(rows) == 7
+        assert all(len(r) <= 24 for r in rows)
+        assert rows == [STRINGS[lang][f"menu_row_{k}"] for k in
+                        ("sell", "stock", "owes", "statements", "reports",
+                         "reminders", "settings")]
+    CURRENT_LANG.set("en")
+
+
+def test_emoji_yes_tap_confirms_pending(conn, monkeypatch, tmp_path):
+    seed_demo(SHOP, conn)
+    _use_english(conn)
+    calls = _stub(monkeypatch, tmp_path, [_plan_body(
+        [{"kind": "sale",
+          "args": {"items": [{"product": "Sasko White Bread 700g",
+                               "qty": 2}]},
+          "quote": "sell 2 bread"}])])
+    agent.handle_text(conn, SHOP, "sell 2 bread then cash up")
+    assert calls["n"] == 1
+    from app.tools import get_pending
+    msg, _ = agent.handle_text(conn, SHOP, "✅ Yes")
+    assert get_pending(conn, SHOP) is None
+    assert msg.strip()
+
+
+def test_localized_menu_tap_reaches_router(conn, monkeypatch, tmp_path):
+    seed_demo(SHOP, conn)
+    _use_english(conn)
+    heard = []
+    import app.interpreter as interp
+
+    def fake(messages):
+        user = [m["content"] for m in messages
+                if isinstance(m, dict) and m.get("role") == "user"][-1]
+        heard.append(user.split("\n")[1])
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content=json.dumps(_chat_reply("ok"))))],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1,
+                                  total_tokens=2),
+        )
+
+    monkeypatch.setattr(llm, "TOKEN_LOG", tmp_path / "usage.log")
+    monkeypatch.setattr(interp, "propose_plan", fake)
+    agent.handle_text(conn, SHOP, "menu")
+    assert agent.canonicalize_ui("Dayisa") == "Sell"
+    # a localized row tap reaches the planner as the canonical English
+    agent.handle_text(conn, SHOP, "Dayisa")
+    assert heard[-1] == "Sell"
+
+
+def test_localized_after_button_tap_maps_to_canonical():
+    assert agent.canonicalize_ui("📤 Thumela") == "Send it"
+    assert agent.canonicalize_ui("📋 Imenyu") == "menu"
+    assert agent.canonicalize_ui("🔗 Xhumanisa") == "link"
+    assert agent.canonicalize_ui("🆕 Entsha") == "new"
+
+
+def test_many_options_become_list_not_buttons(conn):
+    seed_demo(SHOP, conn)
+    _use_english(conn)
+    # the planner caps at 3 options; longer choice lists (book which-one,
+    # clarify with many candidates) ride a queued list instead of buttons
+    msg, buttons = agent.coerce_options(
+        conn, SHOP, "Which one?", ["A", "B", "C", "D", "E"])
+    assert buttons is None  # >3 options ride a queued list instead
+    assert agent.LIST_OUTBOX[SHOP]
+    assert agent.LIST_OUTBOX[SHOP][0]["rows"] == ["A", "B", "C", "D", "E"]
+    assert "Which one?" in msg
+    # numbered fallback still resolves against the stored list
+    assert agent._resolve_numbered(conn, SHOP, "4") == "D"
+    msg2, buttons2 = agent.coerce_options(conn, SHOP, "Which?", ["A", "B"])
+    assert buttons2 == ["A", "B"]
+    assert agent._resolve_numbered(conn, SHOP, "2") == "B"
+    assert msg2 == "Which?"
+
+
+def test_few_options_stay_buttons(conn, monkeypatch, tmp_path):
+    seed_demo(SHOP, conn)
+    _use_english(conn)
+    calls = _stub(monkeypatch, tmp_path, [
+        _plan_body([], question="Which bread?",
+                   options=["White", "Brown"]),
+    ])
+    msg, buttons = agent.handle_text(conn, SHOP, "sell")
+    assert calls["n"] == 1
+    assert buttons == ["White", "Brown"]
+    assert SHOP not in agent.LIST_OUTBOX
+    assert "Which bread?" in msg

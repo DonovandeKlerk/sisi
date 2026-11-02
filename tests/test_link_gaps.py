@@ -153,7 +153,7 @@ def test_defer_resume_nudge_roundtrip(conn):
     assert _deferred(conn) is not None  # the question waited
     msg, btns = agent.handle_text(conn, SHOP, "resume")
     assert_format(msg)
-    assert "Reply *link*" in msg and btns == ["link", "new"]
+    assert "Reply *link*" in msg and btns == ["🔗 Link", "🆕 New"]
     assert get_pending(conn, SHOP)["action_type"] == "link_choice"
     assert _deferred(conn) is None
     msg, _ = agent.handle_text(conn, SHOP, "link")
@@ -209,7 +209,7 @@ def test_resume_beats_guided_resume(conn):
     msg, _ = agent.handle_text(conn, SHOP, "pause")
     assert "Paused" in msg
     msg, btns = agent.handle_text(conn, SHOP, "resume")
-    assert "Reply *link*" in msg and btns == ["link", "new"]
+    assert "Reply *link*" in msg and btns == ["🔗 Link", "🆕 New"]
     assert get_pending(conn, SHOP)["action_type"] == "link_choice"
     msg, _ = agent.handle_text(conn, SHOP, "cancel")
     assert get_pending(conn, SHOP) is None

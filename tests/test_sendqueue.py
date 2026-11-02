@@ -50,7 +50,7 @@ def _queued(conn, to=SHOP):
 def test_order_and_pacing(conn, clock):
     ensure_shop(conn, SHOP)
     sender = FakeSender()
-    enqueue(conn, SHOP, "vonage", "buttons", {"body": "Save?", "buttons": ["Yes", "No"]})
+    enqueue(conn, SHOP, "vonage", "buttons", {"body": "Save?", "buttons": ["✅ Yes", "❌ No"]})
     enqueue(conn, SHOP, "vonage", "text", {"body": "second"})
     enqueue(conn, SHOP, "vonage", "image", {"url": "https://x/y.png", "caption": "pic"})
     stats = drain(conn, SHOP, sender, clock=clock, sleep=clock.sleep)

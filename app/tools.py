@@ -7589,7 +7589,8 @@ def answer_link_choice(conn: sqlite3.Connection, shop_id: str,
 
     Returns (message, buttons), or None when no link_choice is pending.
     """
-    from app.agent import CANCEL_WORDS, _normalize
+    from app.agent import (CANCEL_WORDS, _normalize, is_link_word,
+                             is_new_word, link_choice_buttons)
     pend = get_pending(conn, shop_id)
     if pend is None or pend["action_type"] != "link_choice":
         return None
@@ -7603,18 +7604,18 @@ def answer_link_choice(conn: sqlite3.Connection, shop_id: str,
         return _t("not_saved"), None
     direction = payload.get("direction")
     handler = None
-    if word in ("link", "same"):
+    if is_link_word(text or ""):
         if direction == "photo_receipt":
             handler = _link_choice_link_receipt
         elif direction in ("receipt_photo_guided", "receipt_photo_oneshot"):
             handler = _link_choice_link_photo
-    elif word == "new":
+    elif is_new_word(text or ""):
         if direction == "photo_receipt":
             handler = _link_choice_new_receipt
         elif direction in ("receipt_photo_guided", "receipt_photo_oneshot"):
             handler = _link_choice_new_photo
     if handler is None:
-        return _link_choice_ask(payload), ["link", "new"]
+        return _link_choice_ask(payload), link_choice_buttons()
     # Answered: settle the choice BEFORE proposing, so the follow-up
     # preview never pauses (defers) the question it just answered.
     conn.execute("UPDATE pending_actions SET status = 'confirmed',"
@@ -8454,7 +8455,8 @@ def resend_recovery(conn: sqlite3.Connection,
             return resend_last_media(conn, shop_id), None
     pend = get_pending(conn, shop_id)
     if pend is not None and pend["action_type"] == "stock_intake_item":
-        return pend["preview_text"], ["Yes", "No"]
+        from app.agent import yes_no_buttons
+        return pend["preview_text"], yes_no_buttons()
     session = get_intake_session(conn, shop_id)
     if session is not None and (session.get("status") or "active") == "active":
         items = session.get("items_json") or []

@@ -137,10 +137,10 @@ def test_fake_sender_is_default_and_records():
     sender = get_sender()
     assert isinstance(sender, FakeSender)
     sender.send_text(SHOP, "hi")
-    sender.send_buttons(SHOP, "save?", ["Yes", "No"])
+    sender.send_buttons(SHOP, "save?", ["✅ Yes", "❌ No"])
     mine = sender.pop_shop(SHOP)
     assert [m["type"] for m in mine] == ["text", "buttons"]
-    assert mine[1]["buttons"] == ["Yes", "No"]
+    assert mine[1]["buttons"] == ["✅ Yes", "❌ No"]
     assert sender.pop_shop(SHOP) == []
 
 
@@ -241,7 +241,7 @@ def test_simulated_credit_conversation(sim_env, monkeypatch):
     assert r1.status_code == 200 and r1.json() == {"status": "ok"}
     out1 = client.get("/_sim/outbox", params={"shop": SHOP}).json()["messages"]
     assert len(out1) == 1 and out1[0]["type"] == "buttons"
-    assert out1[0]["buttons"] == ["Yes", "No"]
+    assert out1[0]["buttons"] == ["✅ Yes", "❌ No"]
     assert "R73.00" in out1[0]["body"]
 
     r2 = _post_text(client, "Yes", "wamid.2")

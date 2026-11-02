@@ -108,5 +108,5 @@ def test_staff_sale_via_handle_text(conn, shop, monkeypatch):
 
     monkeypatch.setattr(interp, "propose_plan", fake)
     msg, buttons = handle_text(conn, STAFF, "sold 1 bread")
-    assert buttons == ["Yes", "No"]
+    assert buttons == ["✅ Yes", "❌ No"]
     assert get_pending(conn, OWNER) is not None  # owner's shop

@@ -170,7 +170,7 @@ def test_order_caption_beats_stale_legacy_logo_flag(conn, shop, monkeypatch):
     _doc, reply, buttons = handle_photo(conn, SHOP, _photo_bytes(), CAPTION)
     assert "🧾 *Customer order*" in reply
     assert "New logo?" not in reply
-    assert buttons == ["Yes", "No"]
+    assert buttons == ["✅ Yes", "❌ No"]
     assert conn.execute("SELECT logo_path FROM shops WHERE shop_id = ?",
                         (SHOP,)).fetchone()["logo_path"] == ""
     assert conn.execute("SELECT value FROM flags WHERE shop_id = ?"
@@ -204,7 +204,7 @@ def test_logo_words_without_photo_tasks_still_stage(conn, shop, monkeypatch):
     _mock_vision(monkeypatch, {"doc_type": "other"})
     _doc, reply, buttons = handle_photo(conn, SHOP, _photo_bytes(), "logo")
     assert "New logo?" in reply
-    assert buttons == ["Yes", "No"]
+    assert buttons == ["✅ Yes", "❌ No"]
 
 
 # --- order extraction ---------------------------------------------------------
@@ -282,7 +282,7 @@ def test_reminder_to_order_stays_a_reminder(conn, shop):
 
 def _confirm_example(conn):
     msg, buttons = handle_text(conn, SHOP, CAPTION)
-    assert buttons == ["Yes", "No"]
+    assert buttons == ["✅ Yes", "❌ No"]
     assert "🧾 *Customer order*" in msg
     assert "⏰ *Reminder*" in msg
     assert "🧍 *Customer summaries*" in msg
@@ -357,7 +357,7 @@ def test_expired_plan_can_be_redone(conn, shop):
     assert conn.execute("SELECT COUNT(*) n FROM reminders WHERE shop_id = ?",
                         (SHOP,)).fetchone()["n"] == 0
     msg, buttons = handle_text(conn, SHOP, CAPTION)
-    assert buttons == ["Yes", "No"]
+    assert buttons == ["✅ Yes", "❌ No"]
     assert "Customer order" in msg
 
 
@@ -425,7 +425,7 @@ def test_vision_book_lines_feed_order(conn, shop, monkeypatch):
                                         "Sipho's Thursday order")
     assert "🧾 *Customer order*" in reply
     assert "L1 Sipho: 2 × Bread = R36.00" in reply
-    assert buttons == ["Yes", "No"]
+    assert buttons == ["✅ Yes", "❌ No"]
 
 
 def test_ambiguous_order_asks_without_losing_photo(conn, shop, monkeypatch):
@@ -458,7 +458,7 @@ def test_book_photo_plus_reminder_caption_does_both(conn, shop, monkeypatch):
     assert get_pending(conn, SHOP) is not None  # book preview kept
     assert conn.execute("SELECT COUNT(*) n FROM reminders WHERE shop_id = ?",
                         (SHOP,)).fetchone()["n"] == 1
-    assert buttons == ["Yes", "No"]
+    assert buttons == ["✅ Yes", "❌ No"]
 
 
 def test_reminder_caption_without_order_saves_directly(conn, shop, monkeypatch):
@@ -698,7 +698,7 @@ def test_text_answer_resumes_clarified_photo(conn, shop, monkeypatch):
     handle_photo(conn, SHOP, photo, "my order")
     msg, buttons = handle_text(conn, SHOP, "Sipho: 2 bread")
     assert "🧾 *Customer order*" in msg
-    assert buttons == ["Yes", "No"]
+    assert buttons == ["✅ Yes", "❌ No"]
     plan = get_plan(conn, SHOP)
     assert plan["photo_digest"] == hashlib.sha256(photo).hexdigest()
     assert conn.execute("SELECT COUNT(*) n FROM clarify_context"

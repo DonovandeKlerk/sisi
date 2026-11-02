@@ -65,7 +65,7 @@ def test_logo_caption_upload_stages_until_yes(conn):
     ensure_shop(conn, SHOP, "Logo Spaza")
     _, reply, buttons = handle_photo(conn, SHOP, _photo_bytes(), "logo")
     assert "New logo?" in reply
-    assert buttons == ["Yes", "No"]
+    assert buttons == ["✅ Yes", "❌ No"]
     assert reports.shop_brand(conn, SHOP)["logo"] == ""  # live logo untouched
     msg, _ = handle_text(conn, SHOP, "yes")
     assert "Logo updated" in msg
@@ -100,7 +100,7 @@ def test_new_logo_pending_next_image_is_logo(conn, monkeypatch):
                         " AND key = 'logo-pending'", (SHOP,)).fetchone()
     _, reply, buttons = handle_photo(conn, SHOP, _photo_bytes())  # no caption
     assert "New logo?" in reply
-    assert buttons == ["Yes", "No"]
+    assert buttons == ["✅ Yes", "❌ No"]
     assert reports.shop_brand(conn, SHOP)["logo"] == ""  # staged, not live
     assert conn.execute("SELECT value FROM flags WHERE shop_id = ?"
                         " AND key = 'logo-pending'", (SHOP,)).fetchone() is None

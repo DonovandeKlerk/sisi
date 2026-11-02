@@ -245,7 +245,7 @@ def test_pack_price_reply_sets_pack_and_derives_single(conn):
     _seed_units(conn)
     record_sale(conn, SHOP, "Sweets", 1, unit="box")
     preview, buttons = handle_text(conn, SHOP, "box R60")
-    assert buttons == ["Yes", "No"]
+    assert buttons == ["✅ Yes", "❌ No"]
     assert "• 1 × Sweets box (50 units) @ R60.00 = R60.00" in preview
     row = conn.execute("SELECT price_cents, pack_price_cents FROM products"
                        " WHERE shop_id = ? AND name = 'Sweets'", (SHOP,)).fetchone()
