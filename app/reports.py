@@ -1359,12 +1359,46 @@ def build_funding_pack(conn, shop_id: str, base_url: str = "") -> tuple[str, lis
 
 # ---------------------------------------------------------------- PNG card
 
-def _card_font(size: int):
+def _vera_path(name: str) -> str:
+    """ReportLab's bundled Bitstream Vera face (DejaVu's predecessor).
+
+    ReportLab ships with Sisi's requirements, so Vera is the reliable
+    cross-machine fallback when the OS has neither DejaVu (Modal
+    apt-installs fonts-dejavu-core) nor Helvetica/Arial. Vera covers the
+    Latin scripts all six Sisi languages use.
+    """
+    try:
+        import reportlab
+    except ImportError:
+        return ""
+    return str(Path(reportlab.__file__).resolve().parent / "fonts" / name)
+
+
+def _card_font(size: int, bold: bool = False):
+    """A real scalable font for card rendering, never the tiny bitmap.
+
+    Order: DejaVu (Modal + most Linux), then the ReportLab-bundled Vera
+    faces, then macOS/Windows system faces. Bold falls back to the
+    regular face when no bold file exists on the machine, so African
+    language text always stays large and readable.
+    """
     from PIL import ImageFont
-    for path in ("/System/Library/Fonts/Helvetica.ttc",
-                 "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                 "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-                 "C:/Windows/Fonts/arial.ttf"):
+    regular = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        _vera_path("Vera.ttf"),
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+    ]
+    candidates = ([p for name in ("DejaVuSans-Bold.ttf",)
+                   for p in ("/usr/share/fonts/truetype/dejavu/" + name,
+                             "/usr/share/fonts/dejavu/" + name)]
+                  + [_vera_path("VeraBd.ttf")]
+                  + regular) if bold else regular
+    for path in candidates:
+        if not path:
+            continue
         try:
             return ImageFont.truetype(path, size)
         except OSError:

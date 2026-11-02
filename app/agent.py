@@ -11,7 +11,7 @@ import sqlite3
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 
-from app import reports
+from app import overview, reports
 from app.db import read_only, today_str
 from app.i18n import (CURRENT_LANG, NAMES, STRINGS, detect, normalize_lang,
                       owner_lang, t as _t)
@@ -1669,10 +1669,60 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
     return doc, reply, buttons
 
 
+def _with_overview(conn: sqlite3.Connection, shop_id: str,
+                   before_fp, before_media_n: int, message: str) -> str:
+    """Append the post-task overview (image + menu) when books just changed.
+
+    Fires only on a real ledger change with no open proposal: no pending
+    Yes/No, no plan, no staged logo, no clarify context, no which-one book
+    question, no awaited price/reminder, no active guided-intake session,
+    and setup finished. Turns that already queued their own media
+    (statements, order cards, …) keep exactly that media: one image per
+    task, no spam. Reads (cash-up, who-owes, statements, …) leave the
+    fingerprint untouched. Never raises and never breaks the task reply.
+    """
+    try:
+        from app.orders import get_clarify_context as _clarify
+        if needs_setup(conn, shop_id) or setup_step(conn, shop_id) is not None:
+            return message
+        if get_pending(conn, shop_id) is not None:
+            return message
+        if get_plan(conn, shop_id) is not None:
+            return message
+        if get_staged_logo(conn, shop_id) is not None:
+            return message
+        if _clarify(conn, shop_id) is not None:
+            return message
+        if _book_awaits(conn, shop_id):
+            return message
+        if get_await_price(conn, shop_id) is not None:
+            return message
+        if get_await_reminder(conn, shop_id) is not None:
+            return message
+        if get_intake_session(conn, shop_id) is not None:
+            return message
+        if len(MEDIA_OUTBOX.get(shop_id, [])) != before_media_n:
+            return message
+        after_fp = overview.books_fingerprint(conn, shop_id)
+        if before_fp is None or after_fp is None or after_fp == before_fp:
+            return message
+        fallback = overview.queue_overview_and_menu(conn, shop_id)
+        return message + ("\n\n" + fallback if fallback else "")
+    except Exception:
+        log.warning("overview gate failed", exc_info=True)
+        return message
+
+
 def handle_text(conn: sqlite3.Connection, shop_id: str, text: str,
                 sent_at=None):
     shop_id, staff = _enter(conn, shop_id)
     ensure_shop(conn, shop_id)
+    try:
+        before_books = overview.books_fingerprint(conn, shop_id)
+    except Exception:
+        log.warning("overview snapshot failed", exc_info=True)
+        before_books = None
+    before_media_n = len(MEDIA_OUTBOX.get(shop_id, []))
     if staff is None and needs_setup(conn, shop_id):
         # Setup answers are data (names, numbers, yes), not language
         # signals; the step-6 language answer is authoritative.
@@ -1686,38 +1736,46 @@ def handle_text(conn: sqlite3.Connection, shop_id: str, text: str,
                             or word0 in RESET_WORDS
                             or needs_setup(conn, shop_id)):
             # Testing mode: setup and resets would (re)write the shop.
-            return _t("whapi_readonly"), None
+            return _with_overview(conn, shop_id, before_books,
+                                  before_media_n,
+                                  _t("whapi_readonly")), None
         if word0 == "setup":
             message = start_setup(conn, shop_id)
             save_turn(conn, shop_id, "user", text)
             save_turn(conn, shop_id, "assistant", message)
-            return message, None
+            return _with_overview(conn, shop_id, before_books,
+                                  before_media_n, message), None
         if word0 == "reset shop":
             message = reset_shop(conn, shop_id)
             save_turn(conn, shop_id, "user", text)
             save_turn(conn, shop_id, "assistant", message)
-            return message, None
+            return _with_overview(conn, shop_id, before_books,
+                                  before_media_n, message), None
         if word0 == "yes erase everything":
             message = confirm_reset_shop(conn, shop_id)
             save_turn(conn, shop_id, "user", text)
             save_turn(conn, shop_id, "assistant", message)
-            return message, None
+            return _with_overview(conn, shop_id, before_books,
+                                  before_media_n, message), None
         if word0 in RESET_WORDS:
             message = demo_reset(conn, shop_id)
             save_turn(conn, shop_id, "user", text)
             save_turn(conn, shop_id, "assistant", message)
-            return message, None
+            return _with_overview(conn, shop_id, before_books,
+                                  before_media_n, message), None
         if word0 in HELP_WORDS:
             if word0 != "demo help" and not needs_setup(conn, shop_id):
                 message = show_menu(conn, shop_id)
                 save_turn(conn, shop_id, "user", text)
                 save_turn(conn, shop_id, "assistant", message)
-                return message, None
+                return _with_overview(conn, shop_id, before_books,
+                                      before_media_n, message), None
             if not read_only():
                 mark_paused(conn, shop_id)
             save_turn(conn, shop_id, "user", text)
             save_turn(conn, shop_id, "assistant", _t("help_menu"))
-            return _t("help_menu"), None
+            return _with_overview(conn, shop_id, before_books,
+                                  before_media_n, _t("help_menu")), None
         if needs_setup(conn, shop_id):
             if setup_step(conn, shop_id) is None:
                 message = start_setup(conn, shop_id)
@@ -1731,11 +1789,13 @@ def handle_text(conn: sqlite3.Connection, shop_id: str, text: str,
                 button_text, rows = lst
                 queue_list(shop_id, message, button_text, rows)
                 _store_options(conn, shop_id, rows)
-                return message, None
+                return _with_overview(conn, shop_id, before_books,
+                                      before_media_n, message), None
             buttons = setup_buttons(step)
             if buttons:
                 _store_options(conn, shop_id, buttons)
-            return message, buttons
+            return _with_overview(conn, shop_id, before_books,
+                                  before_media_n, message), buttons
     before = get_pending(conn, shop_id)
     before_id = before["id"] if before else None
     before_plan = get_plan(conn, shop_id)
@@ -1762,7 +1822,8 @@ def handle_text(conn: sqlite3.Connection, shop_id: str, text: str,
     if buttons:
         _store_options(conn, shop_id, buttons)
     _offer_book_question(conn, shop_id)
-    return message, buttons
+    return _with_overview(conn, shop_id, before_books,
+                          before_media_n, message), buttons
 
 
 def _maybe_first_offer(conn: sqlite3.Connection, shop_id: str, message: str) -> str:
