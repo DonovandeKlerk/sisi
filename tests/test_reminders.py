@@ -10,11 +10,13 @@ from app.reminders import (
     advance,
     cancel_numbered,
     detect_context,
+    extract_time,
     list_reminders,
     move_numbered,
     now_sast,
     offer_preview,
     offer_scan,
+    parse_bare_time,
     parse_request,
     save_reminder,
     send_due,
@@ -275,3 +277,27 @@ def test_customer_context(conn):
     send_due(conn, datetime(2026, 10, 27, 7, 1))
     queued = conn.execute("SELECT payload_json FROM send_queue").fetchone()
     assert "Sipho owes R40.00" in queued["payload_json"]
+
+
+@pytest.mark.parametrize("text,want", [
+    ("6", (6, 0)), ("06", (6, 0)), ("6:00", (6, 0)), ("06:00", (6, 0)),
+    ("5:30", (5, 30)), ("6am", (6, 0)), ("6 am", (6, 0)), ("6pm", (18, 0)),
+    ("18h00", (18, 0)), ("6h30", (6, 30)), ("6h", (6, 0)),
+    ("yes 6", (6, 0)), ("yes 06:00", (6, 0)), ("yes, 06:00", (6, 0)),
+    ("yes! 5:30?", (5, 30)), ("yebo 6am", (6, 0)), ("ja, 18h00", (18, 0)),
+    ("at 17:30 please", (17, 30)),
+])
+def test_extract_time_lenient(text, want):
+    assert extract_time(text) == want
+
+
+@pytest.mark.parametrize("text", ["yes", "no", "skip", "pick a time", "",
+                                  "half past five", "morning"])
+def test_extract_time_none_without_digits(text):
+    assert extract_time(text) is None
+
+
+def test_parse_bare_time_accepts_h_format():
+    assert parse_bare_time("18h00") == (18, 0)
+    assert parse_bare_time("6h30") == (6, 30)
+    assert parse_bare_time("yes 6") is None  # combos need extract_time

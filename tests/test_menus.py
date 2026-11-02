@@ -178,10 +178,20 @@ def test_menu_intro_follows_owner_language(conn):
 def test_numbered_tap_resolves_to_row_text(conn, monkeypatch, tmp_path):
     seed_demo(SHOP, conn)
     agent.handle_text(conn, SHOP, "menu")
-    calls = _stub(monkeypatch, tmp_path, [_chat_reply("debtors here")])
+    calls = _stub(monkeypatch, tmp_path, [_chat_reply("stock here")])
+    msg, _ = agent.handle_text(conn, SHOP, "2")
+    assert _user_texts(calls)[-1].split("\n")[1] == "Stock"
+    assert msg == "stock here"
+
+
+def test_numbered_debtors_tap_answered_fast(conn, monkeypatch, tmp_path):
+    seed_demo(SHOP, conn)
+    _use_english(conn)
+    agent.handle_text(conn, SHOP, "menu")
+    calls = _stub(monkeypatch, tmp_path, [_chat_reply("must not be called")])
     msg, _ = agent.handle_text(conn, SHOP, "3")
-    assert _user_texts(calls)[-1].split("\n")[1] == "Who owes me"
-    assert msg == "debtors here"
+    assert calls["n"] == 0  # "Who owes me" skips the planner
+    assert "On the book" in msg
 
 
 def test_numbered_yes_confirms_pending(conn, monkeypatch, tmp_path):
@@ -424,8 +434,10 @@ def test_every_row_tap_reaches_router_as_typed(conn, monkeypatch, tmp_path):
     for i, row in enumerate(MENU_ROWS, 1):
         agent.handle_text(conn, SHOP, "menu")
         agent.handle_text(conn, SHOP, str(i))
-    # "Reminders" is a keyword (no planner call); the rest arrive verbatim.
-    assert heard == [r for r in MENU_ROWS if r != "Reminders"]
+    # "Reminders" is a keyword and "Who owes me" is a fast lookup
+    # (no planner calls); the rest arrive verbatim.
+    assert heard == [r for r in MENU_ROWS
+                     if r not in ("Reminders", "Who owes me")]
 
 
 def test_unmatched_message_carries_shop_context(conn, monkeypatch, tmp_path):

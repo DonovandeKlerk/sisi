@@ -107,3 +107,68 @@ def test_demo_help_lists_every_command(conn):
                  "cash-up", "low stock", "restock", "expiry photo", "compliance",
                  "scam", "delete my data", "undo"]:
         assert word in msg.lower(), word
+
+
+def _no_planner(monkeypatch):
+    import app.interpreter as interp
+
+    def boom(messages):
+        raise AssertionError("planner must not be called")
+
+    monkeypatch.setattr(interp, "propose_plan", boom)
+
+
+def test_fast_social_skips_planner(conn, monkeypatch):
+    from app.setup import skip_setup
+    from app.tools import ensure_shop
+    ensure_shop(conn, SHOP)
+    skip_setup(conn, SHOP)
+    _no_planner(monkeypatch)
+    msg, _ = handle_text(conn, SHOP, "good morning")
+    assert "Main menu" in msg
+    msg, _ = handle_text(conn, SHOP, "how are you")
+    assert "👋" in msg
+    msg, _ = handle_text(conn, SHOP, "thanks")
+    assert "👍" in msg
+    msg, _ = handle_text(conn, SHOP, "thanks sisi")
+    assert "👋" in msg  # filler strips to the bare name: greeted, not planned
+
+
+def test_fast_lookups_skip_planner(conn, monkeypatch):
+    seed_demo(SHOP, conn)
+    _no_planner(monkeypatch)
+    msg, _ = handle_text(conn, SHOP, "who owes me")
+    assert "On the book" in msg and "Sipho" in msg
+    msg, _ = handle_text(conn, SHOP, "How much does Sipho owe?")
+    assert msg == "💳 *Sipho* owes R73.00."
+    msg, _ = handle_text(conn, SHOP, "cash in hand")
+    assert msg.startswith("💰 *Cash*")
+    msg, _ = handle_text(conn, SHOP, "stock list")
+    assert "stock on hand" in msg
+    msg, _ = handle_text(conn, SHOP, "low stock")
+    assert "Low stock" in msg or "Nothing is running low" in msg
+
+
+def test_fast_lookup_yields_to_multi_intent(conn, monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    import app.interpreter as interp
+    seed_demo(SHOP, conn)
+    calls = {"n": 0}
+
+    def fake(messages):
+        calls["n"] += 1
+        body = {"understood": "ok",
+                "tasks": [{"kind": "debtors", "args": {}, "quote": ""}],
+                "question": None, "options": []}
+        return SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content=json.dumps(body)))],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1,
+                                  total_tokens=2))
+
+    monkeypatch.setattr(interp, "propose_plan", fake)
+    msg, _ = handle_text(conn, SHOP, "who owes me most and remind them")
+    assert calls["n"] == 1  # composite still reaches the planner
+    assert "On the book" in msg

@@ -339,7 +339,8 @@ class CloudApiSender(WhatsAppSender):
             return False
         try:
             self._post({"messaging_product": "whatsapp", "status": "read",
-                        "message_id": message_id})
+                        "message_id": message_id,
+                        "typing_indicator": {"type": "text"}})
             return True
         except Exception:
             log.warning("meta mark-read failed", exc_info=True)

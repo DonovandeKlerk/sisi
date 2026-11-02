@@ -403,6 +403,7 @@ STRINGS["en"].update({
     "setup_lang_invalid": "Reply English, isiZulu, Afrikaans or isiXhosa.\n\n{prompt}",
     "setup_plan": "{head}\n☀️ Daily plan every morning at 06:00? Reply Yes, a time, or No.",
     "setup_plan_invalid": "Reply Yes, a time like '5:30', or No.\n\n{prompt}",
+    "setup_plan_time_q": "What time should I send it? e.g. 5:30.\n\n{prompt}",
     "setup_resume": "Let's finish setting up, step {n} of {total} {emoji}\n\n{body}",
     "setup_which": "Which part? Say 'change name', 'address', 'phone', 'logo', 'float', 'language' or 'plan'.\n\n{prompt}",
     "setup_skipped": "⚠️ Skipped step {n} — let's keep going.\n\n{next}",
@@ -887,6 +888,7 @@ STRINGS["zu"].update({
     "setup_lang_invalid": "Phendula English, isiZulu, Afrikaans noma isiXhosa.\n\n{prompt}",
     "setup_plan": "{head}\n☀️ Icebo lansuku zonke njalo ekuseni ngo-06:00? Phendula ngo-Yes, isikhathi, noma ngo-No.",
     "setup_plan_invalid": "Phendula ngo-Yes, isikhathi esinje '5:30', noma ngo-No.\n\n{prompt}",
+    "setup_plan_time_q": "Ngilithumele ngasiphi isikhathi? isib. 5:30.\n\n{prompt}",
     "setup_resume": "Ake siqedele ukusetha, isinyathelo {n} kwezi-{total} {emoji}\n\n{body}",
     "setup_which": "Ikuphi? Yithi 'change name', 'address', 'phone', 'logo', 'float', 'language' noma 'plan'.\n\n{prompt}",
     "setup_skipped": "⚠️ Isinyathelo {n} seqile — masiqhubeke.\n\n{next}",
@@ -1371,6 +1373,7 @@ STRINGS["af"].update({
     "setup_lang_invalid": "Antwoord English, isiZulu, Afrikaans of isiXhosa.\n\n{prompt}",
     "setup_plan": "{head}\n☀️ Dagplan elke oggend om 06:00? Antwoord Yes, 'n tyd, of No.",
     "setup_plan_invalid": "Antwoord Yes, 'n tyd soos '5:30', of No.\n\n{prompt}",
+    "setup_plan_time_q": "Hoe laat moet ek dit stuur? bv. 5:30.\n\n{prompt}",
     "setup_resume": "Kom ons maak die opstelling klaar, stap {n} van {total} {emoji}\n\n{body}",
     "setup_which": "Watter deel? Sê 'change name', 'address', 'phone', 'logo', 'float', 'language' of 'plan'.\n\n{prompt}",
     "setup_skipped": "⚠️ Stap {n} oorgeslaan — kom ons gaan aan.\n\n{next}",
@@ -1855,6 +1858,7 @@ STRINGS["xh"].update({
     "setup_lang_invalid": "Phendula English, isiZulu, Afrikaans okanye isiXhosa.\n\n{prompt}",
     "setup_plan": "{head}\n☀️ Icebo lemihla ngemihla qho kusasa ngo-06:00? Phendula ngo-Yes, ixesha, okanye ngo-No.",
     "setup_plan_invalid": "Phendula ngo-Yes, ixesha elinje '5:30', okanye ngo-No.\n\n{prompt}",
+    "setup_plan_time_q": "Mandilithumele ngabani ixesha? umz. 5:30.\n\n{prompt}",
     "setup_resume": "Masiqukumbele ukuseta, inyathelo {n} kwezi-{total} {emoji}\n\n{body}",
     "setup_which": "Yeyiphi? Yithi 'change name', 'address', 'phone', 'logo', 'float', 'language' okanye 'plan'.\n\n{prompt}",
     "setup_skipped": "⚠️ Inyathelo {n} litsityiwe — masiqhube.\n\n{next}",
@@ -2641,6 +2645,8 @@ STRINGS["en"].update({
     "ag_first_offer": ("\n\n\U0001f4ca It's the 1st \u2014 reply 'month-end report'"
                        " for your {month} books."),
     "ag_lang_ok": "\U0001f5e3\ufe0f *Sharp, I'll speak {lang}.*",
+    "ag_thanks": "👍 Pleasure! Send your next sale, stock or question.",
+    "ag_hello": "👋 Hello! Tell me what you need, or tap Menu.",
     "ag_lang_unknown": ("\u2753 Which language? Reply English, isiZulu,"
                         " Afrikaans or isiXhosa."),
     "ag_cust_lang_ok": "\u2705 *{name}'s statements will be in {lang}.*",
@@ -2682,6 +2688,8 @@ STRINGS["zu"].update({
     "ag_first_offer": ("\n\n\U0001f4ca Usuku lokuqala \u2014 phendula uthi 'month-end report'"
                        " ukuze uthole amabhuku akho ka-{month}."),
     "ag_lang_ok": "\U0001f5e3\ufe0f *Kulungile, ngizokhuluma {lang}.*",
+    "ag_thanks": "👍 Ngiyajabula! Thumela okuthengisile, isitoko noma umbuzo.",
+    "ag_hello": "👋 Sawubona! Ngitshele okudingayo, noma ucofe Imenyu.",
     "ag_lang_unknown": ("\u2753 Yiliphi ulimi? Phendula uthi English, isiZulu,"
                         " Afrikaans noma isiXhosa."),
     "ag_cust_lang_ok": "\u2705 *Izitatimende zika-{name} zizoba ngolimi {lang}.*",
@@ -2723,6 +2731,8 @@ STRINGS["af"].update({
     "ag_first_offer": ("\n\n\U0001f4ca Dis die 1ste \u2014 antwoord 'month-end report'"
                        " vir jou {month}-boeke."),
     "ag_lang_ok": "\U0001f5e3\ufe0f *Reg so, ek praat nou {lang}.*",
+    "ag_thanks": "👍 Plesier! Stuur jou volgende verkoop, voorraad of vraag.",
+    "ag_hello": "👋 Hallo! Sê wat jy nodig het, of tik Menu.",
     "ag_lang_unknown": ("\u2753 Watter taal? Antwoord English, isiZulu,"
                         " Afrikaans of isiXhosa."),
     "ag_cust_lang_ok": "\u2705 *{name} se state sal in {lang} wees.*",
@@ -2764,6 +2774,8 @@ STRINGS["xh"].update({
     "ag_first_offer": ("\n\n\U0001f4ca Ngowoku-1 \u2014 phendula uthi 'month-end report'"
                        " ukuze ufumane iincwadi zakho zika-{month}."),
     "ag_lang_ok": "\U0001f5e3\ufe0f *Kulungile, ndizothetha {lang}.*",
+    "ag_thanks": "👍 Ndiyavuya! Thumela intengiso, isitokhwe okanye umbuzo.",
+    "ag_hello": "👋 Molo! Ndixelele into oyifunayo, okanye ucofe Imenyu.",
     "ag_lang_unknown": ("\u2753 Lulwimi luni? Phendula uthi English, isiZulu,"
                         " Afrikaans okanye isiXhosa."),
     "ag_cust_lang_ok": "\u2705 *Iistatimenti zika-{name} zizoba ngolwimi {lang}.*",

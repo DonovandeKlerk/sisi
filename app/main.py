@@ -100,7 +100,7 @@ async def webhook_receive(request: Request, background_tasks: BackgroundTasks):
     msgs = parse_webhook(payload)
     statuses = parse_statuses(payload)
     if statuses:
-        _apply_dlrs(statuses)
+        background_tasks.add_task(_apply_dlrs, statuses)
     if not msgs and not statuses:
         log.warning("meta inbound dropped: no messages keys=%s",
                     sorted(payload.keys()) if isinstance(payload, dict) else "?")
@@ -108,11 +108,9 @@ async def webhook_receive(request: Request, background_tasks: BackgroundTasks):
         if _rate_limited(msg.shop_id):
             log.warning("rate-limited %s", msg.shop_id)
             continue
-        try:
-            get_sender().mark_read(msg.message_id)
-        except Exception:
-            log.warning("mark-read failed", exc_info=True)
-        _dispatch(background_tasks, msg)
+        background_tasks.add_task(_ack_inbound, msg.channel or "meta",
+                                  msg.message_id, msg.shop_id)
+        await _dispatch(background_tasks, msg)
     return {"status": "ok"}
 
 
@@ -137,16 +135,39 @@ def _apply_dlrs(reports: list[tuple[str, str, str]]) -> None:
         log.warning("dlr batch failed", exc_info=True)
 
 
-def _dispatch(background_tasks: BackgroundTasks, msg: IncomingMessage) -> None:
+def _ack_inbound(channel: str, message_id: str, shop_id: str) -> None:
+    """Read receipt + typing indicator. Best-effort, runs after the 200."""
+    try:
+        sender_for_channel(channel or "meta").mark_read(message_id)
+    except Exception:
+        log.warning("mark-read failed", exc_info=True)
+    if (channel or "meta") == "whapi":
+        try:
+            from app.whapi import WhapiSender
+            WhapiSender().send_presence(shop_id)
+        except Exception:
+            log.warning("presence failed", exc_info=True)
+
+
+async def _dispatch(background_tasks: BackgroundTasks,
+                    msg: IncomingMessage) -> None:
     """Run handle-now in a spawned Modal worker on Modal, else a background task.
 
     Either way the webhook returns 200 instantly; slow work (vision, voice,
-    reports) never blocks the receipt.
+    reports) never blocks the receipt. The spawn never blocks the event
+    loop: async spawn when the SDK offers it, else a worker thread.
     """
     if os.environ.get("SISI_SPAWN") == "1":
         try:
+            import asyncio
             import modal
-            modal.Function.from_name("sisi", "worker").spawn(msg.__dict__)
+            fn = modal.Function.from_name("sisi", "worker")
+            spawn_aio = getattr(getattr(fn, "spawn", None), "aio", None)
+            if callable(spawn_aio):
+                await spawn_aio(msg.__dict__)
+            else:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, fn.spawn, msg.__dict__)
             return
         except Exception:
             log.warning("modal spawn failed; using background task", exc_info=True)
@@ -175,16 +196,15 @@ async def webhook_vonage_receive(request: Request, background_tasks: BackgroundT
         if _rate_limited(msg.shop_id):
             log.warning("rate-limited %s", msg.shop_id)
             continue
-        try:
-            VonageSender().mark_read(msg.message_id)
-        except Exception:
-            log.warning("mark-read failed", exc_info=True)
-        _dispatch(background_tasks, msg)
+        background_tasks.add_task(_ack_inbound, msg.channel or "vonage",
+                                  msg.message_id, msg.shop_id)
+        await _dispatch(background_tasks, msg)
     return {"status": "ok"}
 
 
 @app.post("/webhook/vonage/status")
-async def webhook_vonage_status(request: Request):
+async def webhook_vonage_status(request: Request,
+                                background_tasks: BackgroundTasks):
     """Vonage delivery receipts -> reminder states. Always 200."""
     try:
         payload = json.loads(await request.body() or b"{}")
@@ -193,7 +213,7 @@ async def webhook_vonage_status(request: Request):
     try:
         reports = parse_vonage_status(payload)
         if reports:
-            _apply_dlrs(reports)
+            background_tasks.add_task(_apply_dlrs, reports)
     except Exception:
         log.warning("vonage status parse failed", exc_info=True)
     return {"status": "ok"}
@@ -219,7 +239,8 @@ def parse_vonage_status(payload: dict) -> list[tuple[str, str, str]]:
 
 
 @app.post("/webhook/infobip/dlr")
-async def webhook_infobip_dlr(request: Request):
+async def webhook_infobip_dlr(request: Request,
+                              background_tasks: BackgroundTasks):
     """Delivery reports: logged for ops, always 200 (never retry-triggering).
 
     Declared before the token route below so /dlr is not swallowed by {token}.
@@ -252,7 +273,7 @@ async def webhook_infobip_dlr(request: Request):
                         if isinstance(status, dict) else ""
                     reports.append((mid, "failed", desc or str(name or "failed")))
         if reports:
-            _apply_dlrs(reports)
+            background_tasks.add_task(_apply_dlrs, reports)
     except Exception:
         log.warning("infobip dlr parse failed", exc_info=True)
     return {"status": "ok"}
@@ -292,11 +313,9 @@ async def webhook_infobip_receive(request: Request,
         if _rate_limited(msg.shop_id):
             log.warning("rate-limited %s", msg.shop_id)
             continue
-        try:
-            InfobipSender().mark_read(msg.message_id)
-        except Exception:
-            log.warning("mark-read failed", exc_info=True)
-        _dispatch(background_tasks, msg)
+        background_tasks.add_task(_ack_inbound, msg.channel or "infobip",
+                                  msg.message_id, msg.shop_id)
+        await _dispatch(background_tasks, msg)
     return {"status": "ok"}
 
 
@@ -327,7 +346,7 @@ async def webhook_whapi_receive(request: Request,
     try:
         reports = parse_whapi_status(payload)
         if reports:
-            _apply_dlrs(reports)
+            background_tasks.add_task(_apply_dlrs, reports)
     except Exception:
         log.warning("whapi status parse failed", exc_info=True)
     msgs = parse_whapi_webhook(payload)
@@ -340,8 +359,10 @@ async def webhook_whapi_receive(request: Request,
         if _rate_limited(msg.shop_id):
             log.warning("rate-limited %s", msg.shop_id)
             continue
-        # No mark_read: Whapi documents no read-receipt endpoint.
-        _dispatch(background_tasks, msg)
+        # Typing indicator goes out with the 200; the reply follows.
+        background_tasks.add_task(_ack_inbound, msg.channel or "whapi",
+                                  msg.message_id, msg.shop_id)
+        await _dispatch(background_tasks, msg)
     return {"status": "ok"}
 
 

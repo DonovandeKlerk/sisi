@@ -19,6 +19,8 @@ from app.setup import (
     answer as setup_answer,
     mark_paused,
     needs_setup,
+    setup_buttons,
+    setup_list,
     setup_step,
     start_setup,
 )
@@ -523,6 +525,91 @@ _QUESTION_STARTS = ("how ", "what ", "when ", "who ", "which ", "why ",
                     "ngubani", "nini", "yini", "kanjani",
                     "hoeveel", "wat ", "wanneer", "wie ", "hoekom", "kan ",
                     "yintoni", "kutheni", "yimalini", "ndinga")
+
+_GREET_WORDS = {"good morning", "good afternoon", "good evening", "morning",
+                "afternoon", "evening", "sawubona", "sanibona", "molo",
+                "molweni", "dumela", "dumelang", "heita", "howzit", "ave"}
+"""Longer greetings answered with the menu, never the planner."""
+_SOCIAL_WORDS = {"how are you", "how are u", "how r u", "how are things",
+                 "unjan", "unjani", "kunjani", "kunjan", "hoe gaan dit",
+                 "hoe gaan", "how is it going", "sisi"}
+_THANKS_WORDS = {"thanks", "thank you", "thx", "ta", "ngiyabonga", "dankie",
+                 "enkosi", "cool", "great", "bye", "bye bye", "cheers",
+                 "goodbye", "good night", "goodnight", "all good",
+                 "all sharp", "pleasure"}
+_WHO_OWES_WORDS = {"who owes me", "who owes", "who owes money", "debtors",
+                   "show debtors", "list debtors", "owe me", "bakweletani",
+                   "wie skuld my", "ngubani okweletayo"}
+_CASH_WORDS = {"cash", "cash in hand", "how much cash", "till balance",
+               "cash balances", "show cash", "money in till", "how much money",
+               "imali", "kontant", "mali", "how much is in the till",
+               "what is in the till"}
+_STOCK_WORDS = {"stock list", "list stock", "show stock", "show my stock",
+                "what is in stock", "whats in stock", "what's in stock",
+                "stock on hand", "isitokwe", "voorraad", "my stock"}
+_LOW_WORDS = {"low stock", "running low", "what is low", "whats low",
+              "what's low", "out of stock", "what ran out", "what is short"}
+_PAY_WORDS = ("paid", "payment", "paying", "khokha", "betaal", "hlawula",
+              "settled", "ibhadalile")
+
+
+def try_fast_social(conn: sqlite3.Connection, shop_id: str, word: str):
+    """Greetings, small talk and thanks without the planner.
+
+    Returns (message, buttons) or None. Thanks also releases a
+    reminder that was waiting on its topic (same as before).
+    """
+    if word in _GREET_WORDS:
+        return show_menu(conn, shop_id), None
+    for greet in ("hi ", "hello ", "hey "):
+        if word.startswith(greet):
+            rest = word[len(greet):].strip()
+            if rest in ("", "sisi", "there") \
+                    or (len(rest) <= 12 and not _intent_hits(rest)):
+                return show_menu(conn, shop_id), None
+            return None
+    if word in _SOCIAL_WORDS:
+        return _t("ag_hello"), None
+    if word in _THANKS_WORDS:
+        if get_await_reminder(conn, shop_id) is not None:
+            clear_await_reminder(conn, shop_id)
+        return _t("ag_thanks"), None
+    return None
+
+
+def try_fast_lookup(conn: sqlite3.Connection, shop_id: str, text: str):
+    """Single-intent read-only lookups without the planner.
+
+    Call only when not _looks_multi: composites ('who owes me most and
+    remind them') must still reach the planner. Returns reply or None.
+    """
+    word = _normalize(text or "")
+    if word in _WHO_OWES_WORDS:
+        from app.tools import list_debtors
+        return list_debtors(conn, shop_id)
+    if word in _CASH_WORDS:
+        from app.tools import cash_balances
+        return cash_balances(conn, shop_id)
+    if word in _STOCK_WORDS:
+        from app.tools import list_stock
+        return list_stock(conn, shop_id)
+    if word in _LOW_WORDS:
+        from app.tools import low_stock
+        return low_stock(conn, shop_id)
+    toks = set(re.findall(r"[a-z0-9]+", word))
+    balance_hit = bool({"owe", "owes", "owing", "owed"} & toks) or any(
+        s in word for s in ("balance", "ibhalansi", "saldo", "kwelet",
+                            "tyala", "skuld"))
+    pay_hit = bool({"pay"} & toks) or any(p in word for p in _PAY_WORDS)
+    if balance_hit and not pay_hit:
+        names = [r["name"] for r in conn.execute(
+            "SELECT name FROM customers WHERE shop_id = ?",
+            (shop_id,)).fetchall()]
+        hits = _customers_in_text(word, names)
+        if len(hits) == 1 and not _statement_has_sibling(word):
+            from app.tools import get_balance
+            return get_balance(conn, shop_id, hits[0])
+    return None
 
 
 def try_reminder_exact(conn: sqlite3.Connection, shop_id: str,
@@ -1047,6 +1134,9 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str,
             return afford, None
     if word in MENU_WORDS:
         return show_menu(conn, shop_id), None
+    fast_social = try_fast_social(conn, shop_id, word)
+    if fast_social is not None:
+        return fast_social
     if word in ("who recorded today", "who recorded", "staff today"):
         return who_recorded_today(conn, shop_id), None
     if word == "float" or word.startswith("float "):
@@ -1061,6 +1151,9 @@ def try_deterministic(conn: sqlite3.Connection, shop_id: str, text: str,
         statement = try_statement_request(conn, shop_id, text)
         if statement is not None:
             return statement, _AFTER_STATEMENT
+        lookup = try_fast_lookup(conn, shop_id, text)
+        if lookup is not None:
+            return lookup, None
     if word in ORDER_WORDS:
         return build_order(conn, shop_id), _AFTER_ORDER
     if word == "send it" or word.startswith("send it "):
@@ -1461,7 +1554,10 @@ def handle_photo(conn: sqlite3.Connection, shop_id: str, image: bytes,
         if got is not None:
             save_turn(conn, shop_id, "user", "[photo]")
             save_turn(conn, shop_id, "assistant", got)
-            return None, got, None
+            btns = setup_buttons(setup_step(conn, shop_id))
+            if btns:
+                _store_options(conn, shop_id, btns)
+            return None, got, btns
         step = setup_step(conn, shop_id) or 1
         reply = _t("ag_photo_setup",
                    prompt=setup_prompt(conn, shop_id, step))
@@ -1608,7 +1704,17 @@ def handle_text(conn: sqlite3.Connection, shop_id: str, text: str,
                 message = setup_answer(conn, shop_id, shop_id, text)
             save_turn(conn, shop_id, "user", text)
             save_turn(conn, shop_id, "assistant", message)
-            return message, None
+            step = setup_step(conn, shop_id)
+            lst = setup_list(step)
+            if lst is not None:
+                button_text, rows = lst
+                queue_list(shop_id, message, button_text, rows)
+                _store_options(conn, shop_id, rows)
+                return message, None
+            buttons = setup_buttons(step)
+            if buttons:
+                _store_options(conn, shop_id, buttons)
+            return message, buttons
     before = get_pending(conn, shop_id)
     before_id = before["id"] if before else None
     before_plan = get_plan(conn, shop_id)

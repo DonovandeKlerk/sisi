@@ -42,7 +42,16 @@ def _get_client():
         key = os.environ.get("MODEL_API_KEY", "")
         if not key:
             raise RuntimeError("MODEL_API_KEY is not set. Copy .env.example to .env and fill it in.")
-        _client = OpenAI(base_url=config.META_BASE_URL, api_key=key)
+        try:
+            timeout = float(os.environ.get("SISI_MODEL_TIMEOUT_S", "120"))
+        except ValueError:
+            timeout = 120.0
+        try:
+            retries = int(os.environ.get("SISI_MODEL_RETRIES", "1"))
+        except ValueError:
+            retries = 1
+        _client = OpenAI(base_url=config.META_BASE_URL, api_key=key,
+                         timeout=timeout, max_retries=retries)
     return _client
 
 

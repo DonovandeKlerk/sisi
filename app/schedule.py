@@ -219,7 +219,7 @@ def _plan_tip(debtors: list[dict], low) -> str:
 def set_daily_plan(conn: sqlite3.Connection, shop_id: str, setting: str) -> str:
     """Change the morning plan: 'HH:MM', 'off' or 'on'."""
     from app.i18n import t
-    from app.reminders import parse_bare_time
+    from app.reminders import extract_time
     from app.tools import ensure_shop
     ensure_shop(conn, shop_id)
     word = (setting or "").strip().lower()
@@ -232,7 +232,7 @@ def set_daily_plan(conn: sqlite3.Connection, shop_id: str, setting: str) -> str:
         conn.commit()
         at = _flag(conn, shop_id, "plan_time") or "06:00"
         return t("plan_on_ok", at=at)
-    hm = parse_bare_time(word)
+    hm = extract_time(word)
     if hm is None:
         return t("plan_hint")
     at = f"{hm[0]:02d}:{hm[1]:02d}"

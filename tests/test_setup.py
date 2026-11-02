@@ -168,3 +168,116 @@ def test_setup_prompts_follow_style(conn):
     assert_format(start_setup(conn, SHOP))
     for step in range(1, 8):
         assert_format(step_prompt(conn, SHOP, step))
+
+
+def _at_step(conn, shop, step):
+    handle_text(conn, shop, "hi")
+    answers = {1: "Kwamama", 2: "12 Main Rd", 3: "yes", 4: "skip",
+               5: "100 cash", 6: "english"}
+    for s in range(1, step):
+        handle_text(conn, shop, answers[s])
+    assert setup_step(conn, shop) == step
+
+
+def _plan_flag(conn, shop, key):
+    row = conn.execute("SELECT value FROM flags WHERE shop_id = ? AND key = ?",
+                       (shop, key)).fetchone()
+    return row["value"] if row else None
+
+
+@pytest.mark.parametrize("reply,hm", [
+    ("yes", None), ("Yes!", None), ("YES.", None), ("y", None),
+    ("yebo", None), ("ja", None), ("ewe", None), ("ok", None),
+    ("sharp", None), ("sure", None), ("please", None), ("on", None),
+    ("6", (6, 0)), ("06", (6, 0)), ("6:00", (6, 0)), ("06:00", (6, 0)),
+    ("5:30", (5, 30)), ("6am", (6, 0)), ("6 am", (6, 0)),
+    ("6pm", (18, 0)), ("18h00", (18, 0)), ("6h30", (6, 30)),
+    ("yes 6", (6, 0)), ("yes 06:00", (6, 0)), ("yes, 06:00", (6, 0)),
+    ("yes! 5:30?", (5, 30)), ("yebo 6am", (6, 0)), ("ja, 18h00", (18, 0)),
+])
+def test_plan_step_lenient_yes_and_times(conn, reply, hm):
+    shop = f"2771000{9000 + abs(hash(reply)) % 900}"
+    _at_step(conn, shop, 7)
+    msg, _ = handle_text(conn, shop, reply)
+    assert msg.startswith("✅"), reply
+    assert setup_step(conn, shop) is None
+    assert _plan_flag(conn, shop, "plan_off") is None
+    want = f"{hm[0]:02d}:{hm[1]:02d}" if hm else None
+    assert _plan_flag(conn, shop, "plan_time") == want, reply
+
+
+@pytest.mark.parametrize("reply", ["no", "No.", "nope", "nah", "nee", "off",
+                                   "hayi", "cha", "aikona", "never", "skip",
+                                   "no thanks", "no, thanks!"])
+def test_plan_step_lenient_no(conn, reply):
+    shop = f"2771000{9100 + abs(hash(reply)) % 90}"
+    _at_step(conn, shop, 7)
+    msg, _ = handle_text(conn, shop, reply)
+    assert msg.startswith("✅"), reply
+    assert _plan_flag(conn, shop, "plan_off") == "1"
+
+
+def test_plan_step_pick_a_time_button(conn):
+    _at_step(conn, SHOP, 7)
+    msg, buttons = handle_text(conn, SHOP, "Pick a time")
+    assert "What time" in msg and setup_step(conn, SHOP) == 7
+    assert buttons == ["Yes", "Pick a time", "No"]
+    msg, _ = handle_text(conn, SHOP, "half past five")
+    assert msg.startswith("✅")  # unclear twice: default 06:00, move on
+    assert setup_step(conn, SHOP) is None
+
+
+def test_plan_step_never_loops_twice(conn):
+    _at_step(conn, SHOP, 7)
+    msg, _ = handle_text(conn, SHOP, "maybe later-ish?")
+    assert "Step 7 of 7" in msg and setup_step(conn, SHOP) == 7
+    msg, _ = handle_text(conn, SHOP, "dunno really")
+    assert msg.startswith("✅") and setup_step(conn, SHOP) is None
+
+
+def test_step_buttons_and_language_list(conn):
+    from app.agent import take_lists
+    msg, buttons = handle_text(conn, SHOP, "hi")
+    assert buttons is None  # step 1 is free text
+    _, buttons = handle_text(conn, SHOP, "Kwamama")
+    assert buttons == ["Skip"]  # step 2
+    _, buttons = handle_text(conn, SHOP, "1")
+    assert buttons == ["Yes, use this number"]  # step 3, tap resolved
+    _, buttons = handle_text(conn, SHOP, "yes")
+    assert buttons == ["Skip"]  # step 4
+    _, buttons = handle_text(conn, SHOP, "skip")
+    assert buttons == ["Skip"]  # step 5
+    msg, buttons = handle_text(conn, SHOP, "skip")
+    assert buttons is None  # step 6 arrives as a list
+    lists = take_lists(SHOP)
+    assert len(lists) == 1
+    assert lists[0]["button_text"] == "Language"
+    assert lists[0]["rows"] == ["English", "isiZulu", "Afrikaans", "isiXhosa"]
+    msg, buttons = handle_text(conn, SHOP, "2")
+    assert "Isinyathelo 7 kwezi-7" in msg  # digit fallback -> isiZulu
+    assert buttons == ["Yes", "Pick a time", "No"]
+
+
+@pytest.mark.parametrize("step,bad", [
+    (1, "?"),
+    (3, "huh?"),
+    (4, "a logo please"),
+    (5, "lots"),
+    (6, "spanish"),
+])
+def test_each_step_recovers_after_one_retry(conn, step, bad):
+    shop = f"2771999{100 + step}"
+    _at_step(conn, shop, step)
+    msg, _ = handle_text(conn, shop, bad)
+    assert setup_step(conn, shop) == step  # one re-ask, then …
+    msg, _ = handle_text(conn, shop, "still unclear??")
+    assert setup_step(conn, shop) != step or msg.startswith("✅")
+
+
+def test_step3_yes_number_combo_and_skip_float(conn):
+    _at_step(conn, SHOP, 3)
+    handle_text(conn, SHOP, "yes, 082 123 4567")
+    assert ensure_shop(conn, SHOP)["phone"] == "0821234567"
+    handle_text(conn, SHOP, "skip")  # step 4
+    msg, _ = handle_text(conn, SHOP, "none")  # step 5 zero float
+    assert "Step 6 of 7" in msg

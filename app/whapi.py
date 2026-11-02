@@ -35,6 +35,10 @@ Sources (official Whapi.Cloud help-desk docs, verified 2026-10-30):
 - Send buttons: .../help-desk/sending/send-message-with-buttons
   (POST /messages/interactive, quick_reply; max 3, title <= 25 chars;
   replies arrive as type "reply" with buttons_reply {id, title})
+- Send lists: whapi-whatsapp-api-skill msg-interactive.md
+  (POST /messages/interactive, type "list", action.list {sections[],
+  label}; optional header/footer; replies as list_reply {id, title})
+- Typing presence: PUT /presences/{chat} {presence} (OpenAPI PresencesApi)
 - Send media: .../help-desk/sending/send-video-audio-image-document
   (media by URL/base64/media-id; 30-day cloud expiry)
 - Media params (caption/filename/mime): whapi-cloud/whapi-whatsapp-api-skill
@@ -76,6 +80,9 @@ DEFAULT_NUMBER = "27745492157"
 
 MAX_BTNS = 3
 MAX_BTN_TITLE = 25
+MAX_ROWS = 10
+MAX_ROW_TITLE = 24
+MAX_LIST_LABEL = 20
 MAX_MEDIA_BYTES = 20_000_000
 MAX_AGE_S = 600
 
@@ -206,7 +213,8 @@ class WhapiSender(WhatsAppSender):
                 first = self._sent_id(resp)
         return first
 
-    def send_buttons(self, to: str, body: str, buttons: list[str]) -> None:
+    def send_buttons(self, to: str, body: str, buttons: list[str],
+                       header: str = "", footer: str = "") -> None:
         """Native quick-reply buttons; numbered text when unsupported.
 
         429 (RateLimited) is re-raised for the queue to retry; any other
@@ -215,11 +223,15 @@ class WhapiSender(WhatsAppSender):
         dest = _digits(to)
         options = [_clean_label(b, MAX_BTN_TITLE) for b in buttons[:MAX_BTNS]]
         options = [o for o in options if o]
-        payload = {"to": dest, "type": "button",
-                   "body": {"text": body[:1024]},
-                   "action": {"buttons": [
-                       {"type": "quick_reply", "title": o, "id": o}
-                       for o in options]}}
+        payload: dict = {"to": dest, "type": "button",
+                         "body": {"text": body[:1024]},
+                         "action": {"buttons": [
+                             {"type": "quick_reply", "title": o, "id": o}
+                             for o in options]}}
+        if header:
+            payload["header"] = {"text": _clean_label(header, 60)}
+        if footer:
+            payload["footer"] = {"text": _clean_label(footer, 60)}
         try:
             self._post("/messages/interactive", payload, "buttons", dest)
         except RateLimited:
@@ -229,9 +241,54 @@ class WhapiSender(WhatsAppSender):
             self.send_text(to, _numbered(body, buttons[:MAX_BTNS]))
 
     def send_list(self, to: str, body: str, button_text: str,
-                  rows: list[str]) -> None:
-        """Whapi documents no list-message API; numbered text, always clear."""
-        self.send_text(to, _numbered(body, rows[:10]))
+                  rows: list[str], header: str = "",
+                  footer: str = "") -> None:
+        """Native list message; numbered text when unsupported.
+
+        429 (RateLimited) is re-raised for the queue to retry; any other
+        failure falls back to '1) .. 2) ..' text the numbered tap resolves.
+        """
+        dest = _digits(to)
+        options = [_clean_label(r, MAX_ROW_TITLE) for r in rows[:MAX_ROWS]]
+        options = [o for o in options if o]
+        payload: dict = {
+            "to": dest, "type": "list",
+            "body": {"text": body[:1024]},
+            "action": {"list": {
+                "label": _clean_label(button_text,
+                                      MAX_LIST_LABEL) or "Choose",
+                "sections": [{"title": "Options", "rows": [
+                    {"id": o, "title": o} for o in options]}]}},
+        }
+        if header:
+            payload["header"] = {"text": _clean_label(header, 60)}
+        if footer:
+            payload["footer"] = {"text": _clean_label(footer, 60)}
+        try:
+            self._post("/messages/interactive", payload, "list", dest)
+        except RateLimited:
+            raise
+        except (httpx.HTTPError, RuntimeError) as e:
+            log.warning("whapi list fallback to=%s err=%r", dest, e)
+            self.send_text(to, _numbered(body, rows[:MAX_ROWS]))
+
+    def send_presence(self, to: str, presence: str = "composing") -> bool:
+        """Best-effort typing indicator. Never raises; False on any failure."""
+        if not self.token or not self.base_url:
+            return False
+        dest = _digits(to)
+        if not dest:
+            return False
+        try:
+            resp = httpx.put(
+                f"{self.base_url}/presences/{dest}@s.whatsapp.net",
+                headers=self._headers(),
+                json={"presence": presence}, timeout=5)
+            resp.raise_for_status()
+            return True
+        except Exception:
+            log.warning("whapi presence failed to=%s", dest, exc_info=True)
+            return False
 
     def send_image(self, to: str, url: str, caption: str = "") -> None:
         dest = _digits(to)

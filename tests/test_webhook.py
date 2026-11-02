@@ -344,3 +344,61 @@ def test_unsupported_type_gets_graceful_reply(sim_env):
     assert client.post("/webhook", content=raw, headers=_signed(raw)).status_code == 200
     out = client.get("/_sim/outbox", params={"shop": SHOP}).json()["messages"]
     assert len(out) == 1 and "can't watch videos" in out[0]["body"]
+
+
+def test_dispatch_prefers_async_spawn(monkeypatch):
+    import asyncio
+    import sys
+    from fastapi import BackgroundTasks
+
+    from app.whatsapp import IncomingMessage
+    seen = {}
+
+    async def fake_aio(payload):
+        seen["payload"] = payload
+
+    fn = SimpleNamespace(spawn=SimpleNamespace(aio=fake_aio))
+    fake_modal = SimpleNamespace(
+        Function=SimpleNamespace(from_name=lambda *a: fn))
+    monkeypatch.setitem(sys.modules, "modal", fake_modal)
+    monkeypatch.setenv("SISI_SPAWN", "1")
+    tasks = BackgroundTasks()
+    asyncio.run(main._dispatch(
+        tasks, IncomingMessage("m1", SHOP, "text", "hi")))
+    assert seen["payload"]["message_id"] == "m1"
+    assert tasks.tasks == []  # spawned: no local background task
+
+
+def test_dispatch_thread_fallback_without_aio(monkeypatch):
+    import asyncio
+    import sys
+    from fastapi import BackgroundTasks
+
+    from app.whatsapp import IncomingMessage
+    seen = {}
+
+    def fake_spawn(payload):
+        seen["payload"] = payload
+
+    fn = SimpleNamespace(spawn=fake_spawn)
+    fake_modal = SimpleNamespace(
+        Function=SimpleNamespace(from_name=lambda *a: fn))
+    monkeypatch.setitem(sys.modules, "modal", fake_modal)
+    monkeypatch.setenv("SISI_SPAWN", "1")
+    tasks = BackgroundTasks()
+    asyncio.run(main._dispatch(
+        tasks, IncomingMessage("m2", SHOP, "text", "hi")))
+    assert seen["payload"]["message_id"] == "m2"
+    assert tasks.tasks == []
+
+
+def test_status_webhook_applies_dlrs_after_response(sim_env, monkeypatch):
+    applied = []
+    monkeypatch.setattr(main, "_apply_dlrs", applied.extend)
+    client = TestClient(app)
+    payload = {"object": "whatsapp_business_account", "entry": [{"changes": [{
+        "value": {"statuses": [{"id": "wamid.s1", "status": "read"}]}}]}]}
+    raw = json.dumps(payload).encode()
+    assert client.post("/webhook", content=raw,
+                       headers=_signed(raw)).status_code == 200
+    assert ("wamid.s1", "delivered", "") in applied

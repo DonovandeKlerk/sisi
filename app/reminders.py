@@ -178,10 +178,10 @@ def has_explicit_time(text: str) -> bool:
 
 
 def parse_bare_time(text: str) -> tuple[int, int] | None:
-    """A reply that is only a time ('6am', '17:30'). None otherwise."""
+    """A reply that is only a time ('6am', '17:30', '18h00'). None otherwise."""
     m = _BARE_TIME_RE.match(text or "")
     if not m:
-        return None
+        return _parse_h_time((text or "").strip(), bare_only=True)
     hour, minute = int(m.group(1)), int(m.group(2) or 0)
     meridiem = m.group(3)
     if hour > 23 or minute > 59:
@@ -191,6 +191,49 @@ def parse_bare_time(text: str) -> tuple[int, int] | None:
     if meridiem == "am" and hour == 12:
         hour = 0
     return hour, minute
+
+
+_H_TIME_RE = re.compile(r"^\s*(\d{1,2})\s*h\s*(\d{2})?\s*$", re.IGNORECASE)
+_H_TIME_SUB_RE = re.compile(r"\b(\d{1,2})\s*h\s*(\d{2})\b|\b(\d{1,2})\s*h\b",
+                            re.IGNORECASE)
+_BARE_HOUR_RE = re.compile(r"(?:^|[\s,;:!?]+)(\d{1,2})(?:[\s,;:!?.]+|$)")
+
+
+def _parse_h_time(text: str, bare_only: bool = False) -> tuple[int, int] | None:
+    """South African '18h00' / '6h30' / '6h' clock times."""
+    m = _H_TIME_RE.match(text or "")
+    if not m:
+        return None
+    hour, minute = int(m.group(1)), int(m.group(2) or 0)
+    if hour > 23 or minute > 59:
+        return None
+    return hour, minute
+
+
+def extract_time(text: str) -> tuple[int, int] | None:
+    """First clock time anywhere in the text ('yes, 06:00', 'yes 6').
+
+    Accepts 6:00 / 06:00 / 5:30 / 6am / 6 am / 18h00 / bare hours.
+    None when no usable time is present. Never raises.
+    """
+    try:
+        found = _parse_time(text or "")
+        if found is not None:
+            return found
+        m = _H_TIME_SUB_RE.search(text or "")
+        if m:
+            hour = int(m.group(1) or m.group(3))
+            minute = int(m.group(2) or 0)
+            if hour <= 23 and minute <= 59:
+                return hour, minute
+        m = _BARE_HOUR_RE.search(text or "")
+        if m:
+            hour = int(m.group(1))
+            if hour <= 23:
+                return hour, 0
+    except (TypeError, ValueError):
+        return None
+    return None
 
 
 def _strip_prefix_day(word: str) -> str:

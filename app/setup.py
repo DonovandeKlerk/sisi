@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import random
+import re
 import sqlite3
 from datetime import date
 
@@ -76,11 +77,36 @@ def needs_setup(conn: sqlite3.Connection, shop_id: str) -> bool:
     return True
 
 
+def _clear_retries(conn: sqlite3.Connection, shop_id: str) -> None:
+    conn.execute("DELETE FROM flags WHERE shop_id = ? AND key LIKE 'setup-retry-%'",
+                 (shop_id,))
+    conn.commit()
+
+
+def _failed_once(conn: sqlite3.Connection, shop_id: str, step: int) -> bool:
+    """True when this step already failed once: default, don't re-ask."""
+    key = f"setup-retry-{step}"
+    if _flag(conn, shop_id, key):
+        conn.execute("DELETE FROM flags WHERE shop_id = ? AND key = ?",
+                     (shop_id, key))
+        conn.commit()
+        return True
+    _set_flag(conn, shop_id, key, "1")
+    return False
+
+
+def _clear_retry(conn: sqlite3.Connection, shop_id: str, step: int) -> None:
+    conn.execute("DELETE FROM flags WHERE shop_id = ? AND key = ?",
+                 (shop_id, f"setup-retry-{step}"))
+    conn.commit()
+
+
 def start_setup(conn: sqlite3.Connection, shop_id: str, reseed: bool = False) -> str:
     _set_flag(conn, shop_id, "setup-step", "1")
     conn.execute("DELETE FROM flags WHERE shop_id = ? AND key IN"
                  " ('setup-done', 'setup-return', 'setup-reseed', 'setup-paused')",
                  (shop_id,))
+    _clear_retries(conn, shop_id)
     if reseed:
         _set_flag(conn, shop_id, "setup-reseed", "1")
     conn.commit()
@@ -161,6 +187,32 @@ BACK_WORDS = ("back", "buyela", "terug")
 SKIP_WORDS = ("skip", "yeqa", "slaan oor", "tsiba")
 CHANGE_PREFIXES = ("change ", "verander ", "shintsha ", "tshintsha ")
 
+SETUP_BUTTONS = {
+    2: ["Skip"],
+    3: ["Yes, use this number"],
+    4: ["Skip"],
+    5: ["Skip"],
+    7: ["Yes", "Pick a time", "No"],
+}
+"""Tap buttons per step (≤3, ≤25 chars). Bare '1' taps resolve to these."""
+SETUP_LIST_BUTTON = "Language"
+SETUP_LIST_ROWS = ["English", "isiZulu", "Afrikaans", "isiXhosa"]
+"""Step 6 arrives as a list message (digits 1-4 resolve the fallback)."""
+
+
+def setup_buttons(step: int | None) -> list[str] | None:
+    """Button labels for a setup step, or None for free text / lists."""
+    if step is None:
+        return None
+    return list(SETUP_BUTTONS[step]) if step in SETUP_BUTTONS else None
+
+
+def setup_list(step: int | None):
+    """(button_text, rows) for list steps, else None."""
+    if step == 6:
+        return SETUP_LIST_BUTTON, list(SETUP_LIST_ROWS)
+    return None
+
 
 def _answer(conn: sqlite3.Connection, shop_id: str, sender: str, text: str) -> str:
     """Handle one setup reply. Returns the next prompt or the finish card."""
@@ -180,9 +232,17 @@ def _answer(conn: sqlite3.Connection, shop_id: str, sender: str, text: str) -> s
                          prompt=step_prompt(conn, shop_id, step))
             _set_flag(conn, shop_id, "setup-return", str(step))
             return _goto(conn, shop_id, target)
+    m = re.match(r"\s*(\d{1,2})\s*[.)]?\s*$", text or "")
+    if m is not None and step in SETUP_BUTTONS:
+        idx = int(m.group(1)) - 1
+        if 0 <= idx < len(SETUP_BUTTONS[step]):
+            text = SETUP_BUTTONS[step][idx]
+            word = " ".join(text.strip().lower().split())
     if step == 1:
         name = straight_quotes((text or "").strip())
         if not name or len(name) < 2:
+            if _failed_once(conn, shop_id, 1):
+                return _advance(conn, shop_id, 1, None)  # keep Shop <id>
             return t("setup_name_invalid",
                      prompt=step_prompt(conn, shop_id, 1))
         set_shop_name(conn, shop_id, name[:60])
@@ -192,73 +252,143 @@ def _answer(conn: sqlite3.Connection, shop_id: str, sender: str, text: str) -> s
             set_shop_address(conn, shop_id, (text or "").strip()[:120])
         return _advance(conn, shop_id, 2, None)
     if step == 3:
-        if word in ("yes", "y", "yebo", "yeah", "ja", "ewe", "ok", "okay", "sharp",
-                    "shap", "sure"):
+        digits = "".join(c for c in (text or "") if c.isdigit())
+        if len(digits) >= 9:
+            set_shop_phone(conn, shop_id, digits)
+        elif _has_any(word, _PHONE_YES):
             set_shop_phone(conn, shop_id, sender)
         else:
-            digits = "".join(c for c in (text or "") if c.isdigit())
-            if len(digits) < 9:
-                return t("setup_phone_invalid", sender=sender,
-                         prompt=step_prompt(conn, shop_id, 3))
-            set_shop_phone(conn, shop_id, digits)
+            if _failed_once(conn, shop_id, 3):
+                set_shop_phone(conn, shop_id, sender)
+                return _advance(conn, shop_id, 3, None)
+            return t("setup_phone_invalid", sender=sender,
+                     prompt=step_prompt(conn, shop_id, 3))
         return _advance(conn, shop_id, 3, None)
     if step == 4:
-        if word in SKIP_WORDS:
+        if word in SKIP_WORDS or _failed_once(conn, shop_id, 4):
+            _clear_retry(conn, shop_id, 4)
             return _advance(conn, shop_id, 4, None)
         return t("setup_logo_send", prompt=step_prompt(conn, shop_id, 4))
     if step == 5:
+        if word in SKIP_WORDS or word in _FLOAT_ZERO:
+            return _advance(conn, shop_id, 5, None)
         amounts = _parse_float(f"float {(text or '')}")
         if not amounts:
+            if _failed_once(conn, shop_id, 5):
+                return _advance(conn, shop_id, 5, None)  # float stays zero
             return t("setup_float_invalid",
                      prompt=step_prompt(conn, shop_id, 5))
         set_float(conn, shop_id, amounts)
         return _advance(conn, shop_id, 5, None)
     if step == 6:
-        code = normalize_lang(word)
+        code = _lenient_lang(word)
         if code is not None:
             conn.execute("UPDATE shops SET language = ? WHERE shop_id = ?",
                          (code, shop_id))
             conn.commit()
             CURRENT_LANG.set(code)
             return _advance(conn, shop_id, 6, None)
+        if _failed_once(conn, shop_id, 6):
+            return _advance(conn, shop_id, 6, None)  # keep English
         return t("setup_lang_invalid", prompt=step_prompt(conn, shop_id, 6))
     return _answer_plan(conn, shop_id, word, text)
 
 
 PLAN_YES = ("yes", "y", "yebo", "yeah", "ja", "ewe", "ok", "okay", "sharp",
-            "shap", "sure", "on", "please")
-PLAN_NO = ("no", "nope", "nah", "nee", "off", "hayi", "cha", "aikona")
+            "shap", "sure", "on", "please", "yep", "yea", "aye",
+            "definitely", "certainly")
+PLAN_NO = ("no", "n", "nope", "nah", "nee", "off", "hayi", "cha", "aikona",
+           "never", "not", "dont", "don't", "aowa", "skip", "yeqa",
+           "slaan oor", "tsiba")
+PICK_TIME_WORDS = ("pick a time", "pick time", "choose a time", "choose time",
+                   "set a time", "set time", "a time", "another time",
+                   "different time")
+
+_PHONE_YES_EXTRA = ("same", "keep", "keep it", "this number", "this one",
+                    "current", "sender", "mine", "my number")
+_PHONE_YES_TOKENS = ("yes", "y", "yebo", "yeah", "ja", "ewe", "ok", "okay",
+                     "sharp", "shap", "sure", "same", "keep", "mine",
+                     "current", "sender")
+_PHONE_YES = _PHONE_YES_TOKENS + _PHONE_YES_EXTRA
+
+_FLOAT_ZERO = ("none", "no", "nope", "zero", "0", "r0", "nothing", "no float",
+               "akukho", "niks", "geen", "hayi")
+
+_LANG_NUMBERS = {"1": "en", "2": "zu", "3": "af", "4": "xh"}
+"""Digit answers follow the prompt order: English, isiZulu, Afrikaans, isiXhosa."""
+
+
+def _tokens(word: str) -> list[str]:
+    return [tok for tok in re.split(r"[^a-z0-9']+", word or "") if tok]
+
+
+def _has_any(word: str, options: tuple[str, ...]) -> bool:
+    toks = set(_tokens(word))
+    for opt in options:
+        if " " in opt:
+            if opt in (word or ""):
+                return True
+        elif opt in toks:
+            return True
+    return False
+
+
+def _lenient_lang(word: str) -> str | None:
+    """Language answer: exact, digit (1-4), or name anywhere in the text."""
+    from app.i18n import LANG_CODES, normalize_lang
+    code = normalize_lang(word)
+    if code is not None:
+        return code
+    toks = _tokens(word)
+    for tok in toks:
+        if tok in _LANG_NUMBERS:
+            return _LANG_NUMBERS[tok]
+    for name, lang in LANG_CODES.items():
+        if len(name) >= 2 and name in toks:
+            return lang
+    for name, lang in LANG_CODES.items():
+        if len(name) > 2 and name in (word or ""):
+            return lang
+    return None
 
 
 def _answer_plan(conn: sqlite3.Connection, shop_id: str, word: str,
                  text: str) -> str:
     """Step 7: daily plan Yes / time / No, then the finish card."""
     from app.i18n import t
-    from app.reminders import parse_bare_time
-    if word in PLAN_YES:
-        conn.execute("DELETE FROM flags WHERE shop_id = ? AND key = 'plan_off'",
-                     (shop_id,))
-        conn.commit()
-        return _finish(conn, shop_id)
-    if word in PLAN_NO:
-        _set_flag(conn, shop_id, "plan_off", "1")
-        return _finish(conn, shop_id)
-    hm = parse_bare_time(text)
+    from app.reminders import extract_time
+    hm = extract_time(text or "")
     if hm is not None:
         _set_flag(conn, shop_id, "plan_time", f"{hm[0]:02d}:{hm[1]:02d}")
         conn.execute("DELETE FROM flags WHERE shop_id = ? AND key = 'plan_off'",
                      (shop_id,))
         conn.commit()
         return _finish(conn, shop_id)
+    if _has_any(word, PLAN_NO):
+        _set_flag(conn, shop_id, "plan_off", "1")
+        return _finish(conn, shop_id)
+    if _has_any(word, PLAN_YES):
+        conn.execute("DELETE FROM flags WHERE shop_id = ? AND key = 'plan_off'",
+                     (shop_id,))
+        conn.commit()
+        return _finish(conn, shop_id)
+    if word in PICK_TIME_WORDS or _has_any(word, PICK_TIME_WORDS):
+        if _failed_once(conn, shop_id, 7):
+            return _finish(conn, shop_id)  # asked twice: keep 06:00
+        return t("setup_plan_time_q", prompt=step_prompt(conn, shop_id, 7))
+    if _failed_once(conn, shop_id, 7):
+        return _finish(conn, shop_id)  # unclear twice: keep 06:00, move on
     return t("setup_plan_invalid", prompt=step_prompt(conn, shop_id, 7))
 
 
 def _goto(conn: sqlite3.Connection, shop_id: str, step: int) -> str:
     _set_flag(conn, shop_id, "setup-step", str(step))
+    _clear_retry(conn, shop_id, step)
     return step_prompt(conn, shop_id, step)
 
 
 def _advance(conn: sqlite3.Connection, shop_id: str, step: int, ack: str | None) -> str:
+    _clear_retry(conn, shop_id, step)
     nxt = _flag(conn, shop_id, "setup-return")
     if nxt:
         conn.execute("DELETE FROM flags WHERE shop_id = ? AND key = 'setup-return'",
@@ -296,6 +426,7 @@ def _finish(conn: sqlite3.Connection, shop_id: str) -> str:
     from app import reports as _reports
     conn.execute("DELETE FROM flags WHERE shop_id = ? AND key IN"
                  " ('setup-step', 'setup-return', 'setup-paused')", (shop_id,))
+    _clear_retries(conn, shop_id)
     _set_flag(conn, shop_id, "setup-done", "1")
     reseed = _flag(conn, shop_id, "setup-reseed")
     if reseed:

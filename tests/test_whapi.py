@@ -50,6 +50,7 @@ def wh_env(tmp_path, monkeypatch):
                 "INFOBIP_API_KEY", "WHAPI_MAX_AGE_S", "WHAPI_MAX_MEDIA_BYTES"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(llm, "TOKEN_LOG", tmp_path / "usage.log")
+    monkeypatch.setattr(whapi.httpx, "put", lambda *a, **k: _ok())
     reset_fake()
     main._rate_hits.clear()
     seed_demo(SHOP)
@@ -113,6 +114,14 @@ def test_parse_text_image_voice_reply(wh_env):
         now=NOW)
     assert len(msgs) == 1
     assert (msgs[0].kind, msgs[0].text) == ("button", "Yes")
+
+    msgs = parse_whapi_webhook(_payload(_msg(
+        mtype="reply", mid="w-r-2",
+        node={"type": "list_reply",
+              "list_reply": {"id": "isiZulu", "title": "isiZulu"}})),
+        now=NOW)
+    assert len(msgs) == 1
+    assert (msgs[0].kind, msgs[0].text) == ("button", "isiZulu")
 
 
 def test_parse_autodownload_link_kept_as_fallback(wh_env):
@@ -340,13 +349,69 @@ def test_send_buttons_fallback_and_429(wh_env, monkeypatch):
         WhapiSender().send_buttons(SHOP, "Save it?", ["Yes"])
 
 
-def test_send_list_is_numbered_text(wh_env, monkeypatch):
+def test_send_list_shape_and_limits(wh_env, monkeypatch):
     fake = _FakePost()
     monkeypatch.setattr(whapi.httpx, "post", fake)
-    WhapiSender().send_list(SHOP, "Pick one", "Choose", ["Sell", "Stock"])
+    WhapiSender().send_list(SHOP, "Pick one", "Choose",
+                            ["Sell", "Stock"] + [f"Row{i}" for i in range(12)])
     assert len(fake.calls) == 1
-    assert fake.calls[0]["url"].endswith("/messages/text")
-    assert "1) Sell" in fake.calls[0]["json"]["body"]
+    call = fake.calls[0]
+    assert call["url"].endswith("/messages/interactive")
+    body = call["json"]
+    assert (body["to"], body["type"]) == (SHOP, "list")
+    assert body["body"] == {"text": "Pick one"}
+    lst = body["action"]["list"]
+    assert lst["label"] == "Choose"
+    rows = lst["sections"][0]["rows"]
+    assert len(rows) == 10  # capped at 10
+    assert rows[0] == {"id": "Sell", "title": "Sell"}
+    assert all(len(r["title"]) <= 24 for r in rows)
+
+
+def test_send_list_header_footer_and_fallback(wh_env, monkeypatch):
+    fake = _FakePost()
+    monkeypatch.setattr(whapi.httpx, "post", fake)
+    WhapiSender().send_list(SHOP, "Pick one", "Choose", ["Sell"],
+                            header="Sisi", footer="Step 6 of 7")
+    payload = fake.calls[0]["json"]
+    assert payload["header"] == {"text": "Sisi"}
+    assert payload["footer"] == {"text": "Step 6 of 7"}
+
+    fake = _FakePost(script=[_http_error(400), _ok()])
+    monkeypatch.setattr(whapi.httpx, "post", fake)
+    WhapiSender().send_list(SHOP, "Pick one", "Choose", ["Sell", "Stock"])
+    assert len(fake.calls) == 2
+    assert fake.calls[1]["url"].endswith("/messages/text")
+    assert "1) Sell" in fake.calls[1]["json"]["body"]
+
+    fake = _FakePost(script=[_http_error(429)] * 4)
+    monkeypatch.setattr(whapi.httpx, "post", fake)
+    monkeypatch.setattr(whapi.time, "sleep", lambda s: None)
+    with pytest.raises(RateLimited):
+        WhapiSender().send_list(SHOP, "Pick one", "Choose", ["Sell"])
+
+
+def test_send_presence_best_effort(wh_env, monkeypatch):
+    seen = {}
+
+    class _Put:
+        def __call__(self, url, headers=None, json=None, timeout=None):
+            seen.update(url=url, json=json)
+            return _ok()
+
+    monkeypatch.setattr(whapi.httpx, "put", _Put())
+    assert WhapiSender().send_presence(SHOP) is True
+    assert seen["url"] == \
+        f"https://gate.whapi.test/presences/{SHOP}@s.whatsapp.net"
+    assert seen["json"] == {"presence": "composing"}
+
+    def boom(*a, **k):
+        raise _http_error(500)
+
+    monkeypatch.setattr(whapi.httpx, "put", boom)
+    assert WhapiSender().send_presence(SHOP) is False  # never raises
+    monkeypatch.delenv("WHAPI_TOKEN")
+    assert WhapiSender().send_presence(SHOP) is False
 
 
 def test_send_image_and_file_shapes(wh_env, monkeypatch):
@@ -479,6 +544,41 @@ def test_webhook_text_end_to_end_and_duplicate(wh_env, monkeypatch):
     assert r.status_code == 200
     texts = [c for c in fake.calls if c["url"].endswith("/messages/text")]
     assert len(texts) == 1  # duplicate message id ignored
+
+
+def test_webhook_sends_typing_presence_on_inbound(wh_env, monkeypatch):
+    puts = []
+
+    class _Put:
+        def __call__(self, url, headers=None, json=None, timeout=None):
+            puts.append({"url": url, "json": json})
+            return _ok()
+
+    fake = _FakePost()
+    monkeypatch.setattr(whapi.httpx, "post", fake)
+    monkeypatch.setattr(whapi.httpx, "put", _Put())
+    client = TestClient(app)
+    body = _payload(_msg(mid="w-typing-1", node={"body": "resend"}))
+    body["messages"][0]["timestamp"] = int(time.time())
+    assert client.post(f"/webhook/whapi/{TOKEN}", json=body).status_code == 200
+    assert len(puts) == 1
+    assert puts[0]["url"] == \
+        f"https://gate.whapi.test/presences/{SHOP}@s.whatsapp.net"
+    assert puts[0]["json"] == {"presence": "composing"}
+
+
+def test_button_reply_routes_as_choice(wh_env, monkeypatch):
+    fake = _FakePost()
+    monkeypatch.setattr(whapi.httpx, "post", fake)
+    client = TestClient(app)
+    body = _payload(_msg(
+        mid="w-btn-1", mtype="reply",
+        node={"type": "buttons_reply",
+              "buttons_reply": {"id": "Yes", "title": "Yes"}}))
+    body["messages"][0]["timestamp"] = int(time.time())
+    assert client.post(f"/webhook/whapi/{TOKEN}", json=body).status_code == 200
+    assert [c for c in fake.calls
+            if c["url"].endswith("/messages/text")]  # answered, not dropped
 
 
 def test_webhook_preserves_existing_shop_records(wh_env, monkeypatch):

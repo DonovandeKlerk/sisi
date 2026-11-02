@@ -73,7 +73,7 @@ def _use_volume() -> None:
     ensure_dirs()
 
 
-@app.function(timeout=300)
+@app.function(min_containers=1, timeout=300)
 def worker(msg: dict):
     """Spawned per inbound message so webhooks return 200 instantly."""
     _use_volume()

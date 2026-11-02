@@ -111,7 +111,7 @@ def test_milk_cash_plus_reminder(conn, shop, sent, monkeypatch, tmp_path):
 
 def test_planner_context_sees_state_and_shop(conn, shop, sent, monkeypatch):
     calls = _script(monkeypatch, [_plan([_t("chat", {"reply": "Sharp."})])])
-    agent.handle_text(conn, SHOP, "hi there", sent)
+    agent.handle_text(conn, SHOP, "tell me about my shop", sent)
     ctx = calls["contexts"][0]
     assert "NEW MESSAGE" in ctx and "OPEN STATE" in ctx
     assert "CASH:" in ctx and "CUSTOMERS:" in ctx and "PRODUCTS:" in ctx
