@@ -41,39 +41,68 @@ def books_fingerprint(conn: sqlite3.Connection, shop_id: str):
     product quantities/prices/costs and expiry items. Anything a read-only
     query touches (reports rows, media, turns, flags, reminders, order
     drafts, customers metadata) is deliberately excluded.
+
+    Uses one round-trip for the aggregate ledger counts/sums (faster on
+    Turso) plus one products fetch.
     """
     try:
-        fp: list = []
-        sums = [
-            ("sales", "total_cents", True),
-            ("credit_entries", "amount_cents", True),
-            ("payments", "amount_cents", True),
-            ("expenses", "amount_cents", True),
-            ("cash_moves", "amount_cents", True),
-            ("supplier_moves", "amount_cents", True),
-            ("receipts", "COALESCE(total_cents, 0)", True),
-        ]
-        for table, col, scoped in sums:
-            where = "shop_id = ? AND reversed = 0" if scoped else "shop_id = ?"
-            row = conn.execute(
-                f"SELECT COUNT(*) n, COALESCE(SUM({col}), 0) s"
-                f" FROM {table} WHERE {where}",
-                (shop_id,)).fetchone()
-            fp.append((table, row["n"], row["s"]))
         row = conn.execute(
-            "SELECT COUNT(*) n, COALESCE(SUM(delta_qty), 0) s FROM stock_moves"
-            " WHERE shop_id = ?", (shop_id,)).fetchone()
-        fp.append(("stock_moves", row["n"], row["s"]))
+            """
+            SELECT
+              (SELECT COUNT(*) FROM sales
+                 WHERE shop_id = ? AND reversed = 0) AS sales_n,
+              (SELECT COALESCE(SUM(total_cents), 0) FROM sales
+                 WHERE shop_id = ? AND reversed = 0) AS sales_s,
+              (SELECT COUNT(*) FROM credit_entries
+                 WHERE shop_id = ? AND reversed = 0) AS credit_n,
+              (SELECT COALESCE(SUM(amount_cents), 0) FROM credit_entries
+                 WHERE shop_id = ? AND reversed = 0) AS credit_s,
+              (SELECT COUNT(*) FROM payments
+                 WHERE shop_id = ? AND reversed = 0) AS pay_n,
+              (SELECT COALESCE(SUM(amount_cents), 0) FROM payments
+                 WHERE shop_id = ? AND reversed = 0) AS pay_s,
+              (SELECT COUNT(*) FROM expenses
+                 WHERE shop_id = ? AND reversed = 0) AS exp_n,
+              (SELECT COALESCE(SUM(amount_cents), 0) FROM expenses
+                 WHERE shop_id = ? AND reversed = 0) AS exp_s,
+              (SELECT COUNT(*) FROM cash_moves
+                 WHERE shop_id = ? AND reversed = 0) AS cash_n,
+              (SELECT COALESCE(SUM(amount_cents), 0) FROM cash_moves
+                 WHERE shop_id = ? AND reversed = 0) AS cash_s,
+              (SELECT COUNT(*) FROM supplier_moves
+                 WHERE shop_id = ? AND reversed = 0) AS sup_n,
+              (SELECT COALESCE(SUM(amount_cents), 0) FROM supplier_moves
+                 WHERE shop_id = ? AND reversed = 0) AS sup_s,
+              (SELECT COUNT(*) FROM receipts
+                 WHERE shop_id = ? AND reversed = 0) AS rec_n,
+              (SELECT COALESCE(SUM(COALESCE(total_cents, 0)), 0) FROM receipts
+                 WHERE shop_id = ? AND reversed = 0) AS rec_s,
+              (SELECT COUNT(*) FROM stock_moves
+                 WHERE shop_id = ?) AS stock_n,
+              (SELECT COALESCE(SUM(delta_qty), 0) FROM stock_moves
+                 WHERE shop_id = ?) AS stock_s,
+              (SELECT COUNT(*) FROM expiry_items
+                 WHERE shop_id = ?) AS exp_items_n
+            """,
+            (shop_id,) * 17,
+        ).fetchone()
+        fp = [
+            ("sales", row["sales_n"], row["sales_s"]),
+            ("credit_entries", row["credit_n"], row["credit_s"]),
+            ("payments", row["pay_n"], row["pay_s"]),
+            ("expenses", row["exp_n"], row["exp_s"]),
+            ("cash_moves", row["cash_n"], row["cash_s"]),
+            ("supplier_moves", row["sup_n"], row["sup_s"]),
+            ("receipts", row["rec_n"], row["rec_s"]),
+            ("stock_moves", row["stock_n"], row["stock_s"]),
+        ]
         prods = conn.execute(
             "SELECT id, stock_qty, price_cents, cost_cents FROM products"
             " WHERE shop_id = ? ORDER BY id", (shop_id,)).fetchall()
         fp.append(("products", tuple(
             (r["id"], r["stock_qty"], r["price_cents"], r["cost_cents"])
             for r in prods)))
-        row = conn.execute(
-            "SELECT COUNT(*) n FROM expiry_items WHERE shop_id = ?",
-            (shop_id,)).fetchone()
-        fp.append(("expiry_items", row["n"]))
+        fp.append(("expiry_items", row["exp_items_n"]))
         return tuple(fp)
     except Exception:
         log.warning("books fingerprint failed", exc_info=True)

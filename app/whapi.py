@@ -14,8 +14,10 @@ Safety model (this channel must never act on unrelated chats):
   broadcasts, channels and status updates are ignored.
 - Messages from the linked sender number itself (WHAPI_NUMBER) are
   dropped; the sender number is never treated as a shop owner.
-- WHAPI_ALLOWLIST (comma-separated digits) is REQUIRED: with no
-  allowlist configured, all inbound is dropped (fail closed).
+- WHAPI_ALLOWLIST (comma-separated digits) is REQUIRED for an open
+  channel: with no allowlist configured, non-demo inbound is dropped
+  (fail closed). Join-code demo users (see app/demo.py) and numbers
+  already marked is_demo may pass without being on the allowlist.
 - Messages older than WHAPI_MAX_AGE_S (default 600) are dropped so a
   history sync can never replay old chats into the shop.
 
@@ -73,6 +75,9 @@ from app.voice import VoiceError
 from app.whatsapp import IncomingMessage, WhatsAppSender, split_message
 
 log = logging.getLogger("sisi.whapi")
+
+# Strangers (not allowlisted, no join code): tip once/day, no LLM.
+PENDING_TIPS: list[tuple[str, str]] = []
 
 DEFAULT_BASE_URL = "https://gate.whapi.cloud"
 DEFAULT_CHANNEL_ID = "DEADPL-S9KV8"
@@ -403,11 +408,12 @@ def parse_whapi_webhook(payload: dict, *, now: float | None = None) -> list[Inco
         return []
     allowed = _allowlist()
     if not allowed:
-        log.warning("whapi inbound dropped: WHAPI_ALLOWLIST is not set")
-        return []
+        log.warning("whapi inbound: WHAPI_ALLOWLIST is not set "
+                    "(demo join-codes still accepted)")
     own = _own_number()
     stamp = time.time() if now is None else now
     out: list[IncomingMessage] = []
+    tips: list[tuple[str, str]] = []  # (shop_id, mid) for once-a-day tip
     for m in messages:
         if not isinstance(m, dict):
             continue
@@ -428,9 +434,39 @@ def parse_whapi_webhook(payload: dict, *, now: float | None = None) -> list[Inco
         if shop_id == own:
             continue  # the linked account's own messages: never process
         if shop_id not in allowed:
-            log.warning("whapi inbound dropped: %s not in allowlist id=%s",
-                        shop_id, mid)
-            continue
+            # Demo path: join code in text, or an existing demo shop.
+            # Everything else gets a tip (no LLM) via the webhook handler.
+            body_guess = ""
+            if str(m.get("type", "") or "") == "text":
+                node = m.get("text") or {}
+                if isinstance(node, dict):
+                    body_guess = node.get("body", "") or ""
+            from app import demo as _demo
+            matched, _lang = _demo.extract_join(
+                body_guess if isinstance(body_guess, str) else "")
+            is_demo = False
+            if not matched:
+                try:
+                    from app.db import connect, init_db
+                    _c = connect()
+                    try:
+                        init_db(_c)
+                        is_demo = _demo.is_demo_shop(_c, shop_id)
+                    finally:
+                        _c.close()
+                except Exception:
+                    log.warning("demo lookup failed", exc_info=True)
+            if not matched and not is_demo:
+                if str(m.get("type", "") or "") == "text":
+                    log.info("whapi inbound tip-candidate %s id=%s",
+                             shop_id, mid)
+                    tips.append((shop_id, mid))
+                else:
+                    log.warning("whapi inbound dropped: %s not in allowlist "
+                                "id=%s", shop_id, mid)
+                continue
+            log.info("whapi inbound demo path %s id=%s join=%s",
+                     shop_id, mid, matched)
         if not _fresh(m.get("timestamp"), stamp):
             log.info("whapi inbound dropped: stale ts=%r id=%s",
                      m.get("timestamp"), mid)
@@ -481,6 +517,8 @@ def parse_whapi_webhook(payload: dict, *, now: float | None = None) -> list[Inco
         else:
             log.info("whapi inbound dropped: type=%r id=%s", m.get("type"),
                      mid)
+    PENDING_TIPS.clear()
+    PENDING_TIPS.extend(tips)
     return out
 
 

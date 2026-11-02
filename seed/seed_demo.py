@@ -37,6 +37,7 @@ PRODUCTS = [
 
 CUSTOMERS = ["Thandi", "Sipho", "Lerato", "Jabu", "Nomvula", "Bongani"]
 
+
 # customer, amount_cents, items_text
 CREDIT = [
     ("Sipho", 7300, "2x Sasko White Bread, 1x Coke 2L"),
@@ -80,16 +81,18 @@ def wipe_shop(conn: sqlite3.Connection, shop_id: str) -> None:
         conn.execute(f"DELETE FROM {table} WHERE shop_id = ?", (shop_id,))
 
 
-def seed_demo(shop_id: str = DEMO_SHOP_ID, conn: sqlite3.Connection | None = None) -> str:
+def seed_demo(shop_id: str = DEMO_SHOP_ID, conn: sqlite3.Connection | None = None,
+             language: str = "zu") -> str:
     own = conn is None
     conn = conn or connect()
     try:
         init_db(conn)
         wipe_shop(conn, shop_id)
         ts = now_iso()
+        lang = (language or "en").strip().lower() or "en"
         conn.execute(
-            "INSERT INTO shops (shop_id, name, language) VALUES (?, ?, 'zu')",
-            (shop_id, DEMO_SHOP_NAME),
+            "INSERT INTO shops (shop_id, name, language) VALUES (?, ?, ?)",
+            (shop_id, DEMO_SHOP_NAME, lang),
         )
         cust_ids: dict[str, int] = {}
         for name in CUSTOMERS:
@@ -139,6 +142,72 @@ def seed_demo(shop_id: str = DEMO_SHOP_ID, conn: sqlite3.Connection | None = Non
     finally:
         if own:
             conn.close()
+
+
+def add_demo_activity(conn: sqlite3.Connection, shop_id: str) -> None:
+    """Add today's cash/card sales + a payment so the overview card is rich.
+
+    Called for join-code demo shops only; the base seed stays lean for tests.
+    """
+    ts = now_iso()
+    prods = {r["name"]: r["id"] for r in conn.execute(
+        "SELECT id, name FROM products WHERE shop_id = ?", (shop_id,)).fetchall()}
+    cust = {r["name"]: r["id"] for r in conn.execute(
+        "SELECT id, name FROM customers WHERE shop_id = ?", (shop_id,)).fetchall()}
+    sample_sales = [
+        ("Sasko White Bread 700g", 2, 3700, "cash"),
+        ("Coke 2L", 1, 3600, "cash"),
+        ("Lucky Star Pilchards 400g", 3, 8550, "card"),
+        ("Eggs", 12, 4200, "cash"),
+    ]
+    for i, (pname, qty, total, method) in enumerate(sample_sales):
+        pid = prods.get(pname)
+        if pid is None:
+            continue
+        aid = f"seed-{shop_id}-sale-{i}"
+        # Skip if already applied (idempotent-ish for re-runs).
+        if conn.execute("SELECT 1 FROM actions WHERE action_id = ?",
+                        (aid,)).fetchone():
+            continue
+        conn.execute(
+            """INSERT INTO sales (shop_id, product_id, product_name, qty,
+               total_cents, pay_method, action_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (shop_id, pid, pname, qty, total, method, aid, ts),
+        )
+        conn.execute(
+            """INSERT INTO stock_moves (shop_id, product_id, delta_qty, reason,
+               action_id, created_at) VALUES (?, ?, ?, 'sale', ?, ?)""",
+            (shop_id, pid, -qty, aid, ts),
+        )
+        conn.execute(
+            "UPDATE products SET stock_qty = stock_qty - ? WHERE id = ?",
+            (qty, pid),
+        )
+        conn.execute(
+            """INSERT INTO actions (action_id, shop_id, kind, summary, data_json, created_at)
+               VALUES (?, ?, 'sale', ?, ?, ?)""",
+            (aid, shop_id, f"seed sale {pname}",
+             json.dumps({"product": pname, "qty": qty, "total_cents": total}), ts),
+        )
+    if "Sipho" in cust:
+        paid = 2000
+        aid = f"seed-{shop_id}-pay-0"
+        if not conn.execute("SELECT 1 FROM actions WHERE action_id = ?",
+                            (aid,)).fetchone():
+            conn.execute(
+                """INSERT INTO payments (shop_id, customer_id, amount_cents,
+                   action_id, created_at) VALUES (?, ?, ?, ?, ?)""",
+                (shop_id, cust["Sipho"], paid, aid, ts),
+            )
+            conn.execute(
+                """INSERT INTO actions (action_id, shop_id, kind, summary, data_json, created_at)
+                   VALUES (?, ?, 'payment', ?, ?, ?)""",
+                (aid, shop_id, "seed payment Sipho",
+                 json.dumps({"amount_cents": paid}), ts),
+            )
+    conn.commit()
+
 
 
 def main() -> None:

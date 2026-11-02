@@ -137,6 +137,12 @@ from app.tools import (
 MEDIA_OUTBOX: dict[str, list[dict]] = {}
 """Queued image/file sends per shop; main.py drains after the text reply."""
 
+OVERVIEW_PENDING: set[str] = set()
+"""Shop ids that need an overview card AFTER the text reply is sent."""
+
+DEFER_OVERVIEW: ContextVar[bool] = ContextVar("sisi_defer_overview", default=False)
+"""When True (live webhook), overview PNG renders after the text reply."""
+
 
 def queue_media(shop_id: str, items: list[dict]) -> None:
     if items:
@@ -145,6 +151,17 @@ def queue_media(shop_id: str, items: list[dict]) -> None:
 
 def take_media(shop_id: str) -> list[dict]:
     return MEDIA_OUTBOX.pop(shop_id, [])
+
+
+def mark_overview_pending(shop_id: str) -> None:
+    OVERVIEW_PENDING.add(shop_id)
+
+
+def take_overview_pending(shop_id: str) -> bool:
+    if shop_id in OVERVIEW_PENDING:
+        OVERVIEW_PENDING.discard(shop_id)
+        return True
+    return False
 
 
 LIST_OUTBOX: dict[str, list[dict]] = {}
@@ -1840,6 +1857,10 @@ def _with_overview(conn: sqlite3.Connection, shop_id: str,
             return message
         after_fp = overview.books_fingerprint(conn, shop_id)
         if before_fp is None or after_fp is None or after_fp == before_fp:
+            return message
+        if DEFER_OVERVIEW.get():
+            # Live webhook: send the text reply first, render PNG after.
+            mark_overview_pending(shop_id)
             return message
         fallback = overview.queue_overview_and_menu(conn, shop_id)
         return message + ("\n\n" + fallback if fallback else "")

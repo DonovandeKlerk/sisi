@@ -54,6 +54,9 @@ CREATE TABLE IF NOT EXISTS shops (
   logo_orig_path TEXT NOT NULL DEFAULT '',
   channel    TEXT NOT NULL DEFAULT '',
   consent_given_at TEXT,
+  is_demo    INTEGER NOT NULL DEFAULT 0,
+  demo_msgs  INTEGER NOT NULL DEFAULT 0,
+  demo_joined_at TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
@@ -300,6 +303,13 @@ CREATE TABLE IF NOT EXISTS reports (
 
 CREATE TABLE IF NOT EXISTS flags (
   shop_id TEXT NOT NULL REFERENCES shops(shop_id),
+  key     TEXT NOT NULL,
+  value   TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (shop_id, key)
+);
+
+CREATE TABLE IF NOT EXISTS demo_gate (
+  shop_id TEXT NOT NULL,
   key     TEXT NOT NULL,
   value   TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (shop_id, key)
@@ -615,6 +625,9 @@ def init_db(conn: DbConnection) -> None:
         "ALTER TABLE reminders ADD COLUMN blocked_reason TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE send_queue ADD COLUMN claimed_at REAL",
         "ALTER TABLE sales ADD COLUMN pay_method TEXT NOT NULL DEFAULT 'cash'",
+        "ALTER TABLE shops ADD COLUMN is_demo INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE shops ADD COLUMN demo_msgs INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE shops ADD COLUMN demo_joined_at TEXT",
     ):
         try:
             conn.execute(sql)

@@ -5924,3 +5924,89 @@ STRINGS["tn"].update({
     "ov_fallback_head": "📊 {title} · {updated}",
     "ov_fallback_line": "• {label}: {value}",
 })
+
+# --- join-code demo mode ---------------------------------------------------
+STRINGS["en"].update({
+    "demo_welcome": (
+        "👋 Welcome to *Sisi* — your WhatsApp shop assistant.\n\n"
+        "Demo shop: MaZulu's Spaza (sample stock + sales).\n"
+        "You have *{n} messages*. Try sell, stock, who owes, reports.\n\n"
+        "Pick from the menu, or type / send a voice note.\n"
+        "Code: {code}"
+    ),
+    "demo_exhausted": (
+        "That's your *{n}-message* demo — thanks for trying Sisi!\n\n"
+        "For full access, message Donovan or open Sisi on Version One.\n\n"
+        "Fresh demo later: send *{code}* again tomorrow."
+    ),
+})
+STRINGS["zu"].update({
+    "demo_welcome": (
+        "👋 Sawubona ku-*Sisi* — umsizi wesitolo ku-WhatsApp.\n\n"
+        "I-demo: MaZulu's Spaza (isitokwe + ukuthengisa).\n"
+        "Unemiyalezo engu-*{n}*. Zama dayisa, isitoko, imibiko.\n\n"
+        "Khetha kumenyu, noma bhala / thumela izwi.\n"
+        "Ikhodi: {code}"
+    ),
+    "demo_exhausted": (
+        "I-demo yemiyalezo engu-*{n}* iphelile — siyabonga!\n\n"
+        "Ukufinyelela okugcwele: thumela uDonovan noma Version One.\n\n"
+        "Qala kabusha: thumela *{code}* kusasa."
+    ),
+})
+STRINGS["af"].update({
+    "demo_welcome": (
+        "👋 Welkom by *Sisi* — jou WhatsApp-winkelassistent.\n\n"
+        "Demo: MaZulu's Spaza (steekproefvoorraad + verkope).\n"
+        "Jy het *{n} boodskappe*. Probeer verkoop, voorraad, state.\n\n"
+        "Kies die kieslys, of tik / stuur 'n stemnota.\n"
+        "Kode: {code}"
+    ),
+    "demo_exhausted": (
+        "Jou *{n}-boodskap* demo is klaar — dankie dat jy Sisi probeer!\n\n"
+        "Volle toegang: booodskap Donovan of Sisi op Version One.\n\n"
+        "Vars demo: stuur *{code}* môre weer."
+    ),
+})
+STRINGS["xh"].update({
+    "demo_welcome": (
+        "👋 Wamkelekile ku-*Sisi* — umncedisi wevenkile ku-WhatsApp.\n\n"
+        "Idemo: MaZulu's Spaza (isitokhwe + ukuthengisa).\n"
+        "Unemiyalezo engama-*{n}*. Zama thengisa, isitokhwe, iingxelo.\n\n"
+        "Khetha kwimenyu, okanye bhala / thumela ilizwi.\n"
+        "Ikhowudi: {code}"
+    ),
+    "demo_exhausted": (
+        "Idemo yemiyalezo engama-*{n}* iphelile — enkosi!\n\n"
+        "Ukufikelela okupheleleyo: thumela uDonovan okanye Version One.\n\n"
+        "Qala kwakhona: thumela *{code}* ngomso."
+    ),
+})
+STRINGS["st"].update({
+    "demo_welcome": (
+        "👋 Amohela ho *Sisi* — mothusi wa lebenkele ho WhatsApp.\n\n"
+        "Demo: MaZulu's Spaza (setoko + dithekiso).\n"
+        "O na le melaetsa e *{n}*. Leka rekisa, setoko, ditlaleho.\n\n"
+        "Kgetha lenaneng, kapa ngola / romela lentswe.\n"
+        "Khoutu: {code}"
+    ),
+    "demo_exhausted": (
+        "Demo ya melaetsa e *{n}* e felile — kea leboha!\n\n"
+        "Phihlellelo e felletseng: romela Donovan kapa Version One.\n\n"
+        "Qala bocha: romela *{code}* hosane."
+    ),
+})
+STRINGS["tn"].update({
+    "demo_welcome": (
+        "👋 Amogelesega mo *Sisi* — mothusi wa lebenkele mo WhatsApp.\n\n"
+        "Demo: MaZulu's Spaza (setoko + dithekiso).\n"
+        "O na le molaetsa e *{n}*. Leka rekisa, setoko, dipego.\n\n"
+        "Tlhopha mo lenaneng, kgotsa kwala / romela lentswe.\n"
+        "Khoutu: {code}"
+    ),
+    "demo_exhausted": (
+        "Demo ya molaetsa e *{n}* e fedile — ke a leboga!\n\n"
+        "Phihelelo e e feletseng: romela Donovan kgotsa Version One.\n\n"
+        "Simolola sesha: romela *{code}* kamoso."
+    ),
+})

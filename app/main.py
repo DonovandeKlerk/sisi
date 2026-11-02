@@ -18,15 +18,16 @@ import traceback
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, PlainTextResponse, Response
 
-from app.agent import (handle_photo, handle_text, handle_voice, take_buttons,
-                       take_lists, take_media)
+from app.agent import (DEFER_OVERVIEW, handle_photo, handle_text, handle_voice,
+                       take_buttons, take_lists, take_media,
+                       take_overview_pending)
 from app.db import READ_ONLY, connect, enforce_read_only, init_db, now_iso
 from app.i18n import CURRENT_LANG, STRINGS, detect, owner_lang
 from app.i18n import t as _t
 from app.vision import VisionError
 from app.voice import VoiceError
 from app.vonage import VonageSender, download_vonage_media, parse_vonage_webhook
-from app.whapi import parse_whapi_status, parse_whapi_webhook
+from app.whapi import PENDING_TIPS, parse_whapi_status, parse_whapi_webhook
 from app.infobip import (InfobipSender, download_infobip_media,
                          parse_infobip_webhook)
 from app.providers import sender_for_channel
@@ -147,6 +148,28 @@ def _ack_inbound(channel: str, message_id: str, shop_id: str) -> None:
             WhapiSender().send_presence(shop_id)
         except Exception:
             log.warning("presence failed", exc_info=True)
+
+
+
+def _send_demo_tip(shop_id: str, message_id: str) -> None:
+    """Once-a-day how-to-try tip for strangers. No LLM, no shop setup."""
+    from app import demo as _demo
+    from app.sendqueue import send_immediate
+    conn = connect()
+    try:
+        init_db(conn)
+        if _demo.tip_already_sent(conn, shop_id):
+            log.info("demo tip suppressed (already today) %s", shop_id)
+            return
+        if _already_seen(message_id, shop_id):
+            return
+        send_immediate("whapi", shop_id, "text", {"body": _demo.tip_text()})
+        _demo.mark_tip_sent(conn, shop_id)
+        log.info("demo tip sent to %s", shop_id)
+    except Exception:
+        log.warning("demo tip failed", exc_info=True)
+    finally:
+        conn.close()
 
 
 async def _dispatch(background_tasks: BackgroundTasks,
@@ -350,9 +373,15 @@ async def webhook_whapi_receive(request: Request,
     except Exception:
         log.warning("whapi status parse failed", exc_info=True)
     msgs = parse_whapi_webhook(payload)
-    if not msgs and not isinstance(payload.get("event"), dict):
+    tips = list(PENDING_TIPS)
+    PENDING_TIPS.clear()
+    if not msgs and not tips and not isinstance(payload.get("event"), dict):
         log.warning("whapi inbound dropped: no messages keys=%s",
                     sorted(payload.keys()) if isinstance(payload, dict) else "?")
+    for shop_id, mid in tips:
+        if _rate_limited(shop_id):
+            continue
+        background_tasks.add_task(_send_demo_tip, shop_id, mid)
     for msg in msgs:
         log.info("whapi inbound id=%s from=%s type=%s", msg.message_id,
                  msg.shop_id, msg.kind)
@@ -448,6 +477,24 @@ def process_message(msg: IncomingMessage) -> None:
     # WHAPI_ALLOW_WRITES=1. Other channels are unaffected.
     ro = (msg.channel or "meta") == "whapi" \
         and os.environ.get("WHAPI_ALLOW_WRITES", "") != "1"
+    # Demo join-code shops must mutate their own sandbox even when the
+    # Whapi channel is otherwise read-only for real shops.
+    if ro and (msg.channel or "meta") == "whapi":
+        try:
+            from app import demo as _demo
+            matched, _ = _demo.extract_join(msg.text)
+            if matched:
+                ro = False
+            else:
+                _c = connect()
+                try:
+                    init_db(_c)
+                    if _demo.is_demo_shop(_c, msg.shop_id):
+                        ro = False
+                finally:
+                    _c.close()
+        except Exception:
+            log.warning("demo write-unlock check failed", exc_info=True)
     token = READ_ONLY.set(ro)
     try:
         log.info("handling id=%s channel=%s kind=%s shop=%s%s",
@@ -492,6 +539,7 @@ def _handle_message(sender, msg: IncomingMessage) -> None:
     from app.reports import ensure_dirs
     from app.sendqueue import QueuedSender
     ensure_dirs()
+    defer_token = DEFER_OVERVIEW.set(True)
     conn = connect()
     try:
         init_db(conn)
@@ -514,16 +562,64 @@ def _handle_message(sender, msg: IncomingMessage) -> None:
             log.info("whapi inbound: shops.channel left unchanged")
         CURRENT_LANG.set(detect(msg.text, default=owner_lang(conn, msg.shop_id)))
         out = QueuedSender.wrap(sender, conn, channel)
-        try:
-            line = _slow_line(conn, msg)
-            if line:
-                out.send_text(msg.shop_id, line)
-                out.flush()
-        except Exception:
-            log.warning("status line failed", exc_info=True)
+
+        # --- join-code demo gate (no LLM) ---------------------------------
+        demo_handled = False
+        if (msg.channel or "meta") == "whapi":
+            from app import demo as _demo
+            matched, join_lang = _demo.extract_join(msg.text)
+            is_demo = _demo.is_demo_shop(conn, msg.shop_id)
+            used_now = _demo.demo_msgs_used(conn, msg.shop_id) if is_demo else 0
+            if matched and (not is_demo or used_now >= _demo.msg_limit()):
+                if not is_demo and _demo.cap_reached(conn):
+                    out.send_text(msg.shop_id, _demo.cap_full_text())
+                    out.flush()
+                    return
+                _demo.provision_demo(conn, msg.shop_id, join_lang)
+                _demo.increment_demo_msg(conn, msg.shop_id)
+                CURRENT_LANG.set(join_lang)
+                reply = _demo.start_demo_reply(conn, msg.shop_id, join_lang)
+                buttons = None
+                demo_handled = True
+            elif matched and is_demo:
+                # Already in an active demo: refresh welcome + menu, no LLM.
+                _demo.increment_demo_msg(conn, msg.shop_id)
+                lang = owner_lang(conn, msg.shop_id) or join_lang
+                CURRENT_LANG.set(lang)
+                reply = _demo.start_demo_reply(conn, msg.shop_id, lang)
+                buttons = None
+                demo_handled = True
+            elif is_demo:
+                used = _demo.increment_demo_msg(conn, msg.shop_id)
+                limit = _demo.msg_limit()
+                if used > limit:
+                    # Past the limit: polite close at most once a day.
+                    if _demo.exhausted_notice_sent_today(conn, msg.shop_id):
+                        log.info("demo exhausted silent %s used=%s",
+                                 msg.shop_id, used)
+                        return
+                    lang = owner_lang(conn, msg.shop_id)
+                    out.send_text(msg.shop_id, _demo.exhausted_text(lang))
+                    out.flush()
+                    _demo.mark_exhausted_notice(conn, msg.shop_id)
+                    return
+                if used == limit:
+                    # 10th message: handle normally, then append closing.
+                    pass
+
+        if not demo_handled:
+            try:
+                line = _slow_line(conn, msg)
+                if line:
+                    out.send_text(msg.shop_id, line)
+                    out.flush()
+            except Exception:
+                log.warning("status line failed", exc_info=True)
         from app.reminders import parse_msg_ts
         sent_at = parse_msg_ts(msg.timestamp)
-        if msg.kind == "media:audio":
+        if demo_handled:
+            pass  # reply/buttons already set
+        elif msg.kind == "media:audio":
             try:
                 audio = _download_msg_media(msg, "voice note")
                 if audio is None:
@@ -584,9 +680,41 @@ def _handle_message(sender, msg: IncomingMessage) -> None:
                           lst["rows"])
         for item in [i for i in items if not i.get("first")]:
             out.send_media_item(msg.shop_id, item)
+        # Flush the task reply first so the owner sees it immediately.
         out.flush()
+
+        # Deferred overview card + menu (post-task or demo welcome).
+        if take_overview_pending(msg.shop_id):
+            try:
+                from app.overview import queue_overview_and_menu
+                fallback = queue_overview_and_menu(conn, msg.shop_id)
+                if fallback:
+                    out.send_text(msg.shop_id, fallback)
+                for item in take_media(msg.shop_id):
+                    out.send_media_item(msg.shop_id, item)
+                for lst in take_lists(msg.shop_id):
+                    out.send_list(msg.shop_id, lst["body"], lst["button_text"],
+                                  lst["rows"])
+                out.flush()
+            except Exception:
+                log.warning("deferred overview failed", exc_info=True)
+
+        # After the 10th demo message, append the closing note.
+        try:
+            from app import demo as _demo
+            if _demo.is_demo_shop(conn, msg.shop_id):
+                used = _demo.demo_msgs_used(conn, msg.shop_id)
+                if used >= _demo.msg_limit() and not _demo.exhausted_notice_sent_today(
+                        conn, msg.shop_id):
+                    lang = owner_lang(conn, msg.shop_id)
+                    out.send_text(msg.shop_id, _demo.exhausted_text(lang))
+                    out.flush()
+                    _demo.mark_exhausted_notice(conn, msg.shop_id)
+        except Exception:
+            log.warning("demo close note failed", exc_info=True)
     finally:
         conn.close()
+        DEFER_OVERVIEW.reset(defer_token)
     log.info("%s -> %s (%s)", msg.shop_id, msg.message_id,
              "buttons" if buttons else "text")
 
