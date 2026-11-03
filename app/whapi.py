@@ -296,20 +296,64 @@ class WhapiSender(WhatsAppSender):
             return False
 
     def send_image(self, to: str, url: str, caption: str = "") -> None:
+        """Send an image URL. Retries transient failures with backoff.
+
+        Raises after the retry budget so the queue/worker can soft-fail
+        (record last-failed-media, keep text/menu flowing).
+        """
         dest = _digits(to)
-        self._post("/messages/image",
-                   {"to": dest, "media": url,
-                    "caption": caption[:1000] if caption else ""},
-                   "image", dest, timeout=30)
+        self._post_media(
+            "/messages/image",
+            {"to": dest, "media": url,
+             "caption": caption[:1000] if caption else ""},
+            "image", dest)
 
     def send_file(self, to: str, url: str, filename: str,
                   caption: str = "") -> None:
+        """Send a document URL. Same retry/soft-fail contract as images."""
         dest = _digits(to)
         payload = {"to": dest, "media": url,
                    "filename": (filename or "sisi-file")[:255]}
         if caption:
             payload["caption"] = caption[:1000]
-        self._post("/messages/document", payload, "file", dest, timeout=30)
+        self._post_media("/messages/document", payload, "file", dest)
+
+    def _post_media(self, path: str, payload: dict, label: str,
+                    to: str) -> dict:
+        """Media POST with 3 attempts + backoff (via call_with_retries)."""
+        # Slightly longer base delay than text: Whapi often needs a beat
+        # to fetch a freshly published /media URL.
+        self._check()
+
+        def send():
+            resp = httpx.post(self.base_url + path, headers=self._headers(),
+                              json=payload, timeout=30)
+            resp.raise_for_status()
+            try:
+                body = resp.json()
+            except ValueError:
+                body = {}
+            log.info("whapi %s sent to=%s status=%s id=%s", label, to,
+                     resp.status_code,
+                     body.get("id", "?") if isinstance(body, dict) else "?")
+            return body if isinstance(body, dict) else {}
+
+        try:
+            return call_with_retries(send, attempts=3, base_delay=1.0)
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code if e.response is not None else "?"
+            if status == 429:
+                log.warning("whapi 429 to=%s retry-after=%s", to,
+                            _retry_after(e.response))
+                raise RateLimited(_retry_after(e.response)) from e
+            text = e.response.text[:300] if e.response is not None else ""
+            log.error("whapi %s failed to=%s status=%s body=%s after retries",
+                      label, to, status, text)
+            raise
+        except httpx.TransportError:
+            log.error("whapi %s transport failed to=%s after retries",
+                      label, to, exc_info=True)
+            raise
 
     def mark_read(self, message_id: str) -> bool:
         # No read-receipt endpoint verified in the Whapi docs; skip rather

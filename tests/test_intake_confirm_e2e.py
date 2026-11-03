@@ -283,9 +283,9 @@ def test_full_four_items_summary_undo_and_no_money(shop_db):
     msgs = _send("Yes")
     assert any("saved 4" in m.lower() or "4 saved" in m.lower()
                or ("Albany" in m and "Risi" in m) for m in msgs)
-    # Completed intake queues the post-task overview image + main menu
-    # after the summary.
-    assert "Main menu" in msgs[-1]
+    # Completed intake queues the main menu, then the overview image
+    # (menu first so a flaky image never blocks it).
+    assert any("Main menu" in m for m in msgs)
     conn = _db(shop_db)
     try:
         assert _stock(conn, "Albany Superior White Bread 700g")[0] == 1.0
@@ -297,9 +297,9 @@ def test_full_four_items_summary_undo_and_no_money(shop_db):
                             " WHERE shop_id = ?", (SHOP,)).fetchone()["c"] == 0
     finally:
         conn.close()
-    msgs = _send("undo")  # undo reply, then overview image + main menu
+    msgs = _send("undo")  # undo reply, then main menu + overview image
     assert any("Risi" in m for m in msgs)
-    assert "Main menu" in msgs[-1]
+    assert any("Main menu" in m for m in msgs)
     conn = _db(shop_db)
     try:
         assert _stock(conn, "Risi Marie Multipack 3x150g") is None

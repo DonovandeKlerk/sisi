@@ -11,7 +11,7 @@ import app.llm as llm
 import app.main as main
 import app.whapi as whapi
 from app import demo
-from app.agent import LIST_OUTBOX, take_lists, take_media
+from app.agent import LIST_OUTBOX, take_buttons, take_lists, take_media
 from app.db import connect, init_db
 from app.main import app, process_message
 from app.whapi import PENDING_TIPS, parse_whapi_webhook
@@ -136,7 +136,7 @@ def test_join_provisions_isolated_shop_and_menu(demo_env):
 
     conn = connect()
     assert demo.is_demo_shop(conn, STRANGER)
-    assert demo.demo_msgs_used(conn, STRANGER) == 1
+    assert demo.demo_msgs_used(conn, STRANGER) == 0  # join code is free
     # Premade stock + today's sample sales present
     n = conn.execute("SELECT COUNT(*) n FROM products WHERE shop_id = ?",
                      (STRANGER,)).fetchone()["n"]
@@ -175,11 +175,15 @@ def test_join_language_suffix(demo_env):
 
 
 def test_ten_message_cap_and_eleventh(demo_env, monkeypatch):
-    # Join
+    # Join is free — does not consume the limit.
     process_message(IncomingMessage(
         "c0", STRANGER, "text", "SISI-DEMO", str(int(NOW)), channel="whapi"))
-    # Messages 2..10: deterministic menu taps (no LLM)
-    for i in range(2, 11):
+    conn = connect()
+    assert demo.demo_msgs_used(conn, STRANGER) == 0
+    conn.close()
+
+    # 10 real messages: deterministic menu taps (no LLM)
+    for i in range(1, 11):
         process_message(IncomingMessage(
             f"c{i}", STRANGER, "text", "menu",
             str(int(NOW) + i), channel="whapi"))
@@ -198,6 +202,23 @@ def test_ten_message_cap_and_eleventh(demo_env, monkeypatch):
     conn = connect()
     assert demo.demo_msgs_used(conn, STRANGER) == 12
     assert demo.exhausted_notice_sent_today(conn, STRANGER)
+    conn.close()
+
+
+def test_rejoin_code_does_not_count(demo_env):
+    """Re-sending the join code refreshes welcome/menu but stays free."""
+    process_message(IncomingMessage(
+        "rj0", STRANGER, "text", "SISI-DEMO", str(int(NOW)), channel="whapi"))
+    process_message(IncomingMessage(
+        "rj1", STRANGER, "text", "menu", str(int(NOW) + 1), channel="whapi"))
+    process_message(IncomingMessage(
+        "rj2", STRANGER, "text", "SISI-DEMO", str(int(NOW) + 2), channel="whapi"))
+    process_message(IncomingMessage(
+        "rj3", STRANGER, "text", "SISI-DEMO-ZU", str(int(NOW) + 3),
+        channel="whapi"))
+    conn = connect()
+    assert demo.is_demo_shop(conn, STRANGER)
+    assert demo.demo_msgs_used(conn, STRANGER) == 1  # only the menu tap
     conn.close()
 
 
@@ -220,3 +241,87 @@ def test_allowlisted_shop_unaffected(demo_env):
         _payload(_msg(mid="a1", frm=SHOP, body="menu")), now=NOW)
     assert len(msgs) == 1
     assert msgs[0].shop_id == SHOP
+
+
+def test_join_sends_try_nudge_without_counting(demo_env, monkeypatch):
+    """Welcome + menu + try-nudge; join code still free (0 msgs used)."""
+    sent = []
+
+    class Cap:
+        def send_text(self, to, body):
+            sent.append(("text", to, body))
+            return "mid-t"
+        def send_buttons(self, to, body, buttons, header="", footer=""):
+            sent.append(("buttons", to, body, list(buttons)))
+        def send_list(self, to, body, button_text, rows, header="", footer=""):
+            sent.append(("list", to, body, button_text, list(rows)))
+        def send_image(self, to, url, caption=""):
+            sent.append(("image", to, url))
+        def send_file(self, to, url, filename, caption=""):
+            sent.append(("file", to, url))
+        def mark_read(self, mid):
+            return False
+        def send_presence(self, to, presence="composing"):
+            return True
+
+    monkeypatch.setattr("app.main.sender_for_channel", lambda channel: Cap())
+    process_message(IncomingMessage(
+        "nudge-1", STRANGER, "text", "SISI-DEMO",
+        str(int(NOW)), channel="whapi"))
+    conn = connect()
+    assert demo.is_demo_shop(conn, STRANGER)
+    assert demo.demo_msgs_used(conn, STRANGER) == 0
+    conn.close()
+    button_msgs = [s for s in sent if s[0] == "buttons"]
+    assert button_msgs, f"expected try-nudge buttons, got {sent!r}"
+    # The try-nudge is the buttons payload that carries the three examples.
+    nudge = next(s for s in button_msgs if "sold 2 bread R30" in s[3])
+    assert "💡" in nudge[2]
+    assert "Who owes me?" in nudge[3]
+    assert any("Thandi" in b for b in nudge[3])
+
+
+def test_try_nudge_all_six_languages():
+    from app.i18n import LANGS
+    for lang in LANGS:
+        body, examples = demo.try_nudge(lang)
+        assert body and "💡" in body
+        assert len(examples) == 3
+        assert "Thandi" in examples[2]
+        assert "R30" in examples[0] or "bread" in examples[0].lower()
+
+
+def test_overview_media_failure_still_sends_menu(demo_env, monkeypatch):
+    """Flaky overview image must not block the main menu / try-nudge."""
+    sent = []
+
+    class Cap:
+        def send_text(self, to, body):
+            sent.append(("text", to, body))
+            return "mid-t"
+        def send_buttons(self, to, body, buttons, header="", footer=""):
+            sent.append(("buttons", to, body, list(buttons)))
+        def send_list(self, to, body, button_text, rows, header="", footer=""):
+            sent.append(("list", to, body, button_text, list(rows)))
+        def send_image(self, to, url, caption=""):
+            raise RuntimeError("whapi image upstream failed")
+        def send_file(self, to, url, filename, caption=""):
+            raise RuntimeError("whapi file upstream failed")
+        def mark_read(self, mid):
+            return False
+        def send_presence(self, to, presence="composing"):
+            return True
+
+    monkeypatch.setattr("app.main.sender_for_channel", lambda channel: Cap())
+    monkeypatch.setattr("app.sendqueue.BACKOFF_S", (0, 0, 0, 0))
+    monkeypatch.setattr("app.sendqueue.DRAIN_BUDGET_S", 0.5)
+    monkeypatch.delenv("SISI_SPAWN", raising=False)
+    process_message(IncomingMessage(
+        "media-fail-1", STRANGER, "text", "SISI-DEMO",
+        str(int(NOW)), channel="whapi"))
+    assert any(s[0] == "list" for s in sent) or any(
+        s[0] == "buttons" and "💡" in (s[2] or "") for s in sent
+    ), f"menu/nudge missing after media fail: {sent!r}"
+    conn = connect()
+    assert demo.demo_msgs_used(conn, STRANGER) == 0
+    conn.close()

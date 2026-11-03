@@ -377,14 +377,21 @@ def queue_overview_and_menu(conn: sqlite3.Connection, shop_id: str) -> str:
         except Exception:
             log.warning("overview menu failed", exc_info=True)
         return fallback
+    # Menu first, then media: FIFO send queues must not let a flaky
+    # overview image delay or block the tappable main menu.
+    try:
+        show_menu(conn, shop_id)
+    except Exception:
+        log.warning("overview menu failed", exc_info=True)
     try:
         if media:
             queue_media(shop_id, media)
     except Exception:
         log.warning("overview queue failed", exc_info=True)
-        with doc_lang(owner_lang(conn, shop_id)):
-            fallback = overview_text(overview_data(conn, shop_id))
-        show_menu(conn, shop_id)
-        return fallback
-    show_menu(conn, shop_id)
+        try:
+            with doc_lang(owner_lang(conn, shop_id)):
+                return overview_text(overview_data(conn, shop_id))
+        except Exception:
+            log.warning("overview fallback failed", exc_info=True)
+            return ""
     return ""

@@ -4,11 +4,11 @@ A stranger who texts the join code (default SISI-DEMO, optional language
 suffix like SISI-DEMO-ZU) gets their own isolated copy of the premade
 demo shop, a short welcome, the overview card and the main menu. Real
 allowlisted shops are untouched. Each demo number is capped at
-SISI_DEMO_MSG_LIMIT inbound messages (default 10); after that Sisi
-sends a closing note and ignores further traffic (at most one close
-reminder per day). Strangers with no code get a short tip once a day,
-with no LLM call. A global daily join cap (SISI_DEMO_DAILY_CAP) stops
-runaway cost.
+SISI_DEMO_MSG_LIMIT real inbound messages (default 10); the join code
+itself (and re-sending it) does not count. After the limit Sisi sends a
+closing note and ignores further traffic (at most one close reminder per
+day). Strangers with no code get a short tip once a day, with no LLM
+call. A global daily join cap (SISI_DEMO_DAILY_CAP) stops runaway cost.
 """
 
 from __future__ import annotations
@@ -292,6 +292,28 @@ def start_demo_reply(conn: sqlite3.Connection, shop_id: str, lang: str) -> str:
     CURRENT_LANG.set(lang if lang in LANGS else "en")
     mark_overview_pending(shop_id)
     return welcome_text(lang)
+
+
+
+
+def try_nudge(lang: str = "en") -> tuple[str, list[str]]:
+    """Short post-welcome tip + up to 3 example actions (buttons).
+
+    Outbound only — never increments demo_msgs. Examples use MaZulu's
+    Spaza seed names/items so taps work on a fresh demo shop.
+    """
+    lang = lang if lang in LANGS else "en"
+    token = CURRENT_LANG.set(lang)
+    try:
+        body = _t("demo_try_nudge")
+        examples = [
+            _t("demo_try_sold"),
+            _t("demo_try_owes"),
+            _t("demo_try_statement"),
+        ]
+        return body, examples
+    finally:
+        CURRENT_LANG.reset(token)
 
 
 def known_demo_sender(conn: sqlite3.Connection, shop_id: str) -> bool:

@@ -611,14 +611,14 @@ def _handle_message(sender, msg: IncomingMessage) -> None:
                     out.flush()
                     return
                 _demo.provision_demo(conn, msg.shop_id, join_lang)
-                _demo.increment_demo_msg(conn, msg.shop_id)
+                # Join code itself is free — does not consume the msg limit.
                 CURRENT_LANG.set(join_lang)
                 reply = _demo.start_demo_reply(conn, msg.shop_id, join_lang)
                 buttons = None
                 demo_handled = True
             elif matched and is_demo:
                 # Already in an active demo: refresh welcome + menu, no LLM.
-                _demo.increment_demo_msg(conn, msg.shop_id)
+                # Re-sending the join code is free — does not consume the limit.
                 lang = owner_lang(conn, msg.shop_id) or join_lang
                 CURRENT_LANG.set(lang)
                 reply = _demo.start_demo_reply(conn, msg.shop_id, lang)
@@ -719,20 +719,41 @@ def _handle_message(sender, msg: IncomingMessage) -> None:
         out.flush()
 
         # Deferred overview card + menu (post-task or demo welcome).
+        demo_just_joined = demo_handled
         if take_overview_pending(msg.shop_id):
             try:
                 from app.overview import queue_overview_and_menu
                 fallback = queue_overview_and_menu(conn, msg.shop_id)
                 if fallback:
                     out.send_text(msg.shop_id, fallback)
-                for item in take_media(msg.shop_id):
-                    out.send_media_item(msg.shop_id, item)
+                # Lists/menu before media so a flaky image never blocks them.
                 for lst in take_lists(msg.shop_id):
                     out.send_list(msg.shop_id, lst["body"], lst["button_text"],
                                   lst["rows"])
                 out.flush()
+                for item in take_media(msg.shop_id):
+                    try:
+                        out.send_media_item(msg.shop_id, item)
+                        out.flush()
+                    except Exception:
+                        log.warning(
+                            "overview media send failed shop=%s; continuing",
+                            msg.shop_id, exc_info=True)
             except Exception:
                 log.warning("deferred overview failed", exc_info=True)
+
+        # Fresh demo join: short try-nudge with example actions (outbound;
+        # does not consume the 10-message inbound limit).
+        if demo_just_joined:
+            try:
+                from app import demo as _demo
+                if _demo.is_demo_shop(conn, msg.shop_id):
+                    lang = owner_lang(conn, msg.shop_id) or "en"
+                    body, examples = _demo.try_nudge(lang)
+                    out.send_buttons(msg.shop_id, body, examples)
+                    out.flush()
+            except Exception:
+                log.warning("demo try-nudge failed", exc_info=True)
 
         # After the 10th demo message, append the closing note.
         try:

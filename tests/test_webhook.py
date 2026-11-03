@@ -247,12 +247,14 @@ def test_simulated_credit_conversation(sim_env, monkeypatch):
     r2 = _post_text(client, "Yes", "wamid.2")
     assert r2.status_code == 200
     out2 = client.get("/_sim/outbox", params={"shop": SHOP}).json()["messages"]
-    # Text reply first (fast path), then deferred overview image + menu.
+    # Text reply first (fast path), then menu, then overview image
+    # (menu before media so a flaky image never blocks it).
     assert out2[0]["type"] == "text"
     assert "R146.00" in out2[0]["body"]
     images = [m for m in out2 if m["type"] == "image"]
     assert images and images[0]["url"].endswith("?f=png")
-    assert out2[-1]["type"] == "list"
+    assert any(m["type"] == "list" for m in out2)
+    assert out2[-1]["type"] == "image"
 
     r3 = _post_text(client, "How much does Sipho owe?", "wamid.3")
     assert r3.status_code == 200

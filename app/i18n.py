@@ -5945,6 +5945,12 @@ STRINGS["en"].update({
         "For full access, message Donovan or open Sisi on Version One.\n\n"
         "Fresh demo later: send *{code}* again tomorrow."
     ),
+    "demo_try_nudge": (
+        "💡 *Try one of these* (tap or type):"
+    ),
+    "demo_try_sold": "sold 2 bread R30",
+    "demo_try_owes": "Who owes me?",
+    "demo_try_statement": "statement to Thandi",
 })
 STRINGS["zu"].update({
     "demo_welcome": (
@@ -5959,6 +5965,12 @@ STRINGS["zu"].update({
         "Ukufinyelela okugcwele: thumela uDonovan noma Version One.\n\n"
         "Qala kabusha: thumela *{code}* kusasa."
     ),
+    "demo_try_nudge": (
+        "💡 *Zama okukodwa* (thepha noma bhala):"
+    ),
+    "demo_try_sold": "sold 2 bread R30",
+    "demo_try_owes": "Who owes me?",
+    "demo_try_statement": "statement to Thandi",
 })
 STRINGS["af"].update({
     "demo_welcome": (
@@ -5973,6 +5985,12 @@ STRINGS["af"].update({
         "Volle toegang: booodskap Donovan of Sisi op Version One.\n\n"
         "Vars demo: stuur *{code}* môre weer."
     ),
+    "demo_try_nudge": (
+        "💡 *Probeer een* (tik of stuur):"
+    ),
+    "demo_try_sold": "sold 2 bread R30",
+    "demo_try_owes": "Who owes me?",
+    "demo_try_statement": "statement to Thandi",
 })
 STRINGS["xh"].update({
     "demo_welcome": (
@@ -5987,6 +6005,12 @@ STRINGS["xh"].update({
         "Ukufikelela okupheleleyo: thumela uDonovan okanye Version One.\n\n"
         "Qala kwakhona: thumela *{code}* ngomso."
     ),
+    "demo_try_nudge": (
+        "💡 *Zama enye* (cofsa okanye bhala):"
+    ),
+    "demo_try_sold": "sold 2 bread R30",
+    "demo_try_owes": "Who owes me?",
+    "demo_try_statement": "statement to Thandi",
 })
 STRINGS["st"].update({
     "demo_welcome": (
@@ -6001,6 +6025,12 @@ STRINGS["st"].update({
         "Phihlellelo e felletseng: romela Donovan kapa Version One.\n\n"
         "Qala bocha: romela *{code}* hosane."
     ),
+    "demo_try_nudge": (
+        "💡 *Leka e le nngwe* (tobetsa kapa ngola):"
+    ),
+    "demo_try_sold": "sold 2 bread R30",
+    "demo_try_owes": "Who owes me?",
+    "demo_try_statement": "statement to Thandi",
 })
 STRINGS["tn"].update({
     "demo_welcome": (
@@ -6015,4 +6045,10 @@ STRINGS["tn"].update({
         "Phihelelo e e feletseng: romela Donovan kgotsa Version One.\n\n"
         "Simolola sesha: romela *{code}* kamoso."
     ),
+    "demo_try_nudge": (
+        "💡 *Leka e le nngwe* (tobetsa kgotsa kwala):"
+    ),
+    "demo_try_sold": "sold 2 bread R30",
+    "demo_try_owes": "Who owes me?",
+    "demo_try_statement": "statement to Thandi",
 })

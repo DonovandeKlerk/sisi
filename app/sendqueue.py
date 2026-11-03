@@ -510,13 +510,28 @@ class QueuedSender:
         return self._sender.mark_read(message_id)
 
     def send_media_item(self, to: str, item: dict) -> None:
-        if item.get("kind") == "file":
-            self.send_file(to, item.get("url", ""),
-                           item.get("filename") or "sisi-report.pdf",
-                           item.get("caption") or "")
-        else:
-            self.send_image(to, item.get("url", ""),
-                            item.get("caption") or "")
+        """Enqueue or send media. Never raises — text/menu must keep flowing."""
+        try:
+            if item.get("kind") == "file":
+                self.send_file(to, item.get("url", ""),
+                               item.get("filename") or "sisi-report.pdf",
+                               item.get("caption") or "")
+            else:
+                self.send_image(to, item.get("url", ""),
+                                item.get("caption") or "")
+        except Exception:
+            log.warning("send_media_item failed to=%s kind=%s; continuing",
+                        to, item.get("kind"), exc_info=True)
+            try:
+                if self._conn is not None:
+                    from app.mediasend import _record_failed_media
+                    _record_failed_media(
+                        self._conn, to, self._channel,
+                        item.get("kind") or "image",
+                        item.get("url", ""), item.get("caption") or "",
+                        item.get("filename") or "")
+            except Exception:
+                log.warning("last-failed-media record failed", exc_info=True)
 
     def flush(self) -> dict:
         totals = {"sent": 0, "rate_limited": False, "failed": 0}

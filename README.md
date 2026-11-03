@@ -252,5 +252,5 @@ match or Infobip rejects the send; delivery reports arrive at
 
 ## Try-it demo (join code)
 
-Anyone can try Sisi without being on `WHAPI_ALLOWLIST` by messaging the join code (default **SISI-DEMO**, optional language suffix like `SISI-DEMO-ZU`). They get an isolated copy of MaZulu's Spaza, the overview card and the main menu, capped at 10 messages. Strangers without the code get a once-a-day tip (no LLM). Env: `SISI_DEMO_JOIN_CODE`, `SISI_DEMO_MSG_LIMIT`, `SISI_DEMO_DAILY_CAP`.
+Anyone can try Sisi without being on `WHAPI_ALLOWLIST` by messaging the join code (default **SISI-DEMO**, optional language suffix like `SISI-DEMO-ZU`). They get an isolated copy of MaZulu's Spaza, the overview card and the main menu, capped at 10 messages (the join code itself does not count). Strangers without the code get a once-a-day tip (no LLM). Env: `SISI_DEMO_JOIN_CODE`, `SISI_DEMO_MSG_LIMIT`, `SISI_DEMO_DAILY_CAP`.
 
