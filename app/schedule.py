@@ -448,3 +448,36 @@ def run_due(now: datetime | None = None) -> list[dict]:
     finally:
         conn.close()
     return jobs
+
+
+def run_minute_tick() -> None:
+    """Fire due reminders exactly once + drain leftover queued sends.
+
+    The body of modal_app.every_minute, kept here so it runs without
+    Modal installed. A short Turso outage must not fail the tick:
+    connect() already retries transient 5xx/connection errors, and
+    whatever still fails logs one warning and skips — the next tick
+    retries the same work.
+    """
+    from app.db import connect, init_db, is_transient_db_error
+    from app.providers import sender_for_channel
+    from app.reminders import send_due
+    from app.sendqueue import drain_all
+    conn = None
+    try:
+        conn = connect()
+        init_db(conn)
+        for rid in send_due(conn):
+            log.info("reminder %s fired", rid)
+        drain_all(conn, sender_for_channel)
+    except Exception as e:
+        if not is_transient_db_error(e):
+            raise
+        log.warning("every_minute: db unavailable (%s); skipping tick", e)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception as e:
+                if not is_transient_db_error(e):
+                    raise

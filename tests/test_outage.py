@@ -6,13 +6,13 @@ never crash a job or leave a user hanging.
 """
 
 import logging
-import warnings
 
 import pytest
 from turso_serverless.dbapi import OperationalError as TursoOperationalError
 
 from app.i18n import STRINGS
 from app.main import process_message
+from app.schedule import run_minute_tick
 from app.whatsapp import FakeSender, IncomingMessage, get_sender
 
 SHOP = "27710000099"
@@ -30,32 +30,17 @@ def _outage(*a, **k):
     raise TursoOperationalError(OUTAGE)
 
 
-def _tick_local():
-    """Run the real every_minute handler locally (Modal .local())."""
-    import modal_app
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")  # local-run volume notice
-        modal_app.every_minute.local()
-
-
 def test_every_minute_skips_tick_on_502(monkeypatch, tmp_path, caplog):
-    import modal_app
-
-    monkeypatch.setattr(modal_app, "_use_volume", lambda: None)
     monkeypatch.setenv("SISI_DB", str(tmp_path / "t.db"))
     monkeypatch.setattr("app.db.connect", _outage)
-    with caplog.at_level(logging.WARNING, logger="sisi"):
-        _tick_local()  # must not raise
+    with caplog.at_level(logging.WARNING, logger="sisi.schedule"):
+        run_minute_tick()  # must not raise
     skips = [r for r in caplog.records if "skipping tick" in r.getMessage()]
     assert len(skips) == 1  # a single warning, then the next tick retries
     assert "502" in skips[0].getMessage()
 
 
 def test_every_minute_reraises_permanent_errors(monkeypatch, tmp_path):
-    import modal_app
-
-    monkeypatch.setattr(modal_app, "_use_volume", lambda: None)
     monkeypatch.setenv("SISI_DB", str(tmp_path / "t.db"))
 
     def boom(*a, **k):
@@ -63,15 +48,13 @@ def test_every_minute_reraises_permanent_errors(monkeypatch, tmp_path):
 
     monkeypatch.setattr("app.db.connect", boom)
     with pytest.raises(RuntimeError, match="no such table"):
-        _tick_local()
+        run_minute_tick()
 
 
 def test_every_minute_fires_due_reminder(monkeypatch, tmp_path):
-    import modal_app
     from app.db import connect, init_db
     from app.tools import ensure_shop
 
-    monkeypatch.setattr(modal_app, "_use_volume", lambda: None)
     monkeypatch.setenv("SISI_DB", str(tmp_path / "t.db"))
     db = connect()
     try:
@@ -88,7 +71,7 @@ def test_every_minute_fires_due_reminder(monkeypatch, tmp_path):
         db.commit()
     finally:
         db.close()
-    _tick_local()
+    run_minute_tick()
     db = connect()
     try:
         status = db.execute("SELECT status FROM reminders WHERE shop_id = ?",
