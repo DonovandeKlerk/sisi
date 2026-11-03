@@ -92,18 +92,34 @@ def send_media(payload: dict) -> dict:
 
 @app.function(schedule=modal.Period(minutes=1), timeout=120)
 def every_minute():
-    """Fire due reminders exactly once + drain leftover queued sends."""
+    """Fire due reminders exactly once + drain leftover queued sends.
+
+    A short Turso outage must not fail the tick: connect() already
+    retries transient 5xx/connection errors, and whatever still fails
+    logs one warning and skips — the next tick retries the same work.
+    """
     import logging
     _use_volume()
-    from app.db import connect, init_db
+    from app.db import connect, init_db, is_transient_db_error
     from app.providers import sender_for_channel
     from app.reminders import send_due
     from app.sendqueue import drain_all
-    conn = connect()
+    conn = None
     try:
+        conn = connect()
         init_db(conn)
         for rid in send_due(conn):
             logging.getLogger("sisi").info("reminder %s fired", rid)
         drain_all(conn, sender_for_channel)
+    except Exception as e:
+        if not is_transient_db_error(e):
+            raise
+        logging.getLogger("sisi").warning(
+            "every_minute: db unavailable (%s); skipping tick", e)
     finally:
-        conn.close()
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception as e:
+                if not is_transient_db_error(e):
+                    raise

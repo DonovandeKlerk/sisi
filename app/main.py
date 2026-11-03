@@ -21,7 +21,8 @@ from fastapi.responses import FileResponse, PlainTextResponse, Response
 from app.agent import (DEFER_OVERVIEW, handle_photo, handle_text, handle_voice,
                        take_buttons, take_lists, take_media,
                        take_overview_pending)
-from app.db import READ_ONLY, connect, enforce_read_only, init_db, now_iso
+from app.db import (READ_ONLY, connect, enforce_read_only, init_db,
+                    is_transient_db_error, now_iso)
 from app.i18n import CURRENT_LANG, STRINGS, detect, owner_lang
 from app.i18n import t as _t
 from app.vision import VisionError
@@ -469,6 +470,29 @@ def _slow_line(conn, msg: IncomingMessage) -> str | None:
     return None
 
 
+def _send_try_again_soon(msg: IncomingMessage) -> None:
+    """Direct 'try again in a moment' reply that needs no database.
+
+    send_immediate and QueuedSender both open a DB connection, which is
+    exactly what is down — so send via the channel sender directly.
+    Language comes from the message text when the owner's saved
+    language was never loaded (connect died first); an already-set
+    CURRENT_LANG (owner_lang won the race) is kept.
+    """
+    CURRENT_LANG.set(detect(msg.text, default=CURRENT_LANG.get()))
+    sender_for_channel(msg.channel or "meta").send_text(
+        msg.shop_id, _t("try_again_soon"))
+
+
+def _transient_fallback(msg: IncomingMessage, err: Exception) -> None:
+    """One warning + a try-again-soon reply. Never raises."""
+    log.warning("process_message db unavailable (%s)", err)
+    try:
+        _send_try_again_soon(msg)
+    except Exception:
+        log.warning("try-again-soon send failed", exc_info=True)
+
+
 def process_message(msg: IncomingMessage) -> None:
     """Background worker: one message, own connection, never raises."""
     CURRENT_LANG.set("en")
@@ -506,7 +530,13 @@ def process_message(msg: IncomingMessage) -> None:
         sender = sender_for_channel(msg.channel or "meta")
         try:
             _handle_message(sender, msg)
-        except Exception:
+        except Exception as e:
+            if is_transient_db_error(e):
+                # Short outage: connect() already retried, and the
+                # DB-backed error report + queued fallback would fail
+                # too — reply direct instead.
+                _transient_fallback(msg, e)
+                return
             detail = traceback.format_exc()
             log.error("process_message failed:\n%s", detail)
             try:
@@ -528,8 +558,13 @@ def process_message(msg: IncomingMessage) -> None:
                                {"body": _t("friendly_error")})
             except Exception:
                 log.error("friendly fallback failed:\n%s", traceback.format_exc())
-    except Exception:
-        log.error("process_message failed:\n%s", traceback.format_exc())
+    except Exception as e:
+        # Covers _already_seen's connect (outside the inner try): a dead
+        # DB there must still tell the user to try again, not go silent.
+        if is_transient_db_error(e):
+            _transient_fallback(msg, e)
+        else:
+            log.error("process_message failed:\n%s", traceback.format_exc())
     finally:
         READ_ONLY.reset(token)
 

@@ -357,3 +357,94 @@ def test_turso_connect_uses_wrapper(monkeypatch):
     monkeypatch.setattr(dbmod.TursoReconnect, "_fresh",
                         lambda self: _conn(FakeSession()))
     assert isinstance(dbmod.connect(), dbmod.TursoReconnect)
+
+
+# --- connect retry on short outages -------------------------------------------
+# Live bug (Nov 2026): every_minute crashed in connect() when Turso
+# returned "HTTP status 502: connect to upstream failed" on the PRAGMA
+# in _fresh(). One failed connect must never crash a job: _fresh()
+# retries transient 5xx/connection errors with backoff, then raises.
+
+OUTAGE_502 = RuntimeError("HTTP status 502: connect to upstream failed")
+
+
+def _flaky_turso(monkeypatch, failures):
+    """Patch turso_serverless.connect: call N fails its PRAGMA with
+    failures[N] (None = healthy). Returns the per-call URL list."""
+    import app.db as dbmod  # noqa: F401  (import pins the module under test)
+    import turso_serverless
+
+    calls = []
+
+    def fake_connect(url, auth_token=None):
+        err = failures[len(calls)] if len(calls) < len(failures) else None
+        sess = FakeSession()
+        if err is not None:
+            sess.failures["PRAGMA"] = err
+        calls.append(url)
+        return Connection(sess)
+
+    monkeypatch.setattr(turso_serverless, "connect", fake_connect)
+    return calls
+
+
+def test_fresh_retries_502_then_recovers(monkeypatch, caplog):
+    import logging
+
+    import app.db as dbmod
+
+    calls = _flaky_turso(monkeypatch, [OUTAGE_502, None])
+    sleeps = []
+    monkeypatch.setattr(dbmod, "_sleep", sleeps.append)
+    with caplog.at_level(logging.INFO, logger="sisi.db"):
+        wrap = dbmod.TursoReconnect("https://x", "tok")
+    assert len(calls) == 2  # first connect 502'd, retry succeeded
+    assert len(sleeps) == 1
+    assert 1.0 <= sleeps[0] <= 1.26  # ~1s base + jitter
+    assert "recovered after 2 attempts" in caplog.text
+    assert wrap.execute("SELECT 1").fetchone() is None  # healthy conn
+
+
+def test_fresh_gives_up_after_attempts(monkeypatch):
+    import app.db as dbmod
+
+    calls = _flaky_turso(monkeypatch, [OUTAGE_502] * 10)
+    sleeps = []
+    monkeypatch.setattr(dbmod, "_sleep", sleeps.append)
+    with pytest.raises(TursoOperationalError, match="502"):
+        dbmod.TursoReconnect("https://x", "tok")
+    assert len(calls) == dbmod.CONNECT_ATTEMPTS == 4
+    assert len(sleeps) == dbmod.CONNECT_ATTEMPTS - 1 == 3
+    assert sleeps[0] < sleeps[1] < sleeps[2]  # exponential backoff
+
+
+def test_fresh_no_retry_on_permanent_error(monkeypatch):
+    import app.db as dbmod
+
+    calls = _flaky_turso(
+        monkeypatch, [RuntimeError("HTTP status 401: unauthorized")])
+    sleeps = []
+    monkeypatch.setattr(dbmod, "_sleep", sleeps.append)
+    with pytest.raises(TursoOperationalError, match="401"):
+        dbmod.TursoReconnect("https://x", "tok")
+    assert len(calls) == 1  # auth errors fail fast, never retried
+    assert sleeps == []
+
+
+@pytest.mark.parametrize(("msg", "want"), [
+    ("HTTP status 502: connect to upstream failed", True),
+    ("HTTP status 503: Service Unavailable", True),
+    ("HTTP status 500", True),
+    ("request to https://x.turso.io failed: Connection refused", True),
+    ("request to https://x failed: [Errno 104] Connection reset by peer",
+     True),
+    ("HTTP status 401: unauthorized", False),
+    ("HTTP status 404: stream not found: a1b6:1d57", False),
+    ("UNIQUE constraint failed: t.a", False),
+    ("database is locked", False),
+    ("no such table: shops", False),
+])
+def test_is_transient_db_error(msg, want):
+    import app.db as dbmod
+
+    assert dbmod.is_transient_db_error(RuntimeError(msg)) is want

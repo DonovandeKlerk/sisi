@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import re
 import sqlite3
+import time
 from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -499,6 +501,51 @@ _STREAM_LOST = re.compile(r"stream (not found|expired|closed)",
                             re.IGNORECASE)
 
 
+_TRANSIENT_DB = re.compile(
+    r"HTTP status 5\d\d"              # Turso/proxy 5xx (502 upstream, 503, ...)
+    r"|connect to upstream failed"
+    r"|request to \S+ failed"         # driver wraps URLError/reset/read errors
+    r"|connection (reset|refused|aborted|timed out)"
+    r"|broken pipe"
+    r"|timed out"
+    r"|temporarily unavailable",
+    re.IGNORECASE,
+)
+"""DB errors worth retrying: short Turso/proxy outages, never app bugs.
+
+Deliberately excludes 4xx (401 auth, 404 stream-gone has its own path)
+and SQL errors (locked, constraint): retrying those only burns time.
+"""
+
+CONNECT_ATTEMPTS = 4
+"""Turso connect tries: first attempt + 3 retries."""
+
+CONNECT_BACKOFF_BASE = 1.0
+"""First retry delay in seconds; doubles per attempt (~1s, ~2s, ~4s)."""
+
+CONNECT_BACKOFF_CAP = 5.0
+"""Longest single retry delay in seconds."""
+
+_sleep = time.sleep
+"""Sleep indirection so tests can stub backoff without waiting."""
+
+
+def is_transient_db_error(exc: BaseException) -> bool:
+    """True when a DB failure looks like a short outage worth tolerating.
+
+    Cron ticks skip on these (next tick retries); the webhook path sends
+    a try-again-soon reply instead of the generic error. Anything else
+    (auth, SQL bugs, schema) still fails loud.
+    """
+    return _TRANSIENT_DB.search(str(exc)) is not None
+
+
+def _backoff_delay(attempt: int) -> float:
+    """Exponential backoff with ±25% jitter for retry `attempt` (0-based)."""
+    delay = min(CONNECT_BACKOFF_BASE * (2 ** attempt), CONNECT_BACKOFF_CAP)
+    return delay + random.uniform(0, delay * 0.25)
+
+
 class TursoReconnect:
     """A Turso connection that survives idle stream expiry.
 
@@ -521,13 +568,31 @@ class TursoReconnect:
 
     def _fresh(self):
         from turso_serverless import connect as _turso_connect
-        conn = _turso_connect(self._url, auth_token=self._token)
-        # The driver's Row is already sqlite3.Row-like (index + name
-        # access); its factory protocol takes (cursor, row), so pass
-        # the prebuilt row straight through.
-        conn.row_factory = lambda _cur, row: row
-        conn.execute("PRAGMA foreign_keys = ON")
-        return conn
+        last: Exception | None = None
+        for attempt in range(CONNECT_ATTEMPTS):
+            try:
+                conn = _turso_connect(self._url, auth_token=self._token)
+                # The driver's Row is already sqlite3.Row-like (index + name
+                # access); its factory protocol takes (cursor, row), so pass
+                # the prebuilt row straight through.
+                conn.row_factory = lambda _cur, row: row
+                conn.execute("PRAGMA foreign_keys = ON")
+            except Exception as e:
+                last = e
+                if not is_transient_db_error(e) \
+                        or attempt + 1 >= CONNECT_ATTEMPTS:
+                    raise
+                wait = _backoff_delay(attempt)
+                log.info("turso connect failed (%s); retry %d/%d in %.1fs",
+                         e, attempt + 2, CONNECT_ATTEMPTS, wait)
+                _sleep(wait)
+                continue
+            if attempt:
+                log.warning("turso connect recovered after %d attempts",
+                            attempt + 1)
+            return conn
+        assert last is not None  # CONNECT_ATTEMPTS >= 1 by construction
+        raise last
 
     @staticmethod
     def _stream_lost(exc: BaseException) -> bool:
