@@ -12,7 +12,7 @@ from turso_serverless.dbapi import OperationalError as TursoOperationalError
 
 from app.i18n import STRINGS
 from app.main import process_message
-from app.schedule import run_minute_tick
+from app.schedule import run_due, run_minute_tick
 from app.whatsapp import FakeSender, IncomingMessage, get_sender
 
 SHOP = "27710000099"
@@ -81,6 +81,27 @@ def test_every_minute_fires_due_reminder(monkeypatch, tmp_path):
     assert status == "submitted"  # queued by send_due, sent by drain_all
     sent = get_sender().pop_shop(SHOP)
     assert sent and "pay supplier" in sent[0]["body"]
+
+
+def test_nudges_skip_tick_on_502(monkeypatch, tmp_path, caplog):
+    monkeypatch.setenv("SISI_DB", str(tmp_path / "t.db"))
+    monkeypatch.setattr("app.db.connect", _outage)
+    with caplog.at_level(logging.WARNING, logger="sisi.schedule"):
+        assert run_due() == []  # must not raise
+    skips = [r for r in caplog.records if "skipping tick" in r.getMessage()]
+    assert len(skips) == 1
+    assert "502" in skips[0].getMessage()
+
+
+def test_nudges_reraise_permanent_errors(monkeypatch, tmp_path):
+    monkeypatch.setenv("SISI_DB", str(tmp_path / "t.db"))
+
+    def boom(*a, **k):
+        raise RuntimeError("no such table: shops")
+
+    monkeypatch.setattr("app.db.connect", boom)
+    with pytest.raises(RuntimeError, match="no such table"):
+        run_due()
 
 
 def test_webhook_connect_outage_sends_zulu_try_again(monkeypatch, tmp_path):

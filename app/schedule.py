@@ -409,12 +409,17 @@ def tick(conn: sqlite3.Connection, now: datetime | None = None) -> list[dict]:
 
 
 def run_due(now: datetime | None = None) -> list[dict]:
-    """Plan and send every due job. Returns the sent jobs (for logs/tests)."""
-    from app.db import connect, init_db
+    """Plan and send every due job. Returns the sent jobs (for logs/tests).
+
+    A short Turso outage skips the tick with one warning (returns [])
+    instead of failing the cron; the next tick plans the same jobs.
+    """
+    from app.db import connect, init_db, is_transient_db_error
     from app.providers import WrongProviderError, sender_for_channel
     from app.sendqueue import QueuedSender
-    conn = connect()
+    conn = None
     try:
+        conn = connect()
         init_db(conn)
         jobs = tick(conn, now)
         queues: dict[str, QueuedSender] = {}
@@ -445,8 +450,18 @@ def run_due(now: datetime | None = None) -> list[dict]:
                                    item.get("caption") or "")
         for out in queues.values():
             out.flush()
+    except Exception as e:
+        if not is_transient_db_error(e):
+            raise
+        log.warning("nudges: db unavailable (%s); skipping tick", e)
+        return []
     finally:
-        conn.close()
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception as e:
+                if not is_transient_db_error(e):
+                    raise
     return jobs
 
 
